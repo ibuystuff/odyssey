@@ -9,7 +9,14 @@ Advanced multi-threaded PostgreSQL connection pooler and request router.
 
 #### Project status
 
-Although we run Odyssey in production, the project is currently in Beta. We appreciate any kind of feedback and contribution to the project.
+Odyssey is production-ready, it is being used in large production setups. We appreciate any kind of feedback and contribution to the project.
+
+<a href="https://travis-ci.org/yandex/odyssey"><img src="https://travis-ci.org/yandex/odyssey.svg?branch=master" /></a>
+
+<a href="https://scan.coverity.com/projects/yandex-odyssey">
+  <img alt="Coverity Scan Build Status"
+       src="https://scan.coverity.com/projects/20374/badge.svg"/>
+</a>
 
 ### Design goals and main features
 
@@ -38,7 +45,9 @@ Each defined pool can have separate authentication, pooling mode and limits sett
 #### Authentication
 
 Odyssey has full-featured `SSL/TLS` support and common authentication methods
-like: `md5` and `clear text` both for client and server authentication.
+like: `md5` and `clear text` both for client and server authentication. 
+Odyssey supports PAM & LDAP authentication, this methods operates similarly to `clear text` auth except that it uses 
+PAM/LDAP to validate user name/password pairs. PAM optionally checks the connected remote host name or IP address.
 Additionally it allows to block each pool user separately.
 
 #### Logging
@@ -47,6 +56,10 @@ Odyssey generates universally unique identifiers `uuid` for client and server co
 Any log events and client error responses include the id, which then can be used to
 uniquely identify client and track actions. Odyssey can save log events into log file and
 using system logger.
+
+### CLI
+
+Odyssey supports multiple command line options. Use `/path/to/odyssey` --help to see more
 
 #### Architecture and internals
 
@@ -67,18 +80,32 @@ Currently Odyssey runs only on Linux. Supported platforms are x86/x86_64.
 
 To build you will need:
 
-* cmake >= 2.8
+* cmake >= 3.12.4
 * gcc >= 4.6
-* openssl 1.0.*
+* openssl
+* postgresql-server-dev-13
+* pg_config utility is in the PATH
 
 ```sh
 git clone git://github.com/yandex/odyssey.git
 cd odyssey
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+make local_build
 ```
+Adapt odyssey-dev.conf then:
+```sh
+make local_run
+```
+
+Alternatively:
+```sh
+build/sources/odyssey odyssey-dev.conf
+```
+
+#### Use docker environment for development (helpful for Mac users)
+```sh
+make start-dev-env
+```
+Set up your CLion to build project in container, [manual](https://github.com/shuhaoliu/docker-clion-dev/blob/master/README.md).
 
 ### Configuration reference
 
@@ -86,7 +113,10 @@ make
 
 * [include](documentation/configuration.md#include-string)
 * [daemonize](documentation/configuration.md#daemonize-yesno)
+* [priority](documentation/configuration.md#priority-integer)
 * [pid\_file](documentation/configuration.md#pid_file-string)
+* [unix\_socket\_dir](documentation/configuration.md#unix_socket_dir-string)
+* [unix\_socket\_mode](documentation/configuration.md#unix_socket_mode-string)
 
 ##### Logging
 
@@ -108,12 +138,13 @@ make
 * [workers](documentation/configuration.md#workers-integer)
 * [resolvers](documentation/configuration.md#resolvers-integer)
 * [readahead](documentation/configuration.md#readahead-integer)
-* [pipeline](documentation/configuration.md#pipeline-integer)
-* [cache](documentation/configuration.md#cache-integer)
-* [cache\_chunk](documentation/configuration.md#cache_chunk-integer)
 * [cache\_coroutine](documentation/configuration.md#cache_coroutine-integer)
 * [nodelay](documentation/configuration.md#nodelay-yesno)
 * [keepalive](documentation/configuration.md#keepalive-integer)
+
+##### System
+
+* [coroutine\_stack\_size](documentation/configuration.md#coroutine_stack_size-integer)
 
 ##### Global limits
 
@@ -157,15 +188,18 @@ make
 * [auth\_query](documentation/configuration.md#auth_query-string)
 * [auth\_query\_db](documentation/configuration.md#auth_query-string)
 * [auth\_query\_user](documentation/configuration.md#auth_query-string)
+* [auth\_pam\_service](documentation/configuration.md#auth\_pam\_service-string)
 * [client\_max](documentation/configuration.md#client_max-integer-1)
 * [storage](documentation/configuration.md#storage-string)
 * [storage\_db](documentation/configuration.md#storage-string)
 * [storage\_user](documentation/configuration.md#storage-string)
 * [storage\_password](documentation/configuration.md#storage-string)
+* [password\_passthrough](documentation/configuration.md#storage-string)
 * [pool](documentation/configuration.md#pool-string)
 * [pool\_size](documentation/configuration.md#pool_size-integer)
 * [pool\_timeout](documentation/configuration.md#pool_timeout-integer)
 * [pool\_ttl](documentation/configuration.md#pool_ttl-integer)
+* [pool\_discard](documentation/configuration.md#pool_discard-yesno)
 * [pool\_cancel](documentation/configuration.md#pool_cancel-yesno)
 * [pool\_rollback](documentation/configuration.md#pool_rollback-yesno)
 * [client\_fwd\_error](documentation/configuration.md#client_fwd_error-yesno)

@@ -3,18 +3,10 @@
 #include <odyssey_test.h>
 #include <unistd.h>
 
-void
-machinarium_test_config(void)
+void machinarium_test_config(void)
 {
 	machinarium_set_pool_size(1);
 	machinarium_init();
-	int count_machine = 0;
-	int count_coroutine = 0;
-	int count_coroutine_cache = 0;
-	machinarium_stat(&count_machine, &count_coroutine,
-	                 &count_coroutine_cache);
-	test(count_machine == 1);
+	test(machinarium_init() == -1);
 	machinarium_free();
-
-	machinarium_set_pool_size(3);
 }

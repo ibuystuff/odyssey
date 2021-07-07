@@ -1,13 +1,12 @@
-#ifndef OD_CANCEL_H
-#define OD_CANCEL_H
+#ifndef ODYSSEY_CANCEL_H
+#define ODYSSEY_CANCEL_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-int od_cancel(od_global_t*, shapito_stream_t*, od_configstorage_t*, shapito_key_t*, od_id_t*);
-int od_cancel_find(od_routepool_t*, shapito_key_t*, od_routercancel_t*);
+int od_cancel(od_global_t *, od_rule_storage_t *, kiwi_key_t *, od_id_t *);
 
-#endif
+#endif /* ODYSSEY_CANCEL_H */

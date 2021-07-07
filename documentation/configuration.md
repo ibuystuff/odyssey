@@ -16,12 +16,41 @@ By default Odyssey does not run as a daemon. Set to 'yes' to enable.
 
 `daemonize no`
 
+#### priority *integer*
+
+Process priority.
+
+Set Odyssey parent process and threads priority.
+
+`priority -10`
+
 #### pid\_file *string*
 
 If pid\_file is specified, Odyssey will write its process id to
 the specified file at startup.
 
 `pid_file "/var/run/odyssey.pid"`
+
+#### unix\_socket\_dir *string*
+
+UNIX socket directory.
+
+If `unix_socket_dir` is specified, Odyssey will enable UNIX socket
+communications. Specified directory path will be used for
+searching socket files.
+
+`unix_socket_dir "/tmp"`
+
+#### unix\_socket\_mode *string*
+
+Set `unix_socket_mode` file mode to any created unix files.
+
+`unix_socket_mode "0755"`
+
+#### locks_dir *string*
+
+If `locks_dir` is specified, directory path will be used for 
+placing lock files.
 
 #### log\_file *string*
 
@@ -42,7 +71,8 @@ Supported flags:
 
 ```
 %n = unixtime
-%t = timestamp with date
+%t = timestamp with date in iso 8601 format
+%e = millisEcond
 %p = process ID
 %i = client ID
 %s = server ID
@@ -56,7 +86,7 @@ Supported flags:
 %h = client host
 ```
 
-`log_format "%p %t %l [%i %s] (%c) %m\n"`
+`log_format "%p %t %e %l [%i %s] (%c) %m\n"`
 
 #### log\_to\_stdout *yes|no*
 
@@ -152,42 +182,6 @@ Set size of per-connection buffer used for io readahead operations.
 
 `readahead 8192`
 
-#### pipeline *integer*
-
-Set size of buffer used for pipelining io operations between client
-and server. Odyssey will try to read as much as 'pipeline' data before sending
-data to a peer.
-
-This option differs from 'readahead' since it works with full PostgreSQL
-packets. Incoming packet can be larger than pipeline size, in that case buffer
-will be enlarged.
-
-It is a good idea to set this value to a approximate max size of
-data packet to reduce performance influence of a system memory allocator
-(like fragmentation, increased memory usage, etc).
-
-`pipeline 32768`
-
-#### cache *integer*
-
-Set size of pipeline cache pool (numbers). Approximate cache size could be
-calculated as 'cache' * 'pipeline'.
-
-Set to zero, to disable pipeline caching at all.
-
-`cache 100`
-
-#### cache\_chunk *integer*
-
-Pipeline buffer free watermark value.
-
-If pipeline buffer becomes bigger than `cache_chunk` free it, instead of
-putting back to cache.
-
-Set to zero, to disable the check.
-
-`cache_chunk 0`
-
 #### cache\_coroutine *integer*
 
 Set pool size of free coroutines cache. It is a good idea to set
@@ -208,7 +202,39 @@ TCP nodelay. Set to 'yes', to enable nodelay.
 
 TCP keepalive time. Set to zero, to disable keepalive.
 
-`keepalive 7200`
+`keepalive 15`
+
+#### keepalive_keep_interval *integer*
+
+The number of seconds between TCP keep-alive probes.
+5 by default.
+
+`keepalive_keep_interval 10`
+
+#### keepalive_probes *integer*
+
+TCP keep-alive probes to send before  giving  up  and  killing  the connection if no response is obtained.
+3 by default.
+
+`keepalive_probes 5`
+
+
+#### keepalive_usr_timeout *integer*
+When the value is greater than 0, it specifies the maximum amount of time in milliseconds that transmitted data may remain unacknowledged before TCP will forcibly close the
+corresponding connection
+
+`keepalive_usr_timeout 7`
+
+#### coroutine\_stack\_size *integer*
+
+Coroutine stack size.
+
+Set coroutine stack size in pages. In some rare cases
+it might be necessary to make stack size bigger. Actual stack will be
+allocated as `(coroutine_stack_size + 1_guard_page) * page_size`.
+Guard page is used to track stack overflows. Stack by default is set to 16KB.
+
+`coroutine_stack_size 4`
 
 #### client\_max *integer*
 
@@ -230,6 +256,9 @@ every specified address.
 Odyssey will fail in case it could not bind on any resolved address.
 
 #### host *string*
+
+If host is not set, Odyssey will try to listen using UNIX socket if
+`unix_socket_dir` is set.
 
 `host "*"`
 
@@ -269,6 +298,12 @@ listen
 }
 ```
 
+#### compression *yes|no*
+
+Support of PostgreSQL protocol compression (experimental). Set to 'yes' to enable, disabled by default.
+
+`compression no`
+
 ### Routing rules
 
 Odyssey allows to define client routing rules by specifying
@@ -295,13 +330,28 @@ Set storage type to use. Supported types:
 
 `type "remote"`
 
+#### Local console
+Local console supports RELOAD, SHOW and KILL_CLIENT commands.
+
 #### host *string*
 
 Remote server address.
 
+If host is not set, Odyssey will try to connect using UNIX socket if
+`unix_socket_dir` is set.
+
 #### port *integer*
 
 Remote server port.
+
+#### bindwith_reuseport *yes|no*
+
+If specified, odyssey will bind socket with SO_REUSEPORT option.
+
+##### graceful_die_on_errors *yes|no*
+
+If specified, after receiving the singal SIGUSR2, 
+Odyssey will shutdown the socket for receptions and continue working only with old connections
 
 #### tls *string*
 
@@ -348,14 +398,15 @@ A special `user default` is used, in case when no user is matched.
 
 #### authentication *string*
 
-Set route athentication method. Supported:
+Set route authentication method. Supported:
 
 ```
-"none"       - authentication turned off
-"block"      - block this user
-"clear_text" - PostgreSQL clear text authentication
-"md5"        - PostgreSQL MD5 authentication
-"cert"       - Compare client certificate Common Name against auth_common_name's
+"none"       	- authentication turned off
+"block"      	- block this user
+"clear_text" 	- PostgreSQL clear text authentication
+"md5"        	- PostgreSQL md5 authentication
+"scram-sha-256" - PostgreSQL scram-sha-256 authentication
+"cert"       	- Compare client certificate Common Name against auth_common_name's
 ```
 
 `authentication "none"`
@@ -363,13 +414,15 @@ Set route athentication method. Supported:
 #### password *string*
 
 Set route authentication password. Depending on selected method, password can be
-in plain text or md5 hash.
+in plain text, md5 hash or SCRAM secret.
+
+To generate SCRAM secret you can use [this](https://github.com/DenisMedeirosBBD/PostgresSCRAM256PasswordGenerator) tool.
 
 `password "test"`
 
 #### auth\_common\_name default|*string*
 
-Specify common names to check for "cert" authentification method.
+Specify common names to check for "cert" authentication method.
 If there are more then one common name is defined, all of them
 will be checked until match.
 
@@ -390,12 +443,23 @@ Use matched route server to send 'auth\_query' to get username and password need
 to authenticate a client.
 
 ```
-auth_query "select username, pass from auth where username='%u'"
+auth_query "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"
 auth_query_db ""
 auth_query_user ""
 ```
 
 Disabled by default.
+
+
+#### auth\_pam\_service
+
+Enables PAM(Pluggable Authentication Modules) as the authentication mechanism.
+It is incompatible to use it with auth query method. Password must be passed in plain text form, as
+standard postgreSQL requires to.
+
+```
+auth_pam_service "name desired pam service"
+```
 
 #### client\_max *integer*
 
@@ -421,6 +485,17 @@ storage "postgres_server"
 #storage_user "test"
 #storage_password "test"
 ```
+
+
+#### password\_passthrough *bool*
+
+By default odyssey authenticate users itself, but if side auth application is used,
+like LDAP server, PAM module, or custom auth module, sometimes, 
+instead of configuring `storage_password`, it is more convenient to reuse
+client-provided password to perform backend auth. If you set this option to "yes"
+Odyssey will store client token and use when new server connection is Opened. Anyway, if
+you configure `storage_password` for route, `password_passthrough` is essentially ignored
+
 
 #### pool *string*
 
@@ -467,6 +542,15 @@ Set to zero to disable.
 
 `pool\_ttl 60`
 
+#### pool\_discard *yes|no*
+
+Server pool parameters discard.
+
+Execute `DISCARD ALL` and reset client parameters before using server
+from the pool.
+
+`pool_discard no`
+
 #### pool\_cancel *yes|no*
 
 Server pool auto-cancel.
@@ -506,7 +590,7 @@ database default {
 #		password ""
 #		auth_common_name default
 #		auth_common_name "test"
-#		auth_query "select username, pass from auth where username='%u'"
+#		auth_query "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"
 #		auth_query_db ""
 #		auth_query_user ""
 #		client_max 100

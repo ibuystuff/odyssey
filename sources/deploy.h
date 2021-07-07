@@ -1,12 +1,14 @@
-#ifndef OD_DEPLOY_H
-#define OD_DEPLOY_H
+#ifndef ODYSSEY_DEPLOY_H
+#define ODYSSEY_DEPLOY_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-int od_deploy_write(od_server_t*, char*, shapito_stream_t*, shapito_parameters_t*);
+#include "common_const.h"
 
-#endif /* OD_DEPLOY_H */
+int od_deploy(od_client_t *, char *);
+
+#endif /* ODYSSEY_DEPLOY_H */

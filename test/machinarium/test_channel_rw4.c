@@ -4,41 +4,37 @@
 
 static machine_channel_t *channel;
 
-static void
-test_coroutine_a(void *arg)
+static void test_coroutine_a(void *arg)
 {
 	(void)arg;
 	machine_msg_t *msg;
 	msg = machine_channel_read(channel, UINT32_MAX);
 	test(msg != NULL);
-	test(machine_msg_get_type(msg) == 1);
+	test(machine_msg_type(msg) == 1);
 	machine_msg_free(msg);
 }
 
-static void
-test_coroutine_b(void *arg)
+static void test_coroutine_b(void *arg)
 {
 	(void)arg;
 	machine_msg_t *msg;
 	msg = machine_channel_read(channel, UINT32_MAX);
 	test(msg != NULL);
-	test(machine_msg_get_type(msg) == 2);
+	test(machine_msg_type(msg) == 2);
 	machine_msg_free(msg);
 }
 
-static void
-test_coroutine_c(void *arg)
+static void test_coroutine_c(void *arg)
 {
 	(void)arg;
 	machine_msg_t *msg;
 	msg = machine_channel_read(channel, UINT32_MAX);
 	test(msg != NULL);
-	test(machine_msg_get_type(msg) == 3);
+	test(machine_msg_type(msg) == 3);
 	machine_msg_free(msg);
 }
 
-static void
-test_coroutine(void *arg)
+static void test_coroutine(void *arg)
 {
 	(void)arg;
 	channel = machine_channel_create(0);
@@ -60,18 +56,21 @@ test_coroutine(void *arg)
 	machine_sleep(0);
 
 	machine_msg_t *msg;
-	msg = machine_msg_create(1, 0);
+	msg = machine_msg_create(0);
 	test(msg != NULL);
+	machine_msg_set_type(msg, 1);
 	machine_channel_write(channel, msg);
 	machine_sleep(0);
 
-	msg = machine_msg_create(2, 0);
+	msg = machine_msg_create(0);
 	test(msg != NULL);
+	machine_msg_set_type(msg, 2);
 	machine_channel_write(channel, msg);
 	machine_sleep(0);
 
-	msg = machine_msg_create(3, 0);
+	msg = machine_msg_create(0);
 	test(msg != NULL);
+	machine_msg_set_type(msg, 3);
 	machine_channel_write(channel, msg);
 	machine_sleep(0);
 
@@ -82,8 +81,7 @@ test_coroutine(void *arg)
 	machine_channel_free(channel);
 }
 
-void
-machinarium_test_channel_rw4(void)
+void machinarium_test_channel_rw4(void)
 {
 	machinarium_init();
 

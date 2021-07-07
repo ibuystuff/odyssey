@@ -4,22 +4,21 @@
 
 static machine_channel_t *channel;
 
-static void
-test_coroutine2(void *arg)
+static void test_coroutine2(void *arg)
 {
 	(void)arg;
 	machine_msg_t *msg;
 	msg = machine_channel_read(channel, UINT32_MAX);
 	test(msg != NULL);
-	test(machine_msg_get_type(msg) == 123);
+	test(machine_msg_type(msg) == 123);
 	machine_msg_free(msg);
 
-	msg = machine_msg_create(321, 0);
+	msg = machine_msg_create(0);
+	machine_msg_set_type(msg, 321);
 	machine_channel_write(channel, msg);
 }
 
-static void
-test_coroutine(void *arg)
+static void test_coroutine(void *arg)
 {
 	(void)arg;
 	channel = machine_channel_create(1);
@@ -30,8 +29,9 @@ test_coroutine(void *arg)
 	machine_sleep(0);
 
 	machine_msg_t *msg;
-	msg = machine_msg_create(123, 0);
+	msg = machine_msg_create(0);
 	test(msg != NULL);
+	machine_msg_set_type(msg, 123);
 	machine_channel_write(channel, msg);
 
 	machine_sleep(0);
@@ -39,7 +39,7 @@ test_coroutine(void *arg)
 
 	msg = machine_channel_read(channel, UINT32_MAX);
 	test(msg != NULL);
-	test(machine_msg_get_type(msg) == 321);
+	test(machine_msg_type(msg) == 321);
 	machine_msg_free(msg);
 
 	machine_join(id);
@@ -47,8 +47,7 @@ test_coroutine(void *arg)
 	machine_channel_free(channel);
 }
 
-void
-machinarium_test_channel_shared_rw2(void)
+void machinarium_test_channel_shared_rw2(void)
 {
 	machinarium_init();
 

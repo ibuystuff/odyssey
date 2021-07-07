@@ -2,7 +2,7 @@
 ### Odyssey architecture and internals
 
 Odyssey heavily depends on two libraries, which were originally created during its
-development: Machinarium and Shapito.
+development: Machinarium and Kiwi.
 
 #### Machinarium
 
@@ -15,13 +15,13 @@ All synchronization is done using message passing and transparently handled by m
 
 Repository: [third\_party/machinarium](https://github.com/yandex/odyssey/tree/master/third_party/machinarium)
 
-#### Shapito
+#### Kiwi
 
-Shapito provides resizable buffers (streams) and methods for constructing, reading and validating
-PostgreSQL protocol requests. By design, all PostgreSQL specific details should be provided by
-Shapito library.
+Kiwi provides functions for constructing, reading and validating
+PostgreSQL protocol requests messages. By design, all PostgreSQL specific details should be provided by
+Kiwi library.
 
-Repository: [third\_party/shapito](https://github.com/yandex/odyssey/tree/master/third_party/shapito)
+Repository: [third\_party/kiwi](https://github.com/yandex/odyssey/tree/master/third_party/kiwi)
 
 #### Core components
 
@@ -45,7 +45,7 @@ Repository: [third\_party/shapito](https://github.com/yandex/odyssey/tree/master
 
 Application entry point.
 
-Handle initialization. Read configuration file, prepare loggers.
+Handle initialization. Read configuration file, prepare loggers, parse cli options.
 Run system and worker\_pool threads.
 
 [sources/instance.h](/sources/instance.h), [sources/instance.c](/sources/instance.c)
@@ -61,7 +61,8 @@ On incoming connection, new client context is created and notification message i
 worker using `workerpool_feed()`. Client IO context is not attached to any `epoll(7)` context yet.
 
 Handle signals using `machine_signal_wait()`. On `SIGHUP`: do versional config reload, add new databases
-and obsolete old ones. On `SIGINT`, `SIGTERM`: call `exit(3)`. Other threads are blocked from receiving signals.
+and obsolete old ones. On `SIGUSR1`: reopen log file. On `SIGUSR2`: graceful shutdown.
+On `SIGINT`, `SIGTERM`: call `exit(3)`. Other threads are blocked from receiving signals.
 
 [sources/system.h](/sources/system.h), [sources/system.c](/sources/system.c)
 
@@ -94,6 +95,13 @@ created using `machine_create()`.
 
 [sources/worker.h](/sources/worker.h), [sources/worker.c](/sources/worker.c),
 [sources/worker_pool.h](/sources/worker_pool.h), [sources/worker_pool.c](/sources/worker_pool.c)
+
+#### Single worker mode
+
+To reduce multi-thread communication overhead, Odyssey handles case with a single worker (`workers 1`)
+differently.
+
+Instead of creating separate thread + coroutine for each worker, only one worker coroutine created inside system thread. All message channels `machine_channel_create()` created marked as non-shared. This allows to make faster communications without a need to do expensive system calls for event loop wakeup.
 
 #### Client (frontend) lifecycle
 

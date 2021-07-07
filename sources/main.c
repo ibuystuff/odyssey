@@ -3,34 +3,17 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
+#include <odyssey.h>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <assert.h>
-
-#include <machinarium.h>
-#include <shapito.h>
-
-#include "sources/macro.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/instance.h"
 
 int main(int argc, char *argv[])
 {
 	od_instance_t odyssey;
 	od_instance_init(&odyssey);
+	odyssey.orig_argv_ptr = argv[0];
+
 	int rc = od_instance_main(&odyssey, argc, argv);
 	if (rc == -1) {
 		rc = EXIT_FAILURE;

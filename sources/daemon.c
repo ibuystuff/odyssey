@@ -3,25 +3,9 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-
-#include <unistd.h>
-#include <sys/fcntl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#include <machinarium.h>
-#include <shapito.h>
-
-#include "sources/macro.h"
-#include "sources/daemon.h"
+#include "daemon.h"
 
 int od_daemonize(void)
 {
@@ -40,7 +24,8 @@ int od_daemonize(void)
 	dup2(fd, 0);
 	dup2(fd, 1);
 	dup2(fd, 2);
-	if (fd > 2)
+	if (fd > 2) {
 		close(fd);
+	}
 	return 0;
 }

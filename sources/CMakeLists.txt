@@ -1,38 +1,63 @@
 
+configure_file("build.h.cmake" "build.h")
+
 set(od_binary ${CMAKE_PROJECT_NAME})
 set(od_src
-    pid.c
     daemon.c
+    pid.c
     logger.c
+    rules.c
     config.c
     config_reader.c
-    id.c
-    instance.c
-    server_pool.c
-    client_pool.c
-    route_pool.c
-    io.c
-    system.c
+    dns.c
     router.c
-    console.c
+    system.c
+    cron.c
     worker.c
-    worker_pool.c
+    tls.c
+    attribute.c
+    auth_query.c
+    auth.c
+    cancel.c
+    console.c
+    deploy.c
+    reset.c
     frontend.c
     backend.c
-    reset.c
-    deploy.c
-    auth.c
-    auth_query.c
-    cancel.c
-    cron.c
-    tls.c
+    instance.c
     main.c
-)
+    misc.c
+    tdigest.c
+    module.c
+    counter.c
+    err_logger.c
+    setproctitle.c
+    debugprintf.c
+    restart_sync.c
+    grac_shutdown_worker.c
+    sighandler.c
+    watchdog.c
+    ejection.c
+    thread_global.c
+    compression.c
+    option.c)
 
-configure_file("version.h.cmake" "version.h")
+if (PAM_FOUND)
+        list(APPEND od_src pam.c)
+endif()
+
+if (USE_SCRAM)
+        list(APPEND od_src scram.c)
+endif()
+
+if (LDAP_FOUND)
+        list(APPEND od_src ldap.c)
+endif()
 
 include_directories("${PROJECT_SOURCE_DIR}/")
+include_directories("${PROJECT_SOURCE_DIR}/sources")
 include_directories("${PROJECT_BINARY_DIR}/")
+include_directories("${PROJECT_BINARY_DIR}/sources")
 
 add_executable(${od_binary} ${od_src})
 add_dependencies(${od_binary} build_libs)
@@ -42,4 +67,8 @@ if(THREADS_HAVE_PTHREAD_ARG)
     set_property(TARGET ${od_binary} PROPERTY INTERFACE_COMPILE_OPTIONS "-pthread")
 endif()
 
-target_link_libraries(${od_binary} ${od_libraries} ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${od_binary} ${od_libraries} ${CMAKE_THREAD_LIBS_INIT} m)
+
+if (BUILD_COMPRESSION)
+    target_link_libraries(${od_binary} ${compression_libraries})
+endif()

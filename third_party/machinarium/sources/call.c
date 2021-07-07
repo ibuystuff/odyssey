@@ -3,13 +3,12 @@
  * machinarium.
  *
  * cooperative multitasking engine.
-*/
+ */
 
 #include <machinarium.h>
 #include <machinarium_private.h>
 
-static void
-mm_call_timer_cb(mm_timer_t *handle)
+static void mm_call_timer_cb(mm_timer_t *handle)
 {
 	mm_call_t *call = handle->arg;
 	call->timedout = 1;
@@ -18,8 +17,7 @@ mm_call_timer_cb(mm_timer_t *handle)
 		mm_scheduler_wakeup(&mm_self->scheduler, call->coroutine);
 }
 
-static void
-mm_call_cancel_cb(void *obj, void *arg)
+static void mm_call_cancel_cb(void *obj, void *arg)
 {
 	mm_call_t *call = arg;
 	(void)obj;
@@ -64,34 +62,6 @@ void mm_call(mm_call_t *call, mm_calltype_t type, uint32_t time_ms)
 
 	call->type = MM_CALL_NONE;
 	call->coroutine = NULL;
-	call->cancel_function = NULL;
-	call->arg = NULL;
-	coroutine->call_ptr = NULL;
-
-	mm_errno_set(call->status);
-}
-
-void mm_call_fast(mm_call_t *call, mm_calltype_t type,
-                  void (*function)(void*),
-                  void *arg)
-{
-	mm_scheduler_t *scheduler;
-	scheduler = &mm_self->scheduler;
-
-	mm_coroutine_t *coroutine;
-	coroutine = mm_scheduler_current(scheduler);
-
-	coroutine->call_ptr = call;
-	call->coroutine = NULL; /* not set */
-	call->type = type;
-	call->cancel_function = mm_call_cancel_cb;
-	call->arg = call;
-	call->timedout = 0;
-	call->status = 0;
-
-	function(arg);
-
-	call->type = MM_CALL_NONE;
 	call->cancel_function = NULL;
 	call->arg = NULL;
 	coroutine->call_ptr = NULL;

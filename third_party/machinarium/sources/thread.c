@@ -3,13 +3,13 @@
  * machinarium.
  *
  * cooperative multitasking engine.
-*/
+ */
 
 #include <machinarium.h>
 #include <machinarium_private.h>
 
 int mm_thread_create(mm_thread_t *thread, int stack_size,
-                     mm_thread_function_t function, void *arg)
+		     mm_thread_function_t function, void *arg)
 {
 	pthread_attr_t attr;
 	int rc;
@@ -42,4 +42,11 @@ int mm_thread_set_name(mm_thread_t *thread, char *name)
 	int rc;
 	rc = pthread_setname_np(thread->id, name);
 	return rc;
+}
+
+int mm_thread_disable_cancel(void)
+{
+	int unused;
+	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &unused);
+	return pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &unused);
 }

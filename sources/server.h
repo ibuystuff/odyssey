@@ -1,82 +1,84 @@
-#ifndef OD_SERVER_H
-#define OD_SERVER_H
+#ifndef ODYSSEY_SERVER_H
+#define ODYSSEY_SERVER_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-typedef struct od_serverstat od_serverstat_t;
-typedef struct od_server     od_server_t;
+typedef struct od_server od_server_t;
 
-typedef enum
-{
-	OD_SUNDEF,
-	OD_SIDLE,
-	OD_SACTIVE,
-	OD_SEXPIRE
-} od_serverstate_t;
+typedef enum {
+	OD_SERVER_UNDEF,
+	OD_SERVER_IDLE,
+	OD_SERVER_ACTIVE,
+} od_server_state_t;
 
-struct od_serverstat
-{
-	od_atomic_u64_t count_request;
-	od_atomic_u64_t count_tx;
-	od_atomic_u64_t count_reply;
-	od_atomic_u64_t recv_server;
-	od_atomic_u64_t recv_client;
-	od_atomic_u64_t query_time;
-	uint64_t        query_time_start;
-	uint64_t        count_error;
+struct od_server {
+	od_server_state_t state;
+#ifdef USE_SCRAM
+	od_scram_state_t scram_state;
+#endif
+	od_id_t id;
+	machine_tls_t *tls;
+	od_io_t io;
+	od_relay_t relay;
+	int is_allocated;
+	int is_transaction;
+	int is_copy;
+	int deploy_sync;
+	od_stat_state_t stats_state;
+	uint64_t sync_request;
+	uint64_t sync_reply;
+	int idle_time;
+	kiwi_key_t key;
+	kiwi_key_t key_client;
+	kiwi_vars_t vars;
+	machine_msg_t *error_connect;
+	void *client;
+	void *route;
+	od_global_t *global;
+	int offline;
+	uint64_t init_time_us;
+	od_list_t link;
+	bool synced_settings;
 };
 
-struct od_server
+static inline void od_server_init(od_server_t *server)
 {
-	od_serverstate_t      state;
-	od_id_t               id;
-	shapito_parameters_t  params;
-	machine_io_t         *io;
-	machine_tls_t        *tls;
-	int                   is_allocated;
-	int                   is_transaction;
-	int                   is_copy;
-	int                   deploy_sync;
-	od_serverstat_t       stats;
-	int                   idle_time;
-	shapito_key_t         key;
-	shapito_key_t         key_client;
-	od_id_t               last_client_id;
-	void                 *client;
-	void                 *route;
-	od_global_t          *global;
-	od_list_t             link;
-};
-
-static inline void
-od_server_init(od_server_t *server)
-{
-	server->state          = OD_SUNDEF;
-	server->route          = NULL;
-	server->client         = NULL;
-	server->global         = NULL;
-	server->io             = NULL;
-	server->tls            = NULL;
-	server->idle_time      = 0;
-	server->is_allocated   = 0;
+	server->state = OD_SERVER_UNDEF;
+	server->route = NULL;
+	server->client = NULL;
+	server->global = NULL;
+	server->tls = NULL;
+	server->idle_time = 0;
+	server->is_allocated = 0;
 	server->is_transaction = 0;
-	server->is_copy        = 0;
-	server->deploy_sync    = 0;
-	memset(&server->stats, 0, sizeof(server->stats));
-	shapito_key_init(&server->key);
-	shapito_key_init(&server->key_client);
-	shapito_parameters_init(&server->params);
+	server->is_copy = 0;
+	server->deploy_sync = 0;
+	server->sync_request = 0;
+	server->sync_reply = 0;
+	server->init_time_us = machine_time_us();
+	server->error_connect = NULL;
+	server->offline = 0;
+	server->synced_settings = false;
+	od_stat_state_init(&server->stats_state);
+
+#ifdef USE_SCRAM
+	od_scram_state_init(&server->scram_state);
+#endif
+
+	kiwi_key_init(&server->key);
+	kiwi_key_init(&server->key_client);
+	kiwi_vars_init(&server->vars);
+	od_io_init(&server->io);
+	od_relay_init(&server->relay, &server->io);
 	od_list_init(&server->link);
 	memset(&server->id, 0, sizeof(server->id));
-	memset(&server->last_client_id, 0, sizeof(server->last_client_id));
 }
 
-static inline od_server_t*
-od_server_allocate(void)
+static inline od_server_t *od_server_allocate(void)
 {
 	od_server_t *server = malloc(sizeof(*server));
 	if (server == NULL)
@@ -86,60 +88,45 @@ od_server_allocate(void)
 	return server;
 }
 
-static inline void
-od_server_free(od_server_t *server)
+static inline void od_server_free(od_server_t *server)
 {
-	shapito_parameters_free(&server->params);
-	if (server->is_allocated)
+	if (server->is_allocated) {
+		od_relay_free(&server->relay);
+		od_io_free(&server->io);
 		free(server);
+	}
 }
 
-static inline int
-od_server_sync_is(od_server_t *server)
+static inline void od_server_sync_request(od_server_t *server, uint64_t count)
 {
-	return server->stats.count_request == server->stats.count_reply;
+	server->sync_request += count;
 }
 
-static inline void
-od_server_stat_request(od_server_t *server, uint64_t count)
+static inline void od_server_sync_reply(od_server_t *server)
 {
-	server->stats.query_time_start = machine_time();
-	od_atomic_u64_add(&server->stats.count_request, count);
+	server->sync_reply++;
 }
 
-static inline uint64_t
-od_server_stat_reply(od_server_t *server)
+static inline int od_server_in_deploy(od_server_t *server)
 {
-	od_atomic_u64_inc(&server->stats.count_reply);
-
-	uint64_t diff = machine_time() - server->stats.query_time_start;
-	od_atomic_u64_add(&server->stats.query_time, diff);
-	server->stats.query_time_start = 0;
-	return diff;
+	return server->deploy_sync > 0;
 }
 
-static inline void
-od_server_stat_tx(od_server_t *server)
+static inline int od_server_synchronized(od_server_t *server)
 {
-	od_atomic_u64_inc(&server->stats.count_tx);
+	return server->sync_request == server->sync_reply;
 }
 
-static inline void
-od_server_stat_recv_server(od_server_t *server, uint64_t bytes)
+static inline int od_server_grac_shutdown(od_server_t *server)
 {
-	od_atomic_u64_add(&server->stats.recv_server, bytes);
+	server->offline = 1;
+	return 0;
 }
 
-static inline void
-od_server_stat_recv_client(od_server_t *server, uint64_t bytes)
+static inline int od_server_reload(od_server_t *server)
 {
-	od_atomic_u64_add(&server->stats.recv_client, bytes);
+	// TODO: set offline to 1 if storage/auth rules chaged
+	return 0;
 }
 
-static inline void
-od_server_stat_error(od_server_t *server)
-{
-	server->stats.count_error++;
-}
-
-#endif /* OD_SERVER_H */
+#endif /* ODYSSEY_SERVER_H */

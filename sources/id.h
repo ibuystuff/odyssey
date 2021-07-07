@@ -1,38 +1,53 @@
-#ifndef OD_ID_H
-#define OD_ID_H
+#ifndef ODYSSEY_ID_H
+#define ODYSSEY_ID_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-typedef struct od_id    od_id_t;
-typedef struct od_idmgr od_idmgr_t;
+typedef struct od_id od_id_t;
+typedef struct od_id_mgr od_id_mgr_t;
 
 #define OD_ID_SEEDMAX 6
 
-struct od_id
-{
-	char    *id_prefix;
-	char     id[OD_ID_SEEDMAX * 2];
+struct od_id {
+	char *id_prefix;
+	char id[OD_ID_SEEDMAX * 2];
 	uint64_t id_a;
 	uint64_t id_b;
 };
 
-struct od_idmgr
-{
-	struct drand48_data rand_state;
-};
-
-void od_idmgr_init(od_idmgr_t*);
-int  od_idmgr_seed(od_idmgr_t*);
-void od_idmgr_generate(od_idmgr_t*, od_id_t*, char*);
-
-static inline int
-od_idmgr_cmp(od_id_t *a, od_id_t *b)
+static inline int od_id_cmp(od_id_t *a, od_id_t *b)
 {
 	return memcmp(a->id, b->id, sizeof(a->id)) == 0;
 }
 
-#endif /* OD_ID_H */
+static inline void od_id_generate(od_id_t *id, char *prefix)
+{
+	long int a = machine_lrand48();
+	long int b = machine_lrand48();
+
+	char seed[OD_ID_SEEDMAX];
+	memcpy(seed + 0, &a, 4);
+	memcpy(seed + 4, &b, 2);
+
+	id->id_prefix = prefix;
+	id->id_a = a;
+	id->id_b = b;
+
+	static const char *hex = "0123456789abcdef";
+	int q, w;
+	for (q = 0, w = 0; q < OD_ID_SEEDMAX; q++) {
+		id->id[w++] = hex[(seed[q] >> 4) & 0x0F];
+		id->id[w++] = hex[(seed[q]) & 0x0F];
+	}
+#if OD_DEVEL_LVL != -1
+	assert(w == (OD_ID_SEEDMAX * 2));
+#endif
+}
+
+void od_id_generator_seed(void);
+
+#endif /* ODYSSEY_ID_H */

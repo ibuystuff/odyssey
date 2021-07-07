@@ -1,56 +1,66 @@
-#ifndef OD_ROUTER_H
-#define OD_ROUTER_H
+#ifndef ODYSSEY_ROUTER_H
+#define ODYSSEY_ROUTER_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
 typedef struct od_router od_router_t;
 
-typedef enum
-{
-	OD_ROK,
-	OD_RERROR,
-	OD_RERROR_NOT_FOUND,
-	OD_RERROR_LIMIT,
-	OD_RERROR_TIMEDOUT
-} od_routerstatus_t;
+struct od_router {
+	pthread_mutex_t lock;
 
-struct od_router
-{
-	od_routepool_t     route_pool;
-	machine_channel_t *channel;
-	int                clients;
-	od_global_t       *global;
+	od_rules_t rules;
+	od_route_pool_t route_pool;
+	/* clients */
+	od_atomic_u32_t clients;
+	od_atomic_u32_t clients_routing;
+	/* servers */
+	od_atomic_u32_t servers_routing;
+	/* error logging */
+	od_error_logger_t *router_err_logger;
+
+	/* global */
+	od_global_t *global;
+
+	/* router has type of list */
+	od_list_t servers;
 };
 
-void od_router_init(od_router_t*, od_global_t*);
-int  od_router_start(od_router_t*);
+#define od_router_lock(router) pthread_mutex_lock(&router->lock);
+#define od_router_unlock(router) pthread_mutex_unlock(&router->lock);
 
-od_routerstatus_t
-od_route(od_client_t*);
+void od_router_init(od_router_t *, od_global_t *);
+void od_router_free(od_router_t *);
 
-od_routerstatus_t
-od_unroute(od_client_t*);
+int od_router_reconfigure(od_router_t *, od_rules_t *);
+int od_router_expire(od_router_t *, od_list_t *);
+void od_router_gc(od_router_t *);
+void od_router_stat(od_router_t *, uint64_t, od_route_pool_stat_cb_t, void **);
 
-od_routerstatus_t
-od_router_attach(od_client_t*);
+extern int od_router_foreach(od_router_t *, od_route_pool_cb_t, void **);
 
-od_routerstatus_t
-od_router_detach(od_client_t*);
+od_router_status_t od_router_route(od_router_t *router, od_client_t *client);
 
-od_routerstatus_t
-od_router_detach_and_unroute(od_client_t*);
+void od_router_unroute(od_router_t *, od_client_t *);
 
-od_routerstatus_t
-od_router_close(od_client_t*);
+od_router_status_t od_router_attach(od_router_t *, od_client_t *, bool);
+void od_router_detach(od_router_t *, od_client_t *);
+void od_router_close(od_router_t *, od_client_t *);
 
-od_routerstatus_t
-od_router_close_and_unroute(od_client_t*);
+od_router_status_t od_router_cancel(od_router_t *, kiwi_key_t *,
+				    od_router_cancel_t *);
 
-od_routerstatus_t
-od_router_cancel(od_client_t*, od_routercancel_t*);
+void od_router_kill(od_router_t *, od_id_t *);
 
-#endif /* OD_ROUTER_H */
+static inline int
+od_route_pool_stat_err_router(od_router_t *router,
+			      od_route_pool_stat_route_error_cb_t callback,
+			      void **argv)
+{
+	return callback(router->router_err_logger, argv);
+}
+
+#endif /* ODYSSEY_ROUTER_H */

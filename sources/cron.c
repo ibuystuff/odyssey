@@ -3,341 +3,263 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
-
+#include <kiwi.h>
 #include <machinarium.h>
-#include <shapito.h>
+#include <odyssey.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/frontend.h"
-#include "sources/backend.h"
-#include "sources/cron.h"
-
-static inline int
-od_cron_stats_server(od_server_t *server, void *arg)
+static int od_cron_stat_cb(od_route_t *route, od_stat_t *current,
+			   od_stat_t *avg, void **argv)
 {
-	od_serverstat_t *stats = arg;
-	stats->query_time    += od_atomic_u64_of(&server->stats.query_time);
-	stats->count_request += od_atomic_u64_of(&server->stats.count_request);
-	stats->count_tx      += od_atomic_u64_of(&server->stats.count_tx);
-	stats->recv_client   += od_atomic_u64_of(&server->stats.recv_client);
-	stats->recv_server   += od_atomic_u64_of(&server->stats.recv_server);
+	od_instance_t *instance = argv[0];
+	(void)current;
+
+	struct {
+		int database_len;
+		char database[64];
+		int user_len;
+		char user[64];
+		int obsolete;
+		int client_pool_total;
+		int server_pool_active;
+		int server_pool_idle;
+		uint64_t avg_count_tx;
+		uint64_t avg_tx_time;
+		uint64_t avg_count_query;
+		uint64_t avg_query_time;
+		uint64_t avg_recv_client;
+		uint64_t avg_recv_server;
+	} info;
+
+	od_route_lock(route);
+
+	info.database_len = route->id.database_len - 1;
+	if (info.database_len > (int)sizeof(info.database))
+		info.database_len = sizeof(info.database);
+
+	info.user_len = route->id.user_len - 1;
+	if (info.user_len > (int)sizeof(info.user))
+		info.user_len = sizeof(info.user);
+
+	memcpy(info.database, route->id.database, route->id.database_len);
+	memcpy(info.user, route->id.user, route->id.user_len);
+
+	info.obsolete = route->rule->obsolete;
+	info.client_pool_total = od_client_pool_total(&route->client_pool);
+	info.server_pool_active = route->server_pool.count_active;
+	info.server_pool_idle = route->server_pool.count_idle;
+
+	info.avg_count_query = avg->count_query;
+	info.avg_count_tx = avg->count_tx;
+	info.avg_query_time = avg->query_time;
+	info.avg_tx_time = avg->tx_time;
+	info.avg_recv_server = avg->recv_server;
+	info.avg_recv_client = avg->recv_client;
+
+	od_route_unlock(route);
+
+	od_log(&instance->logger, "stats", NULL, NULL,
+	       "[%.*s.%.*s%s] %d clients, "
+	       "%d active servers, "
+	       "%d idle servers, "
+	       "%" PRIu64 " transactions/sec (%" PRIu64 " usec) "
+	       "%" PRIu64 " queries/sec (%" PRIu64 " usec) "
+	       "%" PRIu64 " in bytes/sec, "
+	       "%" PRIu64 " out bytes/sec",
+	       info.database_len, info.database, info.user_len, info.user,
+	       info.obsolete ? " obsolete" : "", info.client_pool_total,
+	       info.server_pool_active, info.server_pool_idle,
+	       info.avg_count_tx, info.avg_tx_time, info.avg_count_query,
+	       info.avg_query_time, info.avg_recv_client, info.avg_recv_server);
+
 	return 0;
 }
 
-static inline void
-od_cron_stats(od_router_t *router)
-{
-	od_instance_t *instance = router->global->instance;
-
-	if (router->route_pool.count == 0)
-		return;
-
-	if (instance->config.log_stats)
-	{
-		int stream_count = 0;
-		int stream_count_allocated = 0;
-		int stream_total_allocated = 0;
-		int stream_cache_size = 0;
-		shapito_cache_stat(&instance->stream_cache, &stream_count,
-		                   &stream_count_allocated, &stream_total_allocated,
-		                   &stream_cache_size);
-		int count_machine = 0;
-		int count_coroutine = 0;
-		int count_coroutine_cache = 0;
-		machinarium_stat(&count_machine, &count_coroutine,
-		                 &count_coroutine_cache);
-		od_log(&instance->logger, "stats", NULL, NULL,
-		       "clients %d, stream cache (%d:%d allocated, %d cached %d bytes), "
-		       "coroutines (%d active, %d cached)",
-		       router->clients,
-		       stream_count_allocated,
-		       stream_total_allocated,
-		       stream_count,
-		       stream_cache_size,
-		       count_coroutine,
-		       count_coroutine_cache);
-	}
-
-	od_list_t *i;
-	od_list_foreach(&router->route_pool.list, i)
-	{
-		od_route_t *route;
-		route = od_container_of(i, od_route_t, link);
-
-		/* gather statistics per route server pool */
-		od_serverstat_t stats;
-		memset(&stats, 0, sizeof(stats));
-
-		od_serverpool_foreach(&route->server_pool, OD_SACTIVE,
-		                      od_cron_stats_server,
-		                      &stats);
-		od_serverpool_foreach(&route->server_pool, OD_SIDLE,
-		                      od_cron_stats_server,
-		                      &stats);
-
-		/* calculate average between previous sample and the
-		   current one */
-		uint64_t recv_client = 0;
-		uint64_t recv_server = 0;
-		uint64_t reqs = 0;
-		uint64_t tps = 0;
-		uint64_t query_time = 0;
-
-		/* ensure server stats not changed due to a
-		 * server connection close */
-		int64_t  reqs_diff_sanity;
-		reqs_diff_sanity = (stats.count_request - route->cron_stats.count_request);
-
-		if (reqs_diff_sanity >= 0)
-		{
-			/* request count */
-			uint64_t reqs_prev = 0;
-			reqs_prev = route->cron_stats.count_request /
-			            instance->config.stats_interval;
-
-			uint64_t reqs_current = 0;
-			reqs_current = stats.count_request /
-			               instance->config.stats_interval;
-
-			int64_t reqs_diff;
-			reqs_diff = reqs_current - reqs_prev;
-
-			reqs = reqs_diff / instance->config.stats_interval;
-
-			/* transaction count */
-			uint64_t tps_prev = 0;
-			tps_prev = route->cron_stats.count_tx /
-			           instance->config.stats_interval;
-
-			uint64_t tps_current = 0;
-			tps_current = stats.count_tx /
-			              instance->config.stats_interval;
-
-			int64_t tps_diff;
-			tps_diff = tps_current - tps_prev;
-
-			tps = tps_diff / instance->config.stats_interval;
-
-			/* recv client */
-			uint64_t recv_client_prev = 0;
-			recv_client_prev = route->cron_stats.recv_client /
-			                    instance->config.stats_interval;
-
-			uint64_t recv_client_current = 0;
-			recv_client_current = stats.recv_client /
-			                      instance->config.stats_interval;
-
-			recv_client = (recv_client_current - recv_client_prev) /
-			               instance->config.stats_interval;
-
-			/* recv server */
-			uint64_t recv_server_prev = 0;
-			recv_server_prev = route->cron_stats.recv_server /
-			                   instance->config.stats_interval;
-
-			uint64_t recv_server_current = 0;
-			recv_server_current = stats.recv_server /
-			                      instance->config.stats_interval;
-
-			recv_server = (recv_server_current - recv_server_prev) /
-			               instance->config.stats_interval;
-
-			/* query time */
-			if (reqs_diff > 0)
-				query_time = (stats.query_time - route->cron_stats.query_time) /
-				              reqs_diff;
-		}
-
-		/* update stats */
-		route->cron_stats = stats;
-
-		route->cron_stats_avg.count_request = reqs;
-		route->cron_stats_avg.count_tx      = tps;
-		route->cron_stats_avg.recv_client   = recv_client;
-		route->cron_stats_avg.recv_server   = recv_server;
-		route->cron_stats_avg.query_time    = query_time;
-
-		if (instance->config.log_stats) {
-			od_log(&instance->logger, "stats", NULL, NULL,
-			       "[%.*s.%.*s] clients %d, "
-			       "pool_active %d, "
-			       "pool_idle %d "
-			       "rps %" PRIu64 " "
-			       "tps %" PRIu64 " "
-			       "query_time_us %" PRIu64 " "
-			       "recv_client_bytes %" PRIu64 " "
-			       "recv_server_bytes %" PRIu64,
-			       route->id.database_len,
-			       route->id.database,
-			       route->id.user_len,
-			       route->id.user,
-			       od_clientpool_total(&route->client_pool),
-			       route->server_pool.count_active,
-			       route->server_pool.count_idle,
-			       reqs,
-			       tps,
-			       query_time,
-			       recv_client,
-			       recv_server);
-		}
-	}
-}
-
-static inline int
-od_cron_expire_mark(od_server_t *server, void *arg)
-{
-	od_router_t *router = arg;
-	od_instance_t *instance = router->global->instance;
-	od_route_t *route = server->route;
-
-	/* expire by time-to-live */
-	if (! route->config->pool_ttl)
-		return 0;
-
-	od_debug(&instance->logger, "expire", NULL, server,
-	         "idle time: %d",
-	         server->idle_time);
-
-	if (server->idle_time < route->config->pool_ttl) {
-		server->idle_time++;
-		return 0;
-	}
-	od_serverpool_set(&route->server_pool, server,
-	                  OD_SEXPIRE);
-	return 0;
-}
-
-static inline void
-od_cron_expire(od_cron_t *cron)
+static inline void od_cron_stat(od_cron_t *cron)
 {
 	od_router_t *router = cron->global->router;
 	od_instance_t *instance = cron->global->instance;
+	od_worker_pool_t *worker_pool = cron->global->worker_pool;
 
-	/* Idle servers expire.
-	 *
-	 * It is important that mark logic stage must not yield
-	 * to maintain iterator consistency.
-	 *
-	 * mark:
-	 *
-	 *  - If a server idle time is equal to ttl, then move
-	 *    it to the EXPIRE queue.
-	 *
-	 *  - If a server config marked as obsolete and route has
-	 *    no remaining clients, then move it to the EXPIRE queue.
-	 *
-	 *  - Add plus one idle second on each traversal.
-	 *
-	 * sweep:
-	 *
-	 *  - Foreach servers in EXPIRE queue, send Terminate
-	 *    and close the connection.
-	*/
+	if (instance->config.log_stats) {
+		/* system worker stats */
+		uint64_t count_coroutine = 0;
+		uint64_t count_coroutine_cache = 0;
+		uint64_t msg_allocated = 0;
+		uint64_t msg_cache_count = 0;
+		uint64_t msg_cache_gc_count = 0;
+		uint64_t msg_cache_size = 0;
 
-	/* mark */
-	od_routepool_server_foreach(&router->route_pool, OD_SIDLE,
-	                            od_cron_expire_mark,
-	                            router);
+		od_atomic_u64_t startup_errors =
+			od_atomic_u64_of(&cron->startup_errors);
+		cron->startup_errors = 0;
+		machine_stat(&count_coroutine, &count_coroutine_cache,
+			     &msg_allocated, &msg_cache_count,
+			     &msg_cache_gc_count, &msg_cache_size);
+		od_log(&instance->logger, "stats", NULL, NULL,
+		       "system worker: msg (%" PRIu64 " allocated, %" PRIu64
+		       " cached, %" PRIu64 " freed, %" PRIu64 " cache_size), "
+		       "coroutines (%" PRIu64 " active, %" PRIu64
+		       " cached) startup errors %" PRIu64,
+		       msg_allocated, msg_cache_count, msg_cache_gc_count,
+		       msg_cache_size, count_coroutine, count_coroutine_cache,
+		       startup_errors);
 
-	/* sweep */
-	for (;;) {
-		od_server_t *server;
-		server = od_routepool_next(&router->route_pool, OD_SEXPIRE);
-		if (server == NULL)
-			break;
-		od_debug(&instance->logger, "expire", NULL, server,
-		         "closing idle server connection (%d secs)",
-		         server->idle_time);
-		server->idle_time = 0;
+		/* request stats per worker */
+		int i;
+		for (i = 0; i < worker_pool->count; i++) {
+			od_worker_t *worker = &worker_pool->pool[i];
+			machine_msg_t *msg;
+			msg = machine_msg_create(0);
+			machine_msg_set_type(msg, OD_MSG_STAT);
+			machine_channel_write(worker->task_channel, msg);
+		}
 
-		od_route_t *route = server->route;
-		server->route = NULL;
-		od_serverpool_set(&route->server_pool, server, OD_SUNDEF);
-
-		if (instance->is_shared)
-			machine_io_attach(server->io);
-
-		od_backend_close_connection(server);
-		od_backend_close(server);
+		od_log(&instance->logger, "stats", NULL, NULL, "clients %d",
+		       od_atomic_u32_of(&router->clients));
 	}
 
-	/* cleanup unused dynamic routes */
-	od_routepool_gc(&router->route_pool);
+	/* update stats per route and print info */
+	od_route_pool_stat_cb_t stat_cb;
+	if (!instance->config.log_stats) {
+		stat_cb = NULL;
+	} else {
+		stat_cb = od_cron_stat_cb;
+	}
+	void *argv[] = { instance };
+	od_router_stat(router, cron->stat_time_us, stat_cb, argv);
+
+	/* update current stat time mark */
+	cron->stat_time_us = machine_time_us();
 }
 
-static void
-od_cron(void *arg)
+static inline void od_cron_expire(od_cron_t *cron)
+{
+	od_router_t *router = cron->global->router;
+
+	od_instance_t *instance = cron->global->instance;
+
+	/* collect and close expired idle servers */
+	od_list_t expire_list;
+	od_list_init(&expire_list);
+
+	int rc;
+	rc = od_router_expire(router, &expire_list);
+	if (rc > 0) {
+		od_list_t *i, *n;
+		od_list_foreach_safe(&expire_list, i, n)
+		{
+			od_server_t *server;
+			server = od_container_of(i, od_server_t, link);
+			od_debug(&instance->logger, "expire", NULL, server,
+				 "closing idle server connection (%d secs)",
+				 server->idle_time);
+			server->route = NULL;
+			od_backend_close_connection(server);
+			od_backend_close(server);
+		}
+	}
+
+	/* cleanup unused dynamic or obsolete routes */
+	od_router_gc(router);
+}
+
+static void od_cron_err_stat(od_cron_t *cron)
+{
+	od_router_t *router = cron->global->router;
+
+	od_list_t *it;
+	od_list_foreach(&router->route_pool.list, it)
+	{
+		od_route_t *current_route =
+			od_container_of(it, od_route_t, link);
+		od_route_lock(current_route);
+		{
+			if (current_route->extra_logging_enabled) {
+				od_err_logger_inc_interval(
+					current_route->err_logger);
+			}
+		}
+		od_route_unlock(current_route);
+	}
+
+	od_router_lock(router)
+	{
+		od_err_logger_inc_interval(router->router_err_logger);
+	}
+	od_router_unlock(router)
+
+		od_route_pool_lock(router->route_pool)
+	{
+		od_err_logger_inc_interval(router->route_pool.err_logger);
+	}
+	od_route_pool_unlock(router->route_pool)
+}
+
+static void od_cron(void *arg)
 {
 	od_cron_t *cron = arg;
-	od_router_t *router = cron->global->router;
 	od_instance_t *instance = cron->global->instance;
 
-	int stats_tick = 0;
-	for (;;)
-	{
-		/* mark and sweep expired idle server connections */
-		od_cron_expire(cron);
+	cron->stat_time_us = machine_time_us();
+	cron->online = 1;
 
-		/* update stats */
-		if (++stats_tick >= instance->config.stats_interval) {
-			od_cron_stats(router);
-			stats_tick = 0;
+	int stats_tick = 0;
+	for (;;) {
+		if (!cron->online) {
+			return;
 		}
 
+		// we take a lock here
+		// to prevent usage routes that are deallocated while shutdown
+		pthread_mutex_lock(&cron->lock);
+		{
+			/* mark and sweep expired idle server connections */
+			od_cron_expire(cron);
+
+			/* update statistics */
+			if (++stats_tick >= instance->config.stats_interval) {
+				od_cron_stat(cron);
+				stats_tick = 0;
+			}
+
+			od_cron_err_stat(cron);
+		}
+		pthread_mutex_unlock(&cron->lock);
 		/* 1 second soft interval */
 		machine_sleep(1000);
 	}
 }
 
-void od_cron_init(od_cron_t *cron, od_global_t *global)
+void od_cron_init(od_cron_t *cron)
 {
-	cron->global = global;
+	cron->stat_time_us = 0;
+	cron->global = NULL;
+	cron->startup_errors = 0;
+
+	cron->online = 0;
+	pthread_mutex_init(&cron->lock, NULL);
 }
 
-int od_cron_start(od_cron_t *cron)
+int od_cron_start(od_cron_t *cron, od_global_t *global)
 {
-	od_instance_t *instance = cron->global->instance;
+	cron->global = global;
+	od_instance_t *instance = global->instance;
 	int64_t coroutine_id;
 	coroutine_id = machine_coroutine_create(od_cron, cron);
-	if (coroutine_id == -1) {
+	if (coroutine_id == INVALID_COROUTINE_ID) {
 		od_error(&instance->logger, "cron", NULL, NULL,
-		         "failed to start cron coroutine");
-		return -1;
+			 "failed to start cron coroutine");
+		return NOT_OK_RESPONSE;
 	}
-	return 0;
+
+	return OK_RESPONSE;
+}
+
+od_retcode_t od_cron_stop(od_cron_t *cron)
+{
+	cron->online = 0;
+	pthread_mutex_lock(&cron->lock);
+	return OK_RESPONSE;
 }

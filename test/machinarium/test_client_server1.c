@@ -5,8 +5,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 
-static void
-server(void *arg)
+static void server(void *arg)
 {
 	(void)arg;
 	machine_io_t *server = machine_io_create();
@@ -17,7 +16,8 @@ server(void *arg)
 	sa.sin_addr.s_addr = inet_addr("127.0.0.1");
 	sa.sin_port = htons(7778);
 	int rc;
-	rc = machine_bind(server, (struct sockaddr*)&sa);
+	rc = machine_bind(server, (struct sockaddr *)&sa,
+			  MM_BINDWITH_SO_REUSEADDR);
 	test(rc == 0);
 
 	machine_io_t *client;
@@ -27,8 +27,19 @@ server(void *arg)
 	rc = machine_io_attach(client);
 	test(rc == 0);
 
-	char msg[] = "hello world" "HELLO WORLD" "a" "b" "c" "333";
-	rc = machine_write(client, msg, sizeof(msg), UINT32_MAX);
+	machine_msg_t *msg;
+	msg = machine_msg_create(0);
+	test(msg != NULL);
+	char text[] = "hello world"
+		      "HELLO WORLD"
+		      "a"
+		      "b"
+		      "c"
+		      "333";
+	rc = machine_msg_write(msg, text, sizeof(text));
+	test(rc == 0);
+
+	rc = machine_write(client, msg, UINT32_MAX);
 	test(rc == 0);
 
 	rc = machine_close(client);
@@ -40,8 +51,7 @@ server(void *arg)
 	machine_io_free(server);
 }
 
-static void
-client(void *arg)
+static void client(void *arg)
 {
 	(void)arg;
 	machine_io_t *client = machine_io_create();
@@ -52,72 +62,50 @@ client(void *arg)
 	sa.sin_addr.s_addr = inet_addr("127.0.0.1");
 	sa.sin_port = htons(7778);
 	int rc;
-	rc = machine_connect(client, (struct sockaddr*)&sa, UINT32_MAX);
+	rc = machine_connect(client, (struct sockaddr *)&sa, UINT32_MAX);
 	test(rc == 0);
 
-	rc = machine_set_readahead(client, 16834);
-	test(rc == 0);
+	machine_msg_t *msg;
+	msg = machine_read(client, 11, UINT32_MAX);
+	test(msg != NULL);
+	test(memcmp(machine_msg_data(msg), "hello world", 11) == 0);
+	machine_msg_free(msg);
 
-	machine_io_t *io_set_ready[] = {NULL};
-	machine_io_t *io_set[] = {client};
+	msg = machine_read(client, 11, UINT32_MAX);
+	test(msg != NULL);
+	test(memcmp(machine_msg_data(msg), "HELLO WORLD", 11) == 0);
+	machine_msg_free(msg);
 
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
+	msg = machine_read(client, 1, UINT32_MAX);
+	test(msg != NULL);
+	test(memcmp(machine_msg_data(msg), "a", 1) == 0);
+	machine_msg_free(msg);
 
-	char buf[16];
-	rc = machine_read(client, buf, 11, UINT32_MAX);
-	test(rc == 0);
-	test(memcmp(buf, "hello world", 11) == 0);
+	msg = machine_read(client, 1, UINT32_MAX);
+	test(msg != NULL);
+	test(memcmp(machine_msg_data(msg), "b", 1) == 0);
+	machine_msg_free(msg);
 
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
+	msg = machine_read(client, 1, UINT32_MAX);
+	test(msg != NULL);
+	test(memcmp(machine_msg_data(msg), "c", 1) == 0);
+	machine_msg_free(msg);
 
-	rc = machine_read(client, buf, 11, UINT32_MAX);
-	test(rc == 0);
-	test(memcmp(buf, "HELLO WORLD", 11) == 0);
-
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
-
-	rc = machine_read(client, buf, 1, UINT32_MAX);
-	test(rc == 0);
-	test(*buf == 'a');
-
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
-
-	rc = machine_read(client, buf, 1, UINT32_MAX);
-	test(rc == 0);
-	test(*buf == 'b');
-
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
-
-	rc = machine_read(client, buf, 1, UINT32_MAX);
-	test(rc == 0);
-	test(*buf == 'c');
-
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
-
-	rc = machine_read(client, buf, 4, UINT32_MAX);
-	test(rc == 0);
-	test(memcmp(buf, "333", 4) == 0);
+	msg = machine_read(client, 4, UINT32_MAX);
+	test(msg != NULL);
+	test(memcmp(machine_msg_data(msg), "333", 4) == 0);
+	machine_msg_free(msg);
 
 	/* eof */
-	rc = machine_read_poll(io_set, io_set_ready, 1, UINT32_MAX);
-	test(rc == 1);
-
-	rc = machine_read(client, buf, 1, UINT32_MAX);
-	test(rc == -1);
+	msg = machine_read(client, 1, UINT32_MAX);
+	test(msg == NULL);
 
 	rc = machine_close(client);
 	test(rc == 0);
 	machine_io_free(client);
 }
 
-static void
-test_cs(void *arg)
+static void test_cs(void *arg)
 {
 	(void)arg;
 	int rc;
@@ -128,8 +116,7 @@ test_cs(void *arg)
 	test(rc != -1);
 }
 
-void
-machinarium_test_client_server1(void)
+void machinarium_test_client_server1(void)
 {
 	machinarium_init();
 

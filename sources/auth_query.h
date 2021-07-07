@@ -1,13 +1,14 @@
-#ifndef OD_AUTH_QUERY_H
-#define OD_AUTH_QUERY_H
+#ifndef ODYSSEY_AUTH_QUERY_H
+#define ODYSSEY_AUTH_QUERY_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-int od_auth_query(od_global_t*, shapito_stream_t*, od_configroute_t*,
-                  shapito_parameter_t*, shapito_password_t*);
+#define ODYSSEY_AUTH_QUERY_MAX_PASSSWORD_LEN 4096
 
-#endif /* OD_AUTH_QUERY_H */
+int od_auth_query(od_client_t *, char *);
+
+#endif /* ODYSSEY_AUTH_QUERY_H */

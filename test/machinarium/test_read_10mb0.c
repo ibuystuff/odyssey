@@ -5,8 +5,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 
-static void
-server(void *arg)
+static void server(void *arg)
 {
 	(void)arg;
 	machine_io_t *server = machine_io_create();
@@ -17,7 +16,8 @@ server(void *arg)
 	sa.sin_addr.s_addr = inet_addr("127.0.0.1");
 	sa.sin_port = htons(7778);
 	int rc;
-	rc = machine_bind(server, (struct sockaddr*)&sa);
+	rc = machine_bind(server, (struct sockaddr *)&sa,
+			  MM_BINDWITH_SO_REUSEADDR);
 	test(rc == 0);
 
 	machine_io_t *client;
@@ -25,18 +25,19 @@ server(void *arg)
 	test(rc == 0);
 
 	int chunk_size = 10 * 1024;
-	char *chunk = malloc(chunk_size);
-	test(chunk != NULL);
-	memset(chunk, 'x', chunk_size);
-
 	int total = 10 * 1024 * 1024;
 	int pos = 0;
 	while (pos < total) {
-		rc = machine_write(client, chunk, chunk_size, UINT32_MAX);
+		machine_msg_t *msg;
+		msg = machine_msg_create(0);
+		test(msg != NULL);
+		rc = machine_msg_write(msg, NULL, chunk_size);
+		test(rc == 0);
+		memset(machine_msg_data(msg), 'x', chunk_size);
+		rc = machine_write(client, msg, UINT32_MAX);
 		test(rc == 0);
 		pos += chunk_size;
 	}
-	free(chunk);
 
 	rc = machine_close(client);
 	test(rc == 0);
@@ -47,8 +48,7 @@ server(void *arg)
 	machine_io_free(server);
 }
 
-static void
-client(void *arg)
+static void client(void *arg)
 {
 	(void)arg;
 	machine_io_t *client = machine_io_create();
@@ -59,15 +59,16 @@ client(void *arg)
 	sa.sin_addr.s_addr = inet_addr("127.0.0.1");
 	sa.sin_port = htons(7778);
 	int rc;
-	rc = machine_connect(client, (struct sockaddr*)&sa, UINT32_MAX);
+	rc = machine_connect(client, (struct sockaddr *)&sa, UINT32_MAX);
 	test(rc == 0);
 
-	char buf[1024];
 	int pos = 0;
 	while (1) {
-		rc = machine_read(client, buf, 1024, UINT32_MAX);
-		if (rc == -1)
+		machine_msg_t *msg;
+		msg = machine_read(client, 1024, UINT32_MAX);
+		if (msg == NULL)
 			break;
+		machine_msg_free(msg);
 		pos += 1024;
 	}
 	test(pos == 10 * 1024 * 1024);
@@ -77,8 +78,7 @@ client(void *arg)
 	machine_io_free(client);
 }
 
-static void
-test_cs(void *arg)
+static void test_cs(void *arg)
 {
 	(void)arg;
 	int rc;
@@ -89,8 +89,7 @@ test_cs(void *arg)
 	test(rc != -1);
 }
 
-void
-machinarium_test_read_10mb0(void)
+void machinarium_test_read_10mb0(void)
 {
 	machinarium_init();
 

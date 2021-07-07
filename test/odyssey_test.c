@@ -3,7 +3,7 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
 #include <stdlib.h>
 #include <stdarg.h>
@@ -13,7 +13,6 @@
 #include <inttypes.h>
 
 #include <machinarium.h>
-#include <shapito.h>
 #include <odyssey_test.h>
 
 extern void machinarium_test_init(void);
@@ -22,11 +21,12 @@ extern void machinarium_test_create1(void);
 extern void machinarium_test_config(void);
 extern void machinarium_test_context_switch(void);
 extern void machinarium_test_sleep(void);
+extern void machinarium_test_sleep_random(void);
 extern void machinarium_test_sleep_yield(void);
 extern void machinarium_test_sleep_cancel0(void);
 extern void machinarium_test_join(void);
 extern void machinarium_test_condition0(void);
-extern void machinarium_test_condition1(void);
+extern void machinarium_test_eventfd0(void);
 extern void machinarium_test_stat(void);
 extern void machinarium_test_signal0(void);
 extern void machinarium_test_signal1(void);
@@ -43,8 +43,10 @@ extern void machinarium_test_channel_shared_create(void);
 extern void machinarium_test_channel_shared_rw0(void);
 extern void machinarium_test_channel_shared_rw1(void);
 extern void machinarium_test_channel_shared_rw2(void);
+extern void machinarium_test_sleeplock(void);
 extern void machinarium_test_producer_consumer0(void);
 extern void machinarium_test_producer_consumer1(void);
+extern void machinarium_test_producer_consumer2(void);
 extern void machinarium_test_io_new(void);
 extern void machinarium_test_connect(void);
 extern void machinarium_test_connect_timeout(void);
@@ -58,22 +60,25 @@ extern void machinarium_test_getaddrinfo2(void);
 extern void machinarium_test_client_server0(void);
 extern void machinarium_test_client_server1(void);
 extern void machinarium_test_client_server2(void);
+extern void machinarium_test_client_server_unix_socket(void);
 extern void machinarium_test_read_10mb0(void);
 extern void machinarium_test_read_10mb1(void);
 extern void machinarium_test_read_10mb2(void);
 extern void machinarium_test_read_timeout(void);
 extern void machinarium_test_read_cancel(void);
-extern void machinarium_test_read_poll0(void);
-extern void machinarium_test_read_poll1(void);
-extern void machinarium_test_read_poll2(void);
-extern void machinarium_test_read_poll3(void);
 extern void machinarium_test_read_var(void);
 extern void machinarium_test_tls0(void);
+extern void machinarium_test_tls_unix_socket(void);
 extern void machinarium_test_tls_read_10mb0(void);
 extern void machinarium_test_tls_read_10mb1(void);
 extern void machinarium_test_tls_read_10mb2(void);
-extern void machinarium_test_tls_read_10mb_poll(void);
+extern void machinarium_test_tls_read_multithread(void);
 extern void machinarium_test_tls_read_var(void);
+
+extern void odyssey_test_tdigest(void);
+extern void odyssey_test_attribute(void);
+extern void odyssey_test_util(void);
+extern void odyssey_test_lock(void);
 
 int main(int argc, char *argv[])
 {
@@ -85,11 +90,12 @@ int main(int argc, char *argv[])
 	odyssey_test(machinarium_test_config);
 	odyssey_test(machinarium_test_context_switch);
 	odyssey_test(machinarium_test_sleep);
+	odyssey_test(machinarium_test_sleep_random);
 	odyssey_test(machinarium_test_sleep_yield);
 	odyssey_test(machinarium_test_sleep_cancel0);
 	odyssey_test(machinarium_test_join);
 	odyssey_test(machinarium_test_condition0);
-	odyssey_test(machinarium_test_condition1);
+	odyssey_test(machinarium_test_eventfd0);
 	odyssey_test(machinarium_test_stat);
 	odyssey_test(machinarium_test_signal0);
 	odyssey_test(machinarium_test_signal1);
@@ -106,8 +112,10 @@ int main(int argc, char *argv[])
 	odyssey_test(machinarium_test_channel_shared_rw0);
 	odyssey_test(machinarium_test_channel_shared_rw1);
 	odyssey_test(machinarium_test_channel_shared_rw2);
+	odyssey_test(machinarium_test_sleeplock);
 	odyssey_test(machinarium_test_producer_consumer0);
 	odyssey_test(machinarium_test_producer_consumer1);
+	odyssey_test(machinarium_test_producer_consumer2);
 	odyssey_test(machinarium_test_io_new);
 	odyssey_test(machinarium_test_connect);
 	odyssey_test(machinarium_test_connect_timeout);
@@ -121,21 +129,24 @@ int main(int argc, char *argv[])
 	odyssey_test(machinarium_test_client_server0);
 	odyssey_test(machinarium_test_client_server1);
 	odyssey_test(machinarium_test_client_server2);
+	odyssey_test(machinarium_test_client_server_unix_socket);
 	odyssey_test(machinarium_test_read_10mb0);
 	odyssey_test(machinarium_test_read_10mb1);
 	odyssey_test(machinarium_test_read_10mb2);
 	odyssey_test(machinarium_test_read_timeout);
 	odyssey_test(machinarium_test_read_cancel);
-	odyssey_test(machinarium_test_read_poll0);
-	odyssey_test(machinarium_test_read_poll1);
-	odyssey_test(machinarium_test_read_poll2);
-	odyssey_test(machinarium_test_read_poll3);
 	odyssey_test(machinarium_test_read_var);
 	odyssey_test(machinarium_test_tls0);
+	odyssey_test(machinarium_test_tls_unix_socket);
 	odyssey_test(machinarium_test_tls_read_10mb0);
 	odyssey_test(machinarium_test_tls_read_10mb1);
 	odyssey_test(machinarium_test_tls_read_10mb2);
-	odyssey_test(machinarium_test_tls_read_10mb_poll);
+	odyssey_test(machinarium_test_tls_read_multithread);
 	odyssey_test(machinarium_test_tls_read_var);
+	odyssey_test(odyssey_test_tdigest);
+	odyssey_test(odyssey_test_attribute);
+	odyssey_test(odyssey_test_util);
+	odyssey_test(odyssey_test_lock);
+
 	return 0;
 }

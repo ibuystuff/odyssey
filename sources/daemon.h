@@ -1,12 +1,14 @@
-#ifndef OD_DAEMON_H
-#define OD_DAEMON_H
+#ifndef ODYSSEY_DAEMON_H
+#define ODYSSEY_DAEMON_H
 
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
+
+#include <odyssey.h>
 
 int od_daemonize(void);
 
-#endif /* OD_DAEMON_H */
+#endif /* ODYSSEY_DAEMON_H */

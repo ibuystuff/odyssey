@@ -12,7 +12,7 @@ set(od_test_src
     machinarium/test_sleep_cancel0.c
     machinarium/test_join.c
     machinarium/test_condition0.c
-    machinarium/test_condition1.c
+    machinarium/test_eventfd.c
     machinarium/test_stat.c
     machinarium/test_signal0.c
     machinarium/test_signal1.c
@@ -29,8 +29,10 @@ set(od_test_src
     machinarium/test_channel_shared_rw0.c
     machinarium/test_channel_shared_rw1.c
     machinarium/test_channel_shared_rw2.c
+    machinarium/test_sleeplock.c
     machinarium/test_producer_consumer0.c
     machinarium/test_producer_consumer1.c
+    machinarium/test_producer_consumer2.c
     machinarium/test_io_new.c
     machinarium/test_connect.c
     machinarium/test_connect_timeout.c
@@ -44,35 +46,53 @@ set(od_test_src
     machinarium/test_client_server0.c
     machinarium/test_client_server1.c
     machinarium/test_client_server2.c
+    machinarium/test_client_server_unix_socket.c
     machinarium/test_read_10mb0.c
     machinarium/test_read_10mb1.c
     machinarium/test_read_10mb2.c
     machinarium/test_read_timeout.c
     machinarium/test_read_cancel.c
-    machinarium/test_read_poll0.c
-    machinarium/test_read_poll1.c
-    machinarium/test_read_poll2.c
-    machinarium/test_read_poll3.c
     machinarium/test_read_var.c
     machinarium/test_tls0.c
+    machinarium/test_tls_unix_socket.c
     machinarium/test_tls_read_10mb0.c
     machinarium/test_tls_read_10mb1.c
     machinarium/test_tls_read_10mb2.c
-    machinarium/test_tls_read_10mb_poll.c
+    machinarium/test_tls_read_multithread.c
     machinarium/test_tls_read_var.c
+        ../sources/attribute.c
+        ../sources/tdigest.c
+        ../sources/util.h
+        ../sources/build.h
+        ../sources/debugprintf.h
+        odyssey/test_attribute.c
+        odyssey/test_tdigest.c
+        odyssey/test_util.c
+        odyssey/test_locks.c
    )
 
+file(COPY machinarium/ca.crt DESTINATION machinarium)
+file(COPY machinarium/client.crt DESTINATION machinarium)
+file(COPY machinarium/client.key DESTINATION machinarium)
+file(COPY machinarium/server.crt DESTINATION machinarium)
+file(COPY machinarium/server.key DESTINATION machinarium)
+
 include_directories("${PROJECT_SOURCE_DIR}/")
+include_directories("${PROJECT_SOURCE_DIR}/sources/")
 include_directories("${PROJECT_BINARY_DIR}/")
 include_directories("${PROJECT_SOURCE_DIR}/test")
 include_directories("${PROJECT_BINARY_DIR}/test")
 
 add_executable(${od_test_binary} ${od_test_src})
-add_dependencies(${od_test_binary} build_libs)
+add_dependencies(${od_test_binary} build_libs odyssey)
 
 if(THREADS_HAVE_PTHREAD_ARG)
     set_property(TARGET ${od_test_binary} PROPERTY COMPILE_OPTIONS "-pthread")
     set_property(TARGET ${od_test_binary} PROPERTY INTERFACE_COMPILE_OPTIONS "-pthread")
 endif()
 
-target_link_libraries(${od_test_binary} ${od_libraries} ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${od_test_binary} ${od_libraries} ${CMAKE_THREAD_LIBS_INIT} m)
+
+if (BUILD_COMPRESSION)
+    target_link_libraries(${od_test_binary} ${compression_libraries})
+endif()
