@@ -1,0 +1,190 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <machinarium/machinarium.h>
+#include <machinarium/ds/hm.h>
+
+#include <stdatomic.h>
+#include <pool.h>
+#include <io.h>
+#include <types.h>
+#include <relay.h>
+#include <id.h>
+#include <rules.h>
+#include <list.h>
+#include <pstmt.h>
+#include <scram.h>
+#include <od_ldap.h>
+
+typedef enum {
+	OD_CLIENT_UNDEF,
+	OD_CLIENT_PENDING,
+	OD_CLIENT_ACTIVE,
+	OD_CLIENT_QUEUE
+} od_client_state_t;
+
+#define OD_CLIENT_MAX_PEERLEN 128
+
+struct od_client {
+	od_client_state_t state;
+	od_pool_client_type_t type;
+	od_id_t id;
+	uint64_t coroutine_id;
+	machine_tls_t *tls;
+	od_io_t io;
+	od_relay_t relay;
+	od_rule_t *rule;
+	od_system_server_t *source;
+
+	uint64_t time_accept;
+	uint64_t time_setup;
+	uint64_t time_last_active;
+
+	/* set on entering OD_CLIENT_QUEUE, valid only in that state */
+	uint64_t time_queue_start;
+
+	bool is_watchdog;
+
+	kiwi_be_startup_t startup;
+	kiwi_vars_t vars;
+	kiwi_key_t key;
+	/* cached hash of key, set once by od_global_clients_map_add */
+	mm_hash_t key_hash;
+
+	/*
+	 * raw bytes of the startup packet, kept only when
+	 * the replication proxy mode is enabled
+	 */
+	machine_msg_t *startup_raw;
+
+	/* do not set this field directly, use od_server_attach_client */
+	od_server_t *server;
+	od_route_t *route;
+	char peer[OD_CLIENT_MAX_PEERLEN];
+
+	/* desc preparet statements ids */
+	od_client_stmt_map_t *prep_stmt_ids;
+
+	/* portal name -> *od_pstmt_t (extended protocol portals tracking) */
+	od_client_stmt_map_t *portals;
+
+	/* passwd from config rule */
+	kiwi_password_t password;
+
+	/* user - proveded passwd, fallback to use this when no other option is available*/
+	kiwi_password_t received_password;
+	od_global_t *global;
+	od_list_t link_pool;
+	od_list_t link;
+
+	/* Used to kill client in kill_client or odyssey reload */
+	atomic_uint_fast64_t killed;
+
+	/* client-side GUC state. XXX: maybe use embedded struct here */
+	bool backend_pin;
+	bool opportunistic_acquire;
+
+	/*
+	 * only meaningful when backend_pin is set: marks the pin as
+	 * LISTEN-owned; UNLISTEN * drops only such pin
+	 */
+	bool backend_pin_listen;
+	/*
+	 * SET odyssey.execute_on_host - explicit storage host to attach to,
+	 * host == NULL means not set
+	 */
+	od_address_t execute_on_host;
+
+	bool physical_rep;
+	bool logical_rep;
+
+	/* storage_user & storage_password provided by ldapsearch result */
+#ifdef LDAP_FOUND
+	char *ldap_storage_username;
+	int ldap_storage_username_len;
+	char *ldap_storage_password;
+	int ldap_storage_password_len;
+	char *ldap_auth_dn;
+#endif
+
+	int64_t last_catchup_lag;
+
+	/* external_id for logging additional info about client authneticated with external auth */
+	char *external_id;
+
+	/* SQL of a virtual BEGIN; owned heap storage only if it exceeds the buffer. */
+	char *pending_begin;
+	char pending_begin_buf[128];
+
+	/*
+	 * Per-connection debug log sampling decision:
+	 * -1 = not decided yet, 0/1 - decision made
+	 */
+	int debug_log_sampled;
+
+	uint8_t scram_client_key[OD_SCRAM_MAX_KEY_LEN];
+	uint8_t scram_server_key[OD_SCRAM_MAX_KEY_LEN];
+	int scram_key_valid;
+
+	machine_msg_t *read_msg;
+
+	od_query_ctx_t query_ctx;
+	/* -1 inherits the configured mode. */
+	int parser_mode;
+};
+
+static inline od_retcode_t od_client_init_hm(od_client_t *client)
+{
+	client->prep_stmt_ids = od_client_pstmt_map_create();
+	if (client->prep_stmt_ids == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+	client->portals = od_client_portal_map_create();
+	if (client->portals == NULL) {
+		od_client_pstmt_map_free(client->prep_stmt_ids);
+		client->prep_stmt_ids = NULL;
+		return NOT_OK_RESPONSE;
+	}
+	return OK_RESPONSE;
+}
+
+void od_client_init(od_client_t *client);
+
+static inline od_client_t *od_client_allocate(void)
+{
+	od_client_t *client = od_malloc(sizeof(od_client_t));
+	if (client == NULL) {
+		return NULL;
+	}
+	od_client_init(client);
+	return client;
+}
+
+void od_client_free(od_client_t *client);
+
+int od_client_pending_begin_set(od_client_t *client, const char *query);
+void od_client_pending_begin_clear(od_client_t *client);
+
+/*
+ * for service clients (auth, watchdog, etc) usage
+ *
+ * adds od_io_close which is performed in od_frontend_close and
+ * must be performed for service clients too
+ */
+static inline void od_client_free_extended(od_client_t *client)
+{
+	od_io_close(&client->io);
+	od_client_free(client);
+}
+
+static inline void od_client_kill(od_client_t *client)
+{
+	atomic_store(&client->killed, 1UL);
+}
+
+uint32_t od_client_login_timeout(const od_client_t *client);

@@ -1,0 +1,974 @@
+# Global section
+
+Parameters that sets Odyssey execution behaviour or that are common
+for all Odyssey rules.
+
+---
+
+## Duration values
+
+Options that accept a time interval (parameters of type *duration*,
+e.g. `stats_interval`, `server_lifetime`, `pool_timeout`,
+`client_login_timeout`, ...) accept values in the PostgreSQL GUC
+syntax — the same format as `statement_timeout` in postgresql.conf:
+
+```plain
+client_login_timeout 15s
+server_lifetime 1h
+pool_timeout 500
+stats_interval 2min
+catchup_timeout 3s
+stats_interval "10s"
+pool_timeout "1.5 min"
+```
+
+Exactly one optional unit is allowed, and units are case-sensitive,
+like in PostgreSQL: `us`, `ms`, `s`, `min`, `h`, `d`.  Compound values
+(`1h30m`) are not supported.  Whitespace between the number and the
+unit is allowed (`30 min`), as are floating-point numbers (`1.5h`) and
+`0x`-hexadecimal integers (`0x10s`).
+
+Duration values may also be enclosed in double quotes. Quoting does not
+change their meaning: `stats_interval "10"` and `stats_interval 10`
+both mean 10 seconds, while `stats_interval "10ms"` uses milliseconds.
+Quoted values go through the same unit conversion and range checks.
+
+The value is rounded half-to-even to whole milliseconds, exactly like
+PostgreSQL rounds a GUC value to its base unit (`1500us` is 2 ms,
+`500us` is 0 ms).  Some options have a one-second runtime granularity
+(TCP keepalive settings, statistics interval, catchup timeout): their
+values are rounded to whole seconds the same way.
+
+Bare numbers keep the historic unit of the option (for example
+`stats_interval 60` means 60 seconds, while `client_login_timeout
+15000` means 15000 milliseconds).  An explicit unit always overrides
+the unit: `catchup_timeout 3s` is 3 seconds.
+
+Note that a bare `m` suffix is not a time unit (minutes are written as
+`min`): a standalone value like `2m` is a size (`512m` means 512
+megabytes) and is rejected by time-valued options.
+
+## Configuration Parameters Reference
+| Parameter                                  | Type             | Default     | Reload  | Notes                                                 |
+| ------------------------------------------ | ---------------- | ----------- | ------- | ----------------------------------------------------- |
+| `include`                                  | string/list      | unset       | SIGHUP  | Include external config files (parsed, not in struct) |
+| `daemonize`                                | int (bool)       | `no`        | restart | Prefer systemd over daemonize                         |
+| `sequential_routing`                       | int (bool)       | `no`        | SIGHUP  | Match routes strictly in config order                 |
+| `priority`                                 | int              | 0           | restart | Process priority (nice value)                         |
+| `pid_file`                                 | string           | unset       | restart | PID file path                                         |
+| `unix_socket_dir`                          | string           | unset       | restart | Enables UNIX socket comms                             |
+| `unix_socket_mode`                         | string           | unset       | restart | Permissions for socket files (octal string)           |
+| `locks_dir`                                | string           | unset       | restart | Location for lock files                               |
+| `log_file`                                 | string           | unset       | SIGHUP  | Additional log output file                            |
+| `log_format`                               | string           | unset       | SIGHUP  | Log message template                                  |
+| `log_to_stdout`                            | int (bool)       | `yes`       | SIGHUP  | Logs to stdout                                        |
+| `log_syslog`                               | int (bool)       | `no`        | SIGHUP  | Enable syslog output                                  |
+| `log_debug`                                | int (bool)       | `no`        | SIGHUP  | Verbose debugging logs                                |
+| `log_debug_sampling`                       | int (%)          | `100`       | SIGHUP  | Percentage of client connections with debug logging when `log_debug` is on |
+| `log_config`                               | int (bool)       | `no`        | SIGHUP  | Log config at start/reload                            |
+| `log_session`                              | int (bool)       | `yes`       | SIGHUP  | Log client connect/disconnect                         |
+| `log_query`                                | int (bool)       | `no`        | SIGHUP  | ⚠️ Logs client SQL queries                            |
+| `log_query_sampling`                       | int (%)          | `100`       | SIGHUP  | Percentage of queries to log when `log_query` is on   |
+| `log_stats`                                | int (bool)       | `yes`       | SIGHUP  | Log periodic route statistics                         |
+| `promhttp_server_port`                     | int              | unset       | SIGHUP  | Enable Prometheus endpoint                            |
+| `log_general_stats_prom`                   | int (bool)       | `no`        | SIGHUP  | Prometheus general stats                              |
+| `log_route_stats_prom`                     | int (bool)       | `no`        | SIGHUP  | Prometheus per-route stats                            |
+| `stats_interval`                           | int (sec)        | `3`         | SIGHUP  | Interval for stats logging; duration suffixes (`60s`, `1min`) are supported |
+| `workers`                                  | int              | `1`         | restart | Worker threads for clients                            |
+| `resolvers`                                | int              | `1`         | restart | DNS resolver threads                                  |
+| `readahead`                                | int (bytes)      | one page    | SIGHUP  | Per-connection read buffer                            |
+| `cache_coroutine`                          | int              | `1024`      | restart | Coroutines cache size                                  |
+| `nodelay`                                  | int (bool)       | `yes`       | SIGHUP  | Enable TCP\_NODELAY                                   |
+| `disable_nolinger`                         | int (bool)       | `yes`       | SIGHUP  | Do no set tcp linger to 0 for client connections                  |
+| `keepalive`                                | int (sec)        | `15`        | SIGHUP  | TCP keepalive; 0 disables; duration suffixes supported; one-second granularity |
+| `keepalive_keep_interval`                  | int (sec)        | `5`         | SIGHUP  | Interval between probes; duration suffixes supported |
+| `keepalive_probes`                         | int              | `3`         | SIGHUP  | Probes before killing conn                            |
+| `keepalive_usr_timeout`                    | int (ms)         | `0`         | SIGHUP  | 0 = use system default (`TCP_USER_TIMEOUT`); negative = pick automatically |
+| `backend_connect_timeout_ms`               | int (ms)         | `30000`     | SIGHUP  | Backend connection timeout                            |
+| `coroutine_stack_size`                     | int (pages)      | `16`        | restart | Coroutine stack size (client/worker coroutines); values below 16 are not recommended |
+| `system_coroutine_stack_size`              | int (pages)      | `32`        | restart | Coroutine stack size for internal system coroutines   |
+| `client_max`                               | int              | `0`         | SIGHUP  | Max client connections (0/unset = no global limit); per-listen reserve via `reserved_clients` |
+| `client_max_routing`                       | int              | `0`         | SIGHUP  | 0/unset → auto (typically `64 * workers`)             |
+| `server_login_retry`                       | int (ms)         | `1`         | SIGHUP  | Retry delay on "Too many clients"; duration suffixes supported |
+| `hba_file`                                 | string           | unset       | SIGHUP  | Path to pg\_hba-like rules                            |
+| `graceful_die_on_errors`                   | int (bool)       | `no`        | runtime | Shutdown on SIGUSR2 (stop accepting new, keep old)    |
+| `graceful_shutdown_timeout_ms`             | int (ms)         | `30000`     | runtime | Graceful shutdown timeout                             |
+| `availability_zone`                        | string           | unset       | restart | Used for host selection                               |
+| `enable_online_restart`                    | int (bool)       | `yes`       | restart | Allow zero-downtime restart                           |
+| `conn_drop_options.drop_enabled` | int (bool)       | `yes`       | restart | Drop old connections gradually                        |
+| `conn_drop_options.rate_per_sec` | int              | `1`       | restart | Max connections to drop per **interval_ms** on each worker          |
+| `conn_drop_options.interval_ms` | int              | `1000`       | restart | Interval for connections dropping in milliseconds         |
+| `bindwith_reuseport`                       | int (bool)       | `yes`        | restart | Use SO\_REUSEPORT for binding                         |
+| `max_sigterms_to_die`                      | int              | `3`         | SIGHUP  | Max SIGTERMs before hard exit                         |
+| `enable_host_watcher`                      | int(bool)        | `3`         | restart | Start host cpu and mem consumption watcher thread      |
+| `smart_search_path_enquoting`              | int(bool)        | `no`        | SIGHUP | Smart enquoting when `search_path` deploing to server connect      |
+| `log_async`                                | int (bool)       | `yes`       | SIGHUP  | Write log messages asynchronously                                 |
+| `log_queue_depth`                          | int              | `30000`     | SIGHUP  | Max pending messages in async log queue                           |
+| `external_auth_socket_path`                | string           | unset       | restart | Unix socket path for external auth module                         |
+| `cpu_affinity`                             | string           | unset       | restart | CPU affinity mask for Odyssey threads                             |
+| `cancel_timeout_ms`                        | int (ms)         | `1000`      | SIGHUP  | Timeout for cancel request to backend                             |
+| `cancel_queue_timeout_ms`                  | int (ms)         | `-1` (2 × cancel_timeout_ms) | SIGHUP  | Timeout for queued cancel requests; -1 = 2 × cancel_timeout_ms  |
+| `cancel_max_inflight`                      | int              | `-1` (2 × workers) | SIGHUP  | Max concurrent in-flight cancel requests; -1 = 2 × workers       |
+| `cancel_rate_limit`                        | int              | `0` (none)  | restart | Max cancels per second; 0 = unlimited                              |
+| `ignore_cancel`                            | int (bool)       | `no`        | SIGHUP  | Drop all incoming client cancel requests without forwarding them to the backend |
+| `virtual_transaction`                           | int (bool)       | `yes`       | restart  | Enable virtual transaction features    |
+| `replication_proxy_phys`                   | int (bool)       | `no`        | SIGHUP  | Forward physical replication connections as is to the first endpoint of the first remote storage, bypassing all Odyssey logic |
+| `replication_proxy_logic`                  | int (bool)       | `no`        | SIGHUP  | Forward logical replication connections as is to the first endpoint of the first remote storage, bypassing all Odyssey logic |
+| `maintain_params`                          | int (bool)       | `yes`       | restart | Global default of route-level `maintain_params`; routes that set it explicitly override this |
+| `dns_cache_ttl`                            | int (ms)         | `30000`     | SIGHUP  | TTL for DNS cache entries                                         |
+| `auth_query_timeout`                       | int (ms)         | `500`       | SIGHUP  | auth\_query execution timeout; also the wait for a route's first password fetch |
+| `auth_query_cache_ttl`                     | int (ms)         | `10000`     | SIGHUP  | How long a fetched `auth_query` password is considered fresh; duration suffixes supported |
+| `auth_query_cache_ttl_jitter`              | int (ms)         | `5000`      | SIGHUP  | Max random jitter added to `auth_query_cache_ttl`; 0 disables |
+| `auth_query_cache_error_retry`             | int (ms)         | `1000`      | SIGHUP  | Delay before the next refresh attempt after a failed one |
+| `auth_query_cache_stale_on_error`          | int (bool)       | `yes`       | SIGHUP  | Keep serving the stale cached password when a refresh fails; `no` drops it (fail closed) |
+| `cache_msg_gc_size`                        | int (bytes)      | `0`         | SIGHUP  | Max single message buffer size for caching; 0 = caching disabled   |
+| `cache_msg_gc_count`                      | int              | `0`         | SIGHUP  | Message GC cache max count; 0 = unlimited                         |
+| `graceful_die_on_errors`                   | int (bool)       | `no`        | runtime | **Deprecated.** Use SIGUSR2 signal directly instead               |
+| `pipeline`                                 | int              | —           | —       | **Deprecated.** Ignored.                                          |
+| `cache`                                    | int              | —           | —       | **Deprecated.** Ignored.                                          |
+| `cache_chunk`                              | int              | —           | —       | **Deprecated.** Ignored.                                          |
+| `packet_read_size`                         | int              | —           | —       | **Deprecated.** Ignored.                                          |
+| `packet_write_queue`                       | int              | —           | —       | **Deprecated.** Ignored.                                          |
+
+
+
+## **include**
+*string*
+
+Include one or more configuration files. Include files can
+include other files.
+
+`include "path"`
+
+## **daemonize**
+*yes|no*
+
+Start as a daemon.
+
+By default Odyssey does not run as a daemon. Set to 'yes' to enable.
+
+`daemonize no`
+
+## **sequential\_routing**
+*yes|no*
+
+Try to match routes exactly in config order.
+
+By default, Odyssey tries to match all specific routes first, and then all default ones.
+It may be confusing because auth-denying default route can be overridden with more specific auth-permitting route below in the config.
+With this option set, Odyssey will match routes exactly in config order, like in HBA files.
+
+`sequential_routing no`
+
+## **priority**
+*integer*
+
+Process priority.
+
+Set Odyssey parent process and threads priority.
+
+`priority -10`
+
+## **pid\_file**
+*string*
+
+If pid\_file is specified, Odyssey will write its process id to
+the specified file at startup.
+
+`pid_file "/var/run/odyssey.pid"`
+
+## **unix\_socket\_dir**
+*string*
+
+UNIX socket directory.
+
+If `unix_socket_dir` is specified, Odyssey will enable UNIX socket
+communications. Specified directory path will be used for
+searching socket files.
+
+`unix_socket_dir "/tmp"`
+
+Each Unix listener holds a lock on `.s.PGSQL.<port>.odyssey.lock` in this
+directory while it owns the socket. The lock file remains after shutdown;
+its presence does not indicate that Odyssey is running. Do not remove it
+while a listener is running, since another process could acquire a lock
+on a newly created file at the same path.
+
+On Linux, Odyssey removes an existing socket on startup only if a
+connection attempt returns `ECONNREFUSED`. Active sockets, symbolic links,
+and other files are left in place. On other platforms, existing sockets
+are preserved because a live listener can also return `ECONNREFUSED`;
+leftover sockets must be removed after confirming that their process has
+stopped. On shutdown, Odyssey removes the socket only if its device and
+inode still match those recorded after binding.
+
+## **unix\_socket\_mode**
+*string*
+
+Set `unix_socket_mode` file mode to any created unix files.
+
+`unix_socket_mode "0755"`
+
+## **locks_dir**
+*string*
+
+If `locks_dir` is specified, directory path will be used for 
+placing lock files.
+
+## **log\_file**
+*string*
+
+If log\_file is specified, Odyssey will additionally use it to write
+log events.
+
+`log_file "/var/log/odyssey.log"`
+
+## **log\_format**
+*string*
+
+Log text format.
+
+Odyssey allows to configure log text format. This could be useful to
+support external log parser format. Format string can contain plain
+text, escape symbols and format flags.
+
+Supported flags:
+
+```
+%n = unixtime
+%t = timestamp with date in iso 8601 format
+%e = millisEcond
+%p = process ID
+%i = client ID
+%s = server ID
+%u = user name
+%d = database name
+%a = application_name
+%c = source location (file:line)
+%l = level (error, warning, debug)
+%m = message
+%M = message tskv
+%r = client port
+%h = client host
+%H = server host
+```
+
+`log_format "%p %t %e %l [%i %s] (%c) %m\n"`
+
+**JSON logging**: You can enable JSON-formatted logging by setting log_format option to `json`:
+
+```text
+log_format "json"
+```
+
+This outputs structured JSON logs with all available fields:
+```json
+{"timestamp":"2024-12-15 10:30:45.123","pid":"12345","level":"info","context":"instance.c:123","message":"accepting connections","client":{"id":"c1a2b3","ip":"192.168.1.100","port":"54321","user":"app_user","database":"mydb"},"server":{"id":"s4d5e6"}}
+```
+
+## **log\_to\_stdout**
+*yes|no*
+
+Set to 'yes' if you need to additionally display log output in stdout.
+Enabled by default.
+
+`log_to_stdout yes`
+
+## **log\_syslog**
+*yes|no*
+
+Log to system logger.
+
+To enable syslog(3) usage, set log\_syslog to 'yes'. Additionally set
+log\_syslog\_ident and log\_syslog\_facility.
+
+`log_syslog no`
+
+## **log\_syslog\_ident**
+*string*
+
+Set syslog ident name.
+
+`log_syslog_ident "odyssey"`
+
+## **log\_syslog\_facility**
+*string*
+
+Set syslog facility name.
+
+`log_syslog_facility "daemon"`
+
+## **log\_debug**
+*yes|no*
+
+Enable verbose logging of all events, which will generate a log of
+detailed information useful for development or testing.
+
+It is also possible to enable verbose logging for specific users
+(see routes section).
+
+`log_debug no`
+
+## **log\_debug\_sampling**
+*integer (0..100)*
+
+Percentage of client connections for which debug messages are written
+to the log when `log_debug` is enabled. `100` (default) logs debug
+messages of every connection, `10` — of every tenth. The decision is
+made once per client connection, so all debug messages of a sampled
+client (including backend messages of the server it is using) are
+logged as one consistent picture. Debug messages without a client
+context (system messages, idle server connections) are not sampled and
+are always logged. Can also be set per-route (see [rules](rules.md)) to
+override the global value.
+
+`log_debug_sampling 100`
+
+## **log\_config**
+*yes|no*
+
+Write configuration to the log during start and config reload.
+
+`log_config yes`
+
+## **log\_session**
+*yes|no*
+
+Write client connect and disconnect events to the log.
+
+`log_session yes`
+
+## **log\_query**
+*yes|no*
+
+Write client queries text to the log. Disabled by default.
+
+`log_query no`
+
+## **log\_query\_sampling**
+*integer (0..100)*
+
+Percentage of client queries that are written to the log when
+`log_query` is enabled. `100` (default) logs every query, `10` logs
+roughly every tenth query. Can also be set per-route (see
+[rules](rules.md)) to override the global value. Sampling is applied
+independently to each logged message, so for the extended query
+protocol (`parse`/`bind`/`execute`) each message type is sampled
+separately.
+
+`log_query_sampling 100`
+
+## **log\_stats**
+*yes|no*
+
+Periodically display information about active routes.
+
+`log_stats yes`
+
+## **promhttp_server_port**
+*integer*
+
+Port on which metrics server listen. *http://localhost:port/* -- check is port running. *http://localhost:port/metrics* -- get metrics as a response.
+
+## **log\_general\_stats_prom**
+*yes|no*
+
+Write information about active routes in Prometheus format in addition to ordinary format. Requires [C Prometheus client library](https://github.com/digitalocean/prometheus-client-c) installed. Log only info not specific to route
+
+## **log\_route\_stats_prom**
+*yes|no*
+
+Write information about active routes in Prometheus format in addition to ordinary format. Requires [C Prometheus client library](https://github.com/digitalocean/prometheus-client-c) installed. Log all available info
+
+## **stats\_interval**
+*integer*
+
+Set interval in seconds for internal statistics update and log report.
+
+`stats_interval 60`
+
+## **workers**
+*integer*
+
+Set size of thread pool used for client processing.
+
+1: By default, Odyssey runs with a single worker. This is a special
+mode optimized for general use. This mode also made to reduce multi-thread
+communication overhead.
+
+N: Add additional worker threads, if your server experience heavy load,
+especially using TLS setup.
+
+`workers 1`
+
+## **resolvers**
+*integer*
+
+Number of threads used for DNS resolving. This value can be increased, if
+your server experience a big number of connecting clients.
+
+`resolvers 1`
+
+## **readahead**
+*integer*
+
+Set size of per-connection buffer used for io readahead operations.
+Rounded up to whole page numbers.
+
+`readahead 8192`
+
+## **cache\_coroutine**
+*integer*
+
+Set pool size of free coroutines cache. It is a good idea to set
+this value to a sum of max clients plus server connections. Note that
+each coroutine reserves `(coroutine_stack_size + 1) * page_size` of virtual address space
+(e.g. 68 KB with the default 16-page stack on a 4 KB page system), but physical pages
+are only faulted in as the stack actually grows, so RSS is typically much lower.
+
+Set to zero, to disable coroutine cache.
+
+`cache_coroutine 1024`
+
+## **nodelay**
+*yes|no*
+
+TCP nodelay. Set to 'yes', to enable nodelay.
+
+`nodelay yes`
+
+## **disable_nolinger**
+*yes|no*
+
+Disable setting tcp linger to 0 for new client connections.
+
+`disable_nolinger yes`
+
+## **keepalive**
+*duration*
+
+TCP keepalive time, in seconds. Set to zero, to disable keepalive.
+TCP socket options have a one second granularity, so sub-second durations are rounded up.
+
+`keepalive 15`
+
+## **keepalive_keep_interval**
+*duration*
+
+The number of seconds between TCP keep-alive probes.
+5 by default.
+
+`keepalive_keep_interval 10`
+
+## **keepalive_probes**
+*integer*
+
+TCP keep-alive probes to send before  giving  up  and  killing  the connection if no response is obtained.
+3 by default.
+
+`keepalive_probes 5`
+
+## **keepalive_usr_timeout**
+*duration*
+
+When the value is greater than 0, it specifies the maximum amount of time in milliseconds that transmitted data may remain unacknowledged before TCP will forcibly close the
+corresponding connection.
+
+When no value or 0 is provided, the default system user timeout is used.
+
+When the value is negative, Odyssey picks an appropriate timeout as
+`1000 * (keepalive + keepalive_keep_interval * keepalive_probes) - 500` milliseconds.
+
+`keepalive_usr_timeout 7`
+
+## **backend_connect_timeout_ms**
+*integer*
+
+Timeout for connection to backend (postgres). Default value is 30000 (30 secs)
+
+`backend_connect_timeout_ms 20000`
+
+## **coroutine\_stack\_size**
+*integer*
+
+Coroutine stack size for client and worker coroutines.
+
+Set coroutine stack size in pages. Actual stack is allocated as
+`(coroutine_stack_size + 1_guard_page) * page_size`. The guard page
+is protected (`PROT_NONE`) and catches stack overflows. It is purely
+virtual — backed by `mmap(MAP_ANONYMOUS)` with no physical pages
+allocated, so it contributes nothing to RSS.
+
+**Values below 16 pages (64 KB on a 4 KB page system) are not recommended.**
+A stack that is too small can cause silent stack overflows or crashes in
+scenarios involving TLS handshakes, LDAP authentication, config reload, or
+deep library call chains. Odyssey will emit a warning at startup if
+`coroutine_stack_size` is set below 16.
+
+`coroutine_stack_size 16`
+
+## **system\_coroutine\_stack\_size**
+*integer*
+
+Coroutine stack size for internal system coroutines.
+
+Odyssey uses two separate coroutine pools: one for client/worker coroutines
+(sized by `coroutine_stack_size`) and one for internal system coroutines such
+as signal handlers, config reload, cron tasks, and worker management
+(sized by this parameter).
+
+System coroutines are few in number but may require a larger stack — for
+example, the config parser (`yyparse`) allocates significant stack space when
+processing config files with `include` directives. Keeping this value separate
+from `coroutine_stack_size` avoids inflating memory usage for the large number
+of client coroutines just to accommodate the rare system operations.
+
+Actual stack is allocated as `(system_coroutine_stack_size + 1_guard_page) * page_size`.
+The guard page is purely virtual (`mmap(MAP_ANONYMOUS)` + `mprotect(PROT_NONE)`) and
+contributes nothing to RSS.
+
+`system_coroutine_stack_size 32`
+
+## **client\_max**
+*integer*
+
+Global limit of client connections.
+
+Comment 'client_max' to disable the limit. On client limit reach, Odyssey will
+reply with 'too many connections'.
+
+Individual listen endpoints can be granted a reserve that bypasses this limit
+via the [`reserved_clients`](listen.md#reserved_clients) listen option.
+
+`client_max 100`
+
+## **client_max_routing**
+*integer*
+
+Global limit of client connections concurrently being routed.
+Client connection is being routed after it is accepted and until it's startup
+message is read and connection is assigned route to the database. Most of the
+routing time is occupied with TLS handshake.
+Unset or zero 'client_max_routing' will set it's value equal to 64 * workers
+
+`client_max_routing 32`
+
+## **server_login_retry**
+*integer*
+
+If server responds with "Too many clients" client will wait for server_login_retry milliseconds.
+1 by default.
+
+## **hba\_file**
+*string*
+
+Path to file containing host based authentication rules.
+Omit this option to disable HBA.
+
+`hba_file "path"`
+
+HBA file format follows the format of the PostgreSQL `pg_hba.conf` file.
+* Supported record types: `local`, `host`, `hostssl`, `hostnossl`.
+* Database field: `all`, `sameuser`, multiple names.
+* User field: `all`, multiple names.
+* Address field: IPv4 or IPv6 range.
+* Auth-method field: `deny` or `reject` (equivalent keywords), which leads to immediate disconnection,
+`allow` or `trust` (also equivalent keywords), which means applying auth method specified in matching route.
+
+## **graceful_die_on_errors**
+*yes|no*
+
+If specified, after receiving the signal SIGUSR2, 
+Odyssey will shutdown the socket for receptions and continue working only with old connections
+
+## **graceful_shutdown_timeout_ms**
+*integer*
+
+Timeout for graceful shutdown in milliseconds
+Default:30000 (30 seconds), use 0 to disable
+
+`graceful_shutdown_timeout_ms 30000`
+
+## **availability_zone**
+*string*
+
+Specify Odyssey instance availability zone for host selection.
+
+`availability_zone "us-east-1a"`
+
+## **enable_online_restart**
+*yes|no*
+
+Online restart feature.
+When setting to yes, restart odyssey to new version simply with 
+SIGUSR2.
+
+`enable_online_restart no`
+
+## **conn\_drop\_options** / **online\_restart\_drop\_options**
+
+Both names refer to the same section. `online_restart_drop_options` is an
+alias accepted for backwards compatibility. Only one of them may appear in
+a single config file.
+
+This section can be used to configure connections dropping during
+online restart or graceful shutdown.
+
+### **drop_enabled**
+*yes|no*
+
+When set to yes - connections to old odyssey instance
+will be dropped by rate of one per sec for each worker.
+When set to no - odyssey will work with connections
+on old instance until it disconnect.
+Default: yes
+
+```plain
+conn_drop_options {
+	drop_enabled no
+}
+```
+
+### **rate**
+*integer*
+
+Maximum amount of connections to drop per **interval_ms** on each worker.
+Negative value means infinite disabled.
+
+Default: 1
+
+```plain
+conn_drop_options {
+	drop_enabled no
+	rate 10
+}
+```
+*Note: each worker has an queue for rate limiting of size equals
+to that param, so do not use large numbers*
+
+### **interval_ms**
+*integer*
+
+Amount of millisecond for connection dropping rate.
+
+Default: 1000 (1 second)
+
+```plain
+conn_drop_options {
+	drop_enabled no
+	rate 10
+	interval_ms 3000
+}
+```
+
+## **bindwith_reuseport**
+*yes/no*
+
+Enable SO_REUSEPORT for listening sockets. Allow to run several
+Odyssey instances on one listen address. Useful for [online restart](../features/online-restart.md) feature.
+
+## **max_sigterms_to_die**
+*integer*
+
+Maximum SIGTERM count before hard exit(1)
+
+`max_sigterms_to_die 10`
+
+## **enable_host_watcher**
+*yes/no*
+
+Start thread to watch host CPU and memory consumption. Makes `show host_utilization` works.
+
+`enable_host_watcher yes`
+
+## **smart_search_path_enquoting**
+*yes/no*
+
+Do not enquote `search_path` client startup option, if it seems correctly
+(does not contains special symbols, that allows to do harmful SQL injections).
+Allows to execute:
+```
+$ PGOPTIONS='--search_path=public,\ "$user",\ another' ./psql 'host=localhost port=6432 dbname=postgres user=rkhapov' -c 'show search_path'
+       search_path        
+--------------------------
+ public, "$user", another
+(1 row)
+```
+
+With disabled it will be (as for another parameters):
+```
+$ PGOPTIONS='--search_path=public,\ "$user",\ another' ./psql 'host=localhost port=6432 dbname=postgres user=rkhapov' -c 'show search_path'
+         search_path          
+------------------------------
+ "public, ""$user"", another"
+(1 row)
+```
+
+Default is `no`.
+
+`smart_search_path_enquoting yes`
+
+## **log\_async**
+*yes|no*
+
+Write log messages asynchronously. When enabled, logging does not block the worker
+coroutine — messages are queued and written by a background thread. Useful under
+high load where synchronous writes would introduce latency.
+
+Enabled by default.
+
+`log_async yes`
+
+## **log\_queue\_depth**
+*integer*
+
+Maximum number of messages that can be pending in the async log queue before
+the producer is blocked. Only meaningful when `log_async yes`.
+
+Default: 30000.
+
+`log_queue_depth 30000`
+
+## **external\_auth\_socket\_path**
+*string*
+
+Path to the UNIX socket of an external authentication module. Odyssey will
+connect to this socket when the route authentication mode is `"external"`.
+
+`external_auth_socket_path "/var/run/odyssey-auth.sock"`
+
+## **cpu\_affinity**
+*string*
+
+Set CPU affinity for Odyssey threads. The value is passed directly to
+`sched_setaffinity` / `pthread_setaffinity_np` as a hex or decimal CPU
+mask string.
+
+`cpu_affinity "0x3"`
+
+## **cancel\_timeout\_ms**
+*integer*
+
+Timeout in milliseconds for sending a cancel request to the backend.
+Default: 1000 (1 second).
+
+`cancel_timeout_ms 1000`
+
+## **cancel\_queue\_timeout\_ms**
+*integer*
+
+Timeout in milliseconds for a cancel request that is waiting in the
+internal queue (when `cancel_max_inflight` or `cancel_rate_limit` is reached).
+Default: -1 (2 x **cancel_timeout_ms**).
+
+`cancel_queue_timeout_ms 5000`
+
+## **cancel\_max\_inflight**
+*integer*
+
+Maximum number of cancel requests that can be sent to backends concurrently.
+Subsequent requests are queued. Default: -1 (2 x **workers**).
+
+Conflicts with `cancel_rate_limit`.
+
+`cancel_max_inflight 16`
+
+## **cancel\_rate\_limit**
+*integer*
+
+Maximum number of cancel request processed per second.
+Default: 0 (unlimited)
+
+Conflicts with **cancel\_max\_inflight**.
+
+`cancel_rate_limit 10`
+
+## **ignore\_cancel**
+*bool*
+
+When enabled, all incoming client cancel requests are dropped: Odyssey
+closes the cancel connection without forwarding the cancel to the backend.
+Useful when cancels from clients are not desirable (e.g. they cause
+unwanted load on the storage). Default: `no`.
+
+`ignore_cancel yes`
+
+## **dns\_cache\_ttl**
+*integer*
+
+TTL in **milliseconds** for entries in the internal DNS cache. After this time
+has elapsed the entry is resolved again on the next connection attempt.
+Default: 30000 (30 seconds). Set to 0 to disable caching.
+
+`dns_cache_ttl 30000`
+
+## **auth\_query\_timeout**
+*duration*
+
+Timeout for a single `auth_query` execution against the storage, and also the
+maximum time a client waits for the route's very first password fetch
+(subsequent fetches run in the background and clients are served from the
+cache immediately, see **auth\_query\_cache\_ttl**).
+
+Default: 500 (500 ms). Minimum value is 1 ms.
+
+`auth_query_timeout 500ms`
+
+## **auth\_query\_cache\_ttl**
+*duration*
+
+For how long a password successfully fetched by `auth_query` is considered
+fresh. When the cached value becomes older than this, a background refresh is
+scheduled; until the refresh completes clients keep being served the cached
+value, so this option effectively bounds the password staleness on rotation.
+
+Default: 10000 (10 seconds). Set to 0 to refresh on (almost) every
+authentication.
+
+`auth_query_cache_ttl 10s`
+
+## **auth\_query\_cache\_ttl\_jitter**
+*duration*
+
+Maximum random jitter added on top of **auth\_query\_cache\_ttl**. Spreads
+background password refreshes of different routes in time instead of syncing
+them all to the same moment. Default: 5000 (5 seconds). Set to 0 to disable.
+
+`auth_query_cache_ttl_jitter 5s`
+
+## **auth\_query\_cache\_error\_retry**
+*duration*
+
+Delay before the next background `auth_query` refresh attempt after a failed
+one. While waiting, the behaviour is defined by
+**auth\_query\_cache\_stale\_on\_error**. Default: 1000 (1 second).
+
+`auth_query_cache_error_retry 1s`
+
+## **auth\_query\_cache\_stale\_on\_error**
+*yes|no*
+
+How to treat a failed `auth_query` password refresh when a cached value
+already exists.
+
+* `yes` (default) — keep serving the stale cached password and retry the
+  refresh after **auth\_query\_cache\_error\_retry**; authentication
+  continues even while the password source is unavailable.
+* `no` — drop the cached password ("fail closed"): clients can not
+  authenticate until a refresh succeeds. Use this when passwords may be
+  revoked and serving a stale value is unacceptable.
+
+The very first fetch of a route (no cached value yet) always fails the
+client's authentication when `auth_query` itself fails, regardless of this
+option.
+
+`auth_query_cache_stale_on_error yes`
+
+## **cache\_msg\_gc\_size**
+*integer*
+
+Maximum buffer size (in bytes) of a single message that may be retained
+in the internal message garbage-collection cache. Messages whose buffer
+exceeds this threshold are freed immediately instead of being cached.
+Default: 0 (caching disabled — all messages are freed).
+
+`cache_msg_gc_size 12288`
+
+## **cache\_msg\_gc\_count**
+*integer*
+
+Maximum number of message objects retained in the internal
+garbage-collection cache. When the cache exceeds this limit, the oldest
+cached messages are freed. Default: 1024.
+
+`cache_msg_gc_count 1000`
+
+## **replication\_proxy\_phys**, **replication\_proxy\_logic**
+*yes|no*
+
+When enabled, all replication connections of the corresponding type
+(startup packets with `replication=true` for
+`replication_proxy_phys`, `replication=database` for
+`replication_proxy_logic`, i.e. physical or logical walsender
+connections) are treated as a full proxy: Odyssey reads the
+startup packet, takes the **first `remote` storage** of the
+configuration, opens a dedicated connection to its **first endpoint**,
+forwards the original startup packet as is and pipes all further bytes
+in both directions — bypassing all of the Odyssey logic.
+
+This means for replication connections Odyssey does **not** perform:
+
+* rule matching (no `database`/`user` rules are involved at all);
+* client authentication (the client is authenticated by the server
+  directly through the proxy, so credentials must be valid on the
+  server side);
+* HBA checks;
+* connection pooling (each replication client gets its own dedicated
+  server connection which is closed when the client disconnects);
+* parameter deploy / maintain, `auth_query`, `catchup_timeout`,
+  `client_max` and other rule-level features;
+* target session attrs, balancing and storage endpoint fallbacks —
+  always the first endpoint of the first remote storage.
+
+Client-server protocol negotiation, TLS to the backend (as configured
+in the storage `tls` options) and compression happen end-to-end between
+the client and the server.
+
+Known limitations:
+
+* `CancelRequest` cannot cancel such a connection: the backend key data
+  returned by the server is not known to Odyssey, so the cancel request
+  will not find the target connection.
+
+Default is `no`.
+
+`replication_proxy_phys yes`
+
+When `replication_proxy_logic` is enabled instead, logical replication
+(`replication=database`) connections are proxied the same way.
+
+`replication_proxy_logic yes`
+
+## **virtual\_transaction**
+*yes|no*
+
+Enable virtual transaction features. For now it is:
+- deferred `BEGIN` execution
+
+When deferred `BEGIN` execution enabled (the default), Odyssey intercepts a bare `BEGIN` (or `BEGIN;`)
+query from the client and responds with a synthetic `CommandComplete BEGIN` /
+`ReadyForQuery` immediately — without acquiring a backend connection or
+forwarding the statement to PostgreSQL. The actual `BEGIN` is sent to the
+backend only when the client issues the first real query inside the
+transaction, just before that query is forwarded.
+
+This optimization reduces the number of round-trips to PostgreSQL during
+connection establishment and lowers backend pressure in workloads that
+open many short-lived transactions.
+
+Set to `no` to disable this behaviour and forward every `BEGIN` to the
+backend immediately. This may be useful when exact transaction semantics
+are required (e.g. when `BEGIN` is accompanied by options such as
+`BEGIN ISOLATION LEVEL SERIALIZABLE`) — in such cases the client query is
+already forwarded as-is, so the deferred path is not taken anyway.
+
+Default: `yes`.
+
+`virtual_transaction yes`
+
+---
+
+## Deprecated parameters
+
+The following parameters are accepted by the parser for backwards compatibility
+but are **ignored** — a deprecation warning is emitted in the log.
+
+| Parameter | Notes |
+|---|---|
+| `graceful_die_on_errors` | Accepted but ignored. Send SIGUSR2 directly to trigger graceful die. |
+| `pipeline` | Removed. |
+| `cache` | Removed. |
+| `cache_chunk` | Removed. |
+| `packet_read_size` | Removed. |
+| `packet_write_queue` | Removed. |
+

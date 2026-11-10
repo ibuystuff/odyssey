@@ -3,97 +3,75 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
+#include <odyssey.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <sys/un.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/frontend.h"
-#include "sources/backend.h"
-#include "sources/auth.h"
-#include "sources/tls.h"
-#include "sources/cancel.h"
+#include <machinarium/machinarium.h>
+#include <machinarium/dns.h>
+
+#include <backend.h>
+#include <types.h>
+#include <server.h>
+#include <pstmt.h>
+#include <instance.h>
+#include <global.h>
+#include <route.h>
+#include <rules.h>
+#include <auth.h>
+#include <util.h>
+#include <query.h>
+#include <stream.h>
+#include <tls.h>
+#include <wait_event.h>
+
+#define TTT_SESSION_OWNS_TEMP_RELS_STR "ttt.owns_session_objs"
 
 void od_backend_close(od_server_t *server)
 {
-	assert(server->route == NULL);
-	assert(server->io == NULL);
-	assert(server->tls == NULL);
+	od_assert(server->route == NULL);
+	od_assert(server->io.io == NULL);
+	od_assert(server->tls == NULL);
 	server->is_transaction = 0;
 	server->idle_time = 0;
-	shapito_key_init(&server->key);
-	shapito_key_init(&server->key_client);
+	kiwi_key_init(&server->key);
+	kiwi_key_init(&server->key_client);
 	od_server_free(server);
 }
 
-static inline int
-od_backend_terminate(od_server_t *server, shapito_stream_t *stream)
+static inline int od_backend_terminate(od_server_t *server)
 {
-	shapito_stream_reset(stream);
-	int rc;
-	rc = shapito_fe_write_terminate(stream);
-	if (rc == -1)
+	machine_msg_t *msg;
+	msg = kiwi_fe_write_terminate(NULL);
+	if (msg == NULL) {
 		return -1;
-	rc = od_write(server->io, stream);
-	if (rc == -1)
-		return -1;
-	return 0;
+	}
+	return od_write(&server->io, msg);
 }
 
-void od_backend_close_connection(od_server_t *server)
+static void od_backend_disconnect(od_server_t *server, int graceful)
 {
-	od_instance_t *instance = server->global->instance;
-
-	if (server->io == NULL)
-		return;
-
-	if (machine_connected(server->io)) {
-		shapito_stream_t *stream;
-		stream = shapito_cache_pop(&instance->stream_cache);
-		if (stream) {
-			od_backend_terminate(server, stream);
-			shapito_cache_push(&instance->stream_cache, stream);
+	od_assert(server != NULL);
+	od_server_stat_close(server);
+	if (!od_backend_not_connected(server)) {
+		if (graceful && mm_io_connected(server->io.io)) {
+			od_backend_terminate(server);
 		}
+
+		od_io_close(&server->io);
 	}
 
-	machine_close(server->io);
-	machine_io_free(server->io);
-	server->io = NULL;
+	/* TLS may already exist even if connect failed before io publication. */
+	if (server->error_connect) {
+		machine_msg_free(server->error_connect);
+		server->error_connect = NULL;
+	}
 
 	if (server->tls) {
 		machine_tls_free(server->tls);
@@ -101,433 +79,1179 @@ void od_backend_close_connection(od_server_t *server)
 	}
 }
 
-void od_backend_error(od_server_t *server, char *context, char *data, int size)
+void od_backend_close_connection(od_server_t *server)
 {
-	od_instance_t *instance = server->global->instance;
-	shapito_fe_error_t error;
-	int rc;
-	rc = shapito_fe_read_error(&error, data, size);
-	if (rc == -1) {
-		od_error(&instance->logger, context, server->client, server,
-		         "failed to parse error message from server");
-		return;
-	}
-	od_error(&instance->logger, context, server->client, server,
-	         "%s %s %s",
-	         error.severity,
-	         error.code,
-	         error.message);
-	if (error.detail) {
-		od_error(&instance->logger, context, server->client, server,
-		         "DETAIL: %s", error.detail);
-	}
-	if (error.hint) {
-		od_error(&instance->logger, context, server->client, server,
-		         "HINT: %s", error.hint);
-	}
-	od_server_stat_error(server);
+	od_backend_disconnect(server, 1);
 }
 
-int od_backend_ready(od_server_t *server, char *context,
-                     char *data, int size)
+void od_backend_abort_connection(od_server_t *server)
 {
+	/* Close without sending Terminate or waiting on io. */
+	od_backend_disconnect(server, 0);
+}
+
+void od_backend_error(od_server_t *server, char *data, uint32_t size)
+{
+	od_route_t *route = server->route;
+	od_rule_t *rule = route->rule;
 	od_instance_t *instance = server->global->instance;
+	kiwi_fe_error_t error;
+
+	server->error_responses++;
+
+	int rc;
+	rc = kiwi_fe_read_error(data, size, &error);
+	if (rc == -1) {
+		od_error(&instance->logger, server->client, server,
+			 "failed to parse error message from server");
+		return;
+	}
+
+	od_error(&instance->logger, server->client, server, "%s %s %s",
+		 error.severity, error.code, error.message);
+
+	if (error.detail) {
+		od_error(&instance->logger, server->client, server,
+			 "DETAIL: %s", error.detail);
+	}
+
+	if (error.hint) {
+		od_error(&instance->logger, server->client, server, "HINT: %s",
+			 error.hint);
+	}
+
+	if (strcmp(error.code, KIWI_OUT_OF_MEMORY) == 0) {
+		server->oom = 1;
+	}
+
+	if (rule->pool->reserve_prepared_statement &&
+	    rule->server_drop_on_cached_plan_error) {
+		if (strcmp(error.code, KIWI_FEATURE_NOT_SUPPORTED) != 0) {
+			return;
+		}
+
+		if (strcmp(error.message,
+			   "cached plan must not change result type") != 0) {
+			return;
+		}
+
+		od_error(
+			&instance->logger, server->client, server,
+			"catch broken cached plan, server connection will be dropped");
+
+		server->cached_plan_broken = 1;
+	}
+}
+
+int od_backend_ready(od_server_t *server, char *data, uint32_t size)
+{
 	int status;
 	int rc;
-	rc = shapito_fe_read_ready(&status, data, size);
-	if (rc == -1)
+	rc = kiwi_fe_read_ready(data, size, &status);
+	if (rc == -1) {
 		return -1;
+	}
 	if (status == 'I') {
 		/* no active transaction */
 		server->is_transaction = 0;
-	} else
-	if (status == 'T' || status == 'E') {
-		/* in active transaction or in interrupted
-		 * transaction block */
+		server->is_error_tx = 0;
+		/*
+		 * PG destroys all portals at transaction end
+		 */
+		if (server->client != NULL && server->client->portals != NULL) {
+			od_client_portals_clear(server->client);
+		}
+	} else if (status == 'T') {
+		/* active transaction */
 		server->is_transaction = 1;
+		server->is_error_tx = 0;
+	} else if (status == 'E') {
+		/* error in transaction */
+		server->is_transaction = 1;
+		server->is_error_tx = 1;
+	} else {
+		abort();
 	}
-	/* update reply and tx counters and query time */
-	uint64_t query_time;
-	query_time = od_server_stat_reply(server);
-	if (! server->is_transaction)
-		od_server_stat_tx(server);
 
-	od_debug(&instance->logger, context, server->client, server,
-	         "query time: %d microseconds",
-	         query_time);
+	/* update server sync reply state */
+	od_server_sync_reply(server);
 	return 0;
 }
 
-static inline int
-od_backend_startup(od_server_t *server, shapito_stream_t *stream)
+static inline void od_backend_reset_for_retry(od_server_t *server)
+{
+	od_route_t *route = server->route;
+	if (route != NULL) {
+		od_route_lock(route);
+	}
+	/* A failed startup needs no Terminate; do not wait on io under the lock. */
+	od_backend_abort_connection(server);
+
+	od_io_free(&server->io);
+	od_io_init(&server->io);
+	if (route != NULL) {
+		od_route_unlock(route);
+	}
+
+	od_scram_state_free(&server->scram_state);
+	od_scram_state_init(&server->scram_state);
+
+	kiwi_key_init(&server->key);
+	kiwi_vars_free(&server->vars);
+	kiwi_vars_init(&server->vars);
+
+	/*
+	 * do not reset client key here
+	 * 
+	 * client key can be set before real connection attempt
+	 * and if connect retry successeded, the key will be zeroed
+	 */
+
+	server->sync_request = 0;
+	server->sync_reply = 0;
+	server->is_transaction = 0;
+	server->is_error_tx = 0;
+	server->msg_broken = 0;
+	server->oom = 0;
+	server->synced_settings = false;
+	server->need_startup = 1;
+}
+
+/*
+ * libpq switches to the next encryption method only when the server has
+ * answered the startup packet with a valid ErrorResponse: see CONNECTION_FAILED
+ * in the ErrorResponse branch of CONNECTION_AWAITING_RESPONSE in PQconnectPoll.
+ * A closed connection, a garbled reply or a peer that is not a postgres server
+ * at all end the attempt right there, and ERRCODE_CANNOT_CONNECT_NOW is special
+ * cased to move on to the next host instead of changing the encryption.
+ *
+ * On top of that we skip the retry for errors that have nothing to do with
+ * encryption at all. libpq can afford repeating them, a pooler cannot: it would
+ * double the connection load on a server that is already unhappy, and it would
+ * hide the original error from the code that inspects it (see
+ * od_frontend_error_is_too_many_connections).
+ */
+static inline int od_backend_startup_error_allows_tls_retry(od_server_t *server,
+							    const char **code)
+{
+	*code = NULL;
+
+	if (server->error_connect == NULL) {
+		/* connection lost, or the peer does not talk our protocol */
+		return 0;
+	}
+
+	kiwi_fe_error_t error;
+	if (kiwi_fe_read_error(machine_msg_data(server->error_connect),
+			       machine_msg_size(server->error_connect),
+			       &error) == -1) {
+		return 0;
+	}
+
+	if (error.code == NULL) {
+		return 0;
+	}
+
+	*code = error.code;
+
+	/* as in libpq: another host may accept us, encryption is irrelevant */
+	if (strcmp(error.code, KIWI_CANNOT_CONNECT_NOW) == 0) {
+		return 0;
+	}
+
+	/*
+	 * Unlike libpq: the server gave a definite answer that TLS will not
+	 * change. Drop these lines to follow libpq to the letter.
+	 */
+	if (strcmp(error.code, KIWI_TOO_MANY_CONNECTIONS) == 0 ||
+	    strcmp(error.code, KIWI_INVALID_CATALOG_NAME) == 0 ||
+	    strcmp(error.code, KIWI_INVALID_PASSWORD) == 0) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * Perform startup, falling back to a TLS connection for the "allow" mode.
+ *
+ * With libpq sslmode=allow the plaintext attempt comes first and the whole
+ * connection is retried over TLS once it fails, since a server that requires
+ * TLS refuses the plaintext one only at startup, with an ErrorResponse.
+ */
+static int od_backend_startup_with_tls_fallback(od_server_t *server,
+						od_rule_storage_t *storage,
+						kiwi_params_t *route_params,
+						od_client_t *client)
+{
+	od_instance_t *instance = server->global->instance;
+	od_tls_opts_t *tlsopts = storage->tls_opts;
+
+	int rc = od_backend_startup(server, route_params, client);
+	if (rc == OK_RESPONSE) {
+		return OK_RESPONSE;
+	}
+
+	/*
+	 * server->tls is set only once TLS has been negotiated, so the retry
+	 * below never happens more than once per connection.
+	 */
+	if (tlsopts->tls_mode != OD_CONFIG_TLS_ALLOW || server->tls != NULL) {
+		return NOT_OK_RESPONSE;
+	}
+
+	/* must be checked before the reset, it frees error_connect */
+	const char *code = NULL;
+	if (!od_backend_startup_error_allows_tls_retry(server, &code)) {
+		od_debug(
+			&instance->logger, client, server,
+			"startup over a plaintext connection failed, not retrying with tls (allow), code=%s",
+			code ? code : "(null)");
+		return NOT_OK_RESPONSE;
+	}
+
+	od_debug(
+		&instance->logger, client, server,
+		"startup over a plaintext connection failed (code=%s), retrying with tls (allow)",
+		code ? code : "(null)");
+
+	/* points to server->error_connect, which can be reset at next lines */
+	code = NULL;
+
+	od_backend_reset_for_retry(server);
+
+	if (route_params != NULL) {
+		/* drop the parameters collected by the failed attempt */
+		kiwi_params_free(route_params);
+		kiwi_params_init(route_params);
+	}
+
+	rc = od_backend_connect_to(server, od_server_pool_address(server),
+				   tlsopts, OD_BACKEND_TLS_NEGOTIATE);
+	if (rc != OK_RESPONSE) {
+		return NOT_OK_RESPONSE;
+	}
+
+	return od_backend_startup(server, route_params, client);
+}
+
+int od_backend_startup_preallocated(od_server_t *server,
+				    kiwi_params_t *route_params,
+				    od_client_t *client)
+{
+	if (!od_backend_need_startup(server)) {
+		return OK_RESPONSE;
+	}
+
+	/*
+	 * A preallocated connection is connected long before it is started up,
+	 * so this is where the "allow" mode learns that the server wants TLS.
+	 */
+	return od_backend_startup_with_tls_fallback(
+		server, server->route->rule->storage, route_params, client);
+}
+
+int od_backend_startup(od_server_t *server, kiwi_params_t *route_params,
+		       od_client_t *client)
 {
 	od_instance_t *instance = server->global->instance;
 	od_route_t *route = server->route;
-	shapito_stream_reset(stream);
 
-	shapito_fe_arg_t argv[] = {
-		{ "user", 5 },     { route->id.user, route->id.user_len },
-		{ "database", 9 }, { route->id.database, route->id.database_len }
+#define DEFAULT_ARGV_SIZE 6
+
+	kiwi_fe_arg_t argv[DEFAULT_ARGV_SIZE +
+			   2 * route->rule->backend_startup_vars_sz];
+
+	kiwi_fe_arg_t default_argv[] = {
+		{ "user", 5 },
+		{ route->id.user, route->id.user_len },
+		{ "database", 9 },
+		{ route->id.database, route->id.database_len },
+		{ "replication", 12 },
+		{ NULL, 0 }
 	};
-	int rc;
-	rc = shapito_fe_write_startup_message(stream, 4, argv);
-	if (rc == -1)
+
+	od_debug(&instance->logger, server->client, server,
+		 "startup server connection with user %s & database %s",
+		 route->id.user, route->id.database);
+
+	for (size_t i = 0; i < route->rule->backend_startup_vars_sz; i++) {
+		argv[i << 1].name = route->rule->backend_startup_vars[i].name;
+		argv[i << 1].len =
+			route->rule->backend_startup_vars[i].name_len + 1;
+		argv[i << 1 | 1].name =
+			route->rule->backend_startup_vars[i].value;
+		argv[i << 1 | 1].len =
+			route->rule->backend_startup_vars[i].value_len + 1;
+	}
+
+	int argc = route->rule->backend_startup_vars_sz * 2;
+
+	for (size_t i = 0; i < DEFAULT_ARGV_SIZE; ++i) {
+		argv[argc + i] = default_argv[i];
+	}
+
+	argc += 4;
+
+	if (client->physical_rep) {
+		argv[argc + 1].name = "on";
+		argv[argc + 1].len = 3;
+		argc += 2;
+	} else if (client->logical_rep) {
+		argv[argc + 1].name = "database";
+		argv[argc + 1].len = 9;
+		argc += 2;
+	}
+
+	machine_msg_t *msg;
+	/* Offer the maximum version; PostgreSQL may negotiate down to 3.0. */
+	server->proto_version = PG_PROTOCOL_LATEST;
+	msg = kiwi_fe_write_startup_message(NULL, argc, argv);
+	if (msg == NULL) {
 		return -1;
-	rc = od_write(server->io, stream);
+	}
+	int rc;
+	rc = od_write(&server->io, msg);
 	if (rc == -1) {
-		od_error(&instance->logger, "startup", NULL, server,
-		         "write error: %s",
-		         machine_error(server->io));
+		od_error(&instance->logger, NULL, server, "write error: %s",
+			 od_io_error(&server->io));
 		return -1;
 	}
 
 	/* update request count and sync state */
-	od_server_stat_request(server, 1);
+	od_server_sync_request(server, 1);
+	od_assert(server->client);
 
-	while (1) {
-		shapito_stream_reset(stream);
-		int rc;
-		rc = od_read(server->io, stream, UINT32_MAX);
-		if (rc == -1) {
-			od_error(&instance->logger, "startup", NULL, server,
-			         "read error: %s",
-			         machine_error(server->io));
+	for (;;) {
+		od_wait_event_start(OD_WAIT_AUTH_SERVER_READ);
+		msg = od_read(&server->io, UINT32_MAX, OD_READ_BE);
+		od_wait_event_end(OD_WAIT_AUTH_SERVER_READ);
+		if (msg == NULL) {
+			od_error(&instance->logger, client, server,
+				 "read error: %s", od_io_error(&server->io));
 			return -1;
 		}
-		shapito_be_msg_t type = *stream->start;
-		od_debug(&instance->logger, "startup", NULL, server, "%s",
-		         shapito_be_msg_to_string(type));
+
+		kiwi_be_type_t type = *(char *)machine_msg_data(msg);
+		od_debug(&instance->logger, client, server,
+			 "received packet type: %s",
+			 kiwi_be_type_to_string(type));
 
 		switch (type) {
-		case SHAPITO_BE_READY_FOR_QUERY:
-			od_backend_ready(server, "startup", stream->start,
-			                 shapito_stream_used(stream));
+		case KIWI_BE_READY_FOR_QUERY:
+			od_backend_ready(server, machine_msg_data(msg),
+					 machine_msg_size(msg));
+			server->need_startup = 0;
+			machine_msg_free(msg);
 			return 0;
-		case SHAPITO_BE_AUTHENTICATION:
-			rc = od_auth_backend(server, stream);
-			if (rc == -1)
-				return -1;
-			break;
-		case SHAPITO_BE_BACKEND_KEY_DATA:
-			rc = shapito_fe_read_key(&server->key, stream->start,
-			                         shapito_stream_used(stream));
+		case KIWI_BE_AUTHENTICATION:
+			rc = od_auth_backend(server, msg, client);
+			machine_msg_free(msg);
 			if (rc == -1) {
-				od_error(&instance->logger, "startup", NULL, server,
-				         "failed to parse BackendKeyData message");
 				return -1;
 			}
 			break;
-		case SHAPITO_BE_PARAMETER_STATUS:
-		{
+		case KIWI_BE_NEGOTIATE_PROTOCOL_VERSION:
+			rc = kiwi_fe_read_protocol_negotiation(
+				machine_msg_data(msg), machine_msg_size(msg),
+				&server->proto_version);
+			machine_msg_free(msg);
+			if (rc == -1) {
+				od_error(
+					&instance->logger, client, server,
+					"invalid protocol negotiation message");
+				return -1;
+			}
+			od_debug(&instance->logger, client, server,
+				 "server negotiated protocol %d.%d",
+				 PG_PROTOCOL_MAJOR(server->proto_version),
+				 PG_PROTOCOL_MINOR(server->proto_version));
+			break;
+		case KIWI_BE_BACKEND_KEY_DATA:
+			rc = kiwi_fe_read_key(machine_msg_data(msg),
+					      machine_msg_size(msg),
+					      &server->key,
+					      server->proto_version);
+			machine_msg_free(msg);
+			if (rc == -1) {
+				od_error(
+					&instance->logger, client, server,
+					"failed to parse BackendKeyData message");
+				return -1;
+			}
+			break;
+		case KIWI_BE_PARAMETER_STATUS: {
 			char *name;
 			uint32_t name_len;
 			char *value;
 			uint32_t value_len;
-			rc = shapito_fe_read_parameter(stream->start,
-			                               shapito_stream_used(stream),
-			                               &name, &name_len,
-			                               &value, &value_len);
+			rc = kiwi_fe_read_parameter(machine_msg_data(msg),
+						    machine_msg_size(msg),
+						    &name, &name_len, &value,
+						    &value_len);
 			if (rc == -1) {
-				od_error(&instance->logger, "startup", NULL, server,
-				         "failed to parse ParameterStatus message");
+				machine_msg_free(msg);
+				od_error(
+					&instance->logger, client, server,
+					"failed to parse ParameterStatus message");
 				return -1;
 			}
-			rc = shapito_parameters_add(&server->params, name, name_len,
-			                            value, value_len);
-			if (rc == -1)
-				return -1;
+
+			/* set server parameters */
+			if (kiwi_vars_update(&server->vars, name, name_len,
+					     value, value_len) == -1) {
+				od_gdebug(
+					client, server,
+					"unexpected parameter for server: '%s', ignored",
+					name);
+			}
+
+			if (route_params) {
+				/*
+				 * skip volatile params
+				 * we skip in_hot_standby here because it may change
+				 * during connection lifetime, if server was
+				 * promoted
+				 */
+				if (name_len != sizeof("in_hot_standby") ||
+				    strncmp(name, "in_hot_standby", name_len)) {
+					kiwi_param_t *param;
+					param = kiwi_param_allocate(name,
+								    name_len,
+								    value,
+								    value_len);
+					if (param) {
+						kiwi_params_add(route_params,
+								param);
+					}
+				}
+			}
+
+			machine_msg_free(msg);
 			break;
 		}
-		case SHAPITO_BE_NOTICE_RESPONSE:
+		case KIWI_BE_NOTICE_RESPONSE:
+			/*
+			 * internal clients (watchdog, auth_query, group checker)
+			 * have no attached io: there is nobody to forward the
+			 * notice to, and a failed write would break the startup
+			 */
+			if (client != NULL &&
+			    client->type != OD_POOL_CLIENT_INTERNAL) {
+				int rc = od_write(&client->io, msg);
+				if (rc != 0) {
+					od_error(
+						&instance->logger, client,
+						server,
+						"write notice to client error error: %s",
+						od_io_error(&client->io));
+					return -1;
+				}
+			} else {
+				machine_msg_free(msg);
+			}
 			break;
-		case SHAPITO_BE_ERROR_RESPONSE:
-			od_backend_error(server, "startup", stream->start,
-			                 shapito_stream_used(stream));
+		case KIWI_BE_ERROR_RESPONSE:
+			od_backend_error(server, machine_msg_data(msg),
+					 machine_msg_size(msg));
+			server->error_connect = msg;
 			return -1;
 		default:
-			od_debug(&instance->logger, "startup", NULL, server,
-			         "unexpected message: %s",
-			         shapito_be_msg_to_string(type));
+			machine_msg_free(msg);
+			od_debug(&instance->logger, client, server,
+				 "unexpected message: %s",
+				 kiwi_be_type_to_string(type));
 			return -1;
 		}
 	}
+	OD_UNREACHABLE();
 	return 0;
 }
 
-static inline int
-od_backend_connect_to(od_server_t *server,
-                      shapito_stream_t *stream,
-                      od_configstorage_t *server_config,
-                      char *context)
+static inline int od_backend_tls_negotiate(od_tls_opts_t *tlsopts,
+					   od_backend_tls_attempt_t attempt)
+{
+	if (tlsopts->tls_mode == OD_CONFIG_TLS_DISABLE) {
+		return 0;
+	}
+	if (attempt == OD_BACKEND_TLS_NEGOTIATE) {
+		return 1;
+	}
+	/*
+	 * libpq sslmode=allow: try a plaintext connection first, TLS is
+	 * negotiated only after the server has refused the plaintext one.
+	 */
+	return tlsopts->tls_mode != OD_CONFIG_TLS_ALLOW;
+}
+
+int od_backend_connect_to(od_server_t *server, const od_address_t *address,
+			  od_tls_opts_t *tlsopts,
+			  od_backend_tls_attempt_t tls_attempt)
 {
 	od_instance_t *instance = server->global->instance;
-	assert(server->io == NULL);
+	od_assert(server->io.io == NULL);
+	od_assert(address != NULL);
 
 	/* create io handle */
-	server->io = machine_io_create();
-	if (server->io == NULL)
+	mm_io_t *io;
+	io = mm_io_create();
+	if (io == NULL) {
 		return -1;
+	}
 
 	/* set network options */
-	machine_set_nodelay(server->io, instance->config.nodelay);
-	if (instance->config.keepalive > 0)
-		machine_set_keepalive(server->io, 1, instance->config.keepalive);
-	int rc;
-	rc = machine_set_readahead(server->io, instance->config.readahead);
-	if (rc == -1) {
-		od_error(&instance->logger, context, NULL, server,
-		         "failed to set readahead");
-		return -1;
+	mm_io_set_nodelay(io, instance->config.nodelay);
+	if (instance->config.keepalive > 0) {
+		mm_io_set_keepalive(
+			io, 1, instance->config.keepalive,
+			instance->config.keepalive_keep_interval,
+			instance->config.keepalive_probes,
+			(int)instance->config.keepalive_usr_timeout_ms);
 	}
+
+	int rc;
 
 	/* set tls options */
-	if (server_config->tls_mode != OD_TLS_DISABLE) {
-		server->tls = od_tls_backend(server_config);
-		if (server->tls == NULL)
+	int negotiate_tls = od_backend_tls_negotiate(tlsopts, tls_attempt);
+	if (negotiate_tls) {
+		server->tls = od_tls_backend(tlsopts);
+		if (server->tls == NULL) {
+			mm_io_close(io);
+			mm_io_free(io);
 			return -1;
+		}
 	}
+
+	/* snapshot log_session to avoid race on config reload (SIGHUP) */
+	int log_session = instance->config.log_session;
+
+	uint64_t time_connect_start = 0;
+	if (log_session) {
+		time_connect_start = machine_time_us();
+	}
+
+	struct sockaddr_un saddr_un;
+	struct sockaddr_in saddr_v4;
+	struct sockaddr_in6 saddr_v6;
+	struct sockaddr *saddr;
+	mm_addrinfo_t *ai = NULL;
 
 	/* resolve server address */
-	char port[16];
-	od_snprintf(port, sizeof(port), "%d", server_config->port);
-	struct addrinfo *ai = NULL;
-	rc = machine_getaddrinfo(server_config->host, port, NULL, &ai, 0);
-	if (rc != 0) {
-		od_error(&instance->logger, context, NULL, server,
-		         "failed to resolve %s:%d",
-		         server_config->host,
-		         server_config->port);
-		return -1;
+	if (address->type == OD_ADDRESS_TYPE_TCP) {
+		/* assume IPv6 or IPv4 is specified */
+		int rc_resolve = -1;
+		if (strchr(address->host, ':')) {
+			/* v6 */
+			memset(&saddr_v6, 0, sizeof(saddr_v6));
+			saddr_v6.sin6_family = AF_INET6;
+			saddr_v6.sin6_port = htons(address->port);
+			rc_resolve = inet_pton(AF_INET6, address->host,
+					       &saddr_v6.sin6_addr);
+			saddr = (struct sockaddr *)&saddr_v6;
+		} else {
+			/* v4 or hostname */
+			memset(&saddr_v4, 0, sizeof(saddr_v4));
+			saddr_v4.sin_family = AF_INET;
+			saddr_v4.sin_port = htons(address->port);
+			rc_resolve = inet_pton(AF_INET, address->host,
+					       &saddr_v4.sin_addr);
+			saddr = (struct sockaddr *)&saddr_v4;
+		}
+
+		/* schedule getaddrinfo() execution */
+		if (rc_resolve != 1) {
+			char rport[16];
+			od_snprintf(rport, sizeof(rport), "%d", address->port);
+
+			od_wait_event_start(OD_WAIT_CONNECT_TCP);
+			rc = mm_getaddrinfo(address->host, rport, NULL, &ai, 0);
+			od_wait_event_end(OD_WAIT_CONNECT_TCP);
+			if (rc != 0) {
+				od_error(&instance->logger, NULL, server,
+					 "failed to resolve %s:%d",
+					 address->host, address->port);
+				mm_io_close(io);
+				mm_io_free(io);
+				return NOT_OK_RESPONSE;
+			}
+			od_assert(ai != NULL);
+			saddr = ai->ai_addr;
+		}
+		/* connected */
+
+	} else {
+		/* set unix socket path */
+		memset(&saddr_un, 0, sizeof(saddr_un));
+		saddr_un.sun_family = AF_UNIX;
+		saddr = (struct sockaddr *)&saddr_un;
+		if (strlen(address->host) >= sizeof(saddr_un.sun_path)) {
+			od_error(&instance->logger, NULL, server,
+				 "unix socket path '%s' is too long",
+				 address->host);
+			mm_io_close(io);
+			mm_io_free(io);
+			return NOT_OK_RESPONSE;
+		}
+		memcpy(saddr_un.sun_path, address->host,
+		       strlen(address->host) + 1);
 	}
-	assert(ai != NULL);
+
+	uint64_t time_resolve = 0;
+	if (log_session) {
+		time_resolve = machine_time_us() - time_connect_start;
+	}
 
 	/* connect to server */
-	rc = machine_connect(server->io, ai->ai_addr, UINT32_MAX);
-	freeaddrinfo(ai);
+	if (ai != NULL) {
+		for (mm_addrinfo_t *cur = ai; cur != NULL; cur = cur->ai_next) {
+			saddr = cur->ai_addr;
+			od_wait_event_start(OD_WAIT_CONNECT_TCP);
+			rc = mm_io_connect(io, saddr,
+					   (uint32_t)instance->config
+						   .backend_connect_timeout_ms);
+			od_wait_event_end(OD_WAIT_CONNECT_TCP);
+			if (rc == 0) {
+				break;
+			}
+
+			char addr_str[INET6_ADDRSTRLEN] = "<unknown>";
+			if (cur->ai_family == AF_INET) {
+				inet_ntop(AF_INET,
+					  &((struct sockaddr_in *)cur->ai_addr)
+						   ->sin_addr,
+					  addr_str, sizeof(addr_str));
+			} else if (cur->ai_family == AF_INET6) {
+				inet_ntop(AF_INET6,
+					  &((struct sockaddr_in6 *)cur->ai_addr)
+						   ->sin6_addr,
+					  addr_str, sizeof(addr_str));
+			}
+
+			int err = mm_errno_get();
+			od_error(
+				&instance->logger, server->client, server,
+				"failed to connect to %s:%d, errno=%d (%s), trying next address...",
+				addr_str, address->port, err, strerror(err));
+		}
+		mm_freeaddrinfo(ai);
+	} else {
+		od_wait_event_start(OD_WAIT_CONNECT_TCP);
+		rc = mm_io_connect(
+			io, saddr,
+			(uint32_t)instance->config.backend_connect_timeout_ms);
+		od_wait_event_end(OD_WAIT_CONNECT_TCP);
+	}
+
+	if (rc == NOT_OK_RESPONSE) {
+		if (address->type == OD_ADDRESS_TYPE_TCP) {
+			od_error(&instance->logger, server->client, server,
+				 "failed to connect to %s:%d, errno=%d (%s)",
+				 address->host, address->port, machine_errno(),
+				 strerror(machine_errno()));
+		} else {
+			od_error(&instance->logger, server->client, server,
+				 "failed to connect to %s, errno=%d, (%s)",
+				 saddr_un.sun_path, machine_errno(),
+				 strerror(machine_errno()));
+		}
+		mm_io_close(io);
+		mm_io_free(io);
+		return NOT_OK_RESPONSE;
+	}
+
+	/* publish server io after successful connect (stable fd), under
+	 * route lock: console readers traverse the pool under the same lock */
+	if (server->route != NULL) {
+		/* The event loop may already have consumed a failed connect's SO_ERROR. */
+		if (io->error == 0) {
+			od_stat_server_connect(&server->route->stats);
+			server->stats_connected = true;
+		}
+		od_route_lock(server->route);
+	}
+	rc = od_io_prepare(&server->io, io);
+	if (server->route != NULL) {
+		od_route_unlock(server->route);
+	}
 	if (rc == -1) {
-		od_error(&instance->logger, context, server->client, server,
-		         "failed to connect to %s:%d",
-		         server_config->host,
-		         server_config->port);
+		od_error(&instance->logger, NULL, server,
+			 "failed to set server io, errno = %d (%s)",
+			 machine_errno(), strerror(machine_errno()));
+		od_server_stat_close(server);
+		mm_io_close(io);
+		mm_io_free(io);
 		return -1;
 	}
 
 	/* do tls handshake */
-	if (server_config->tls_mode != OD_TLS_DISABLE) {
-		rc = od_tls_backend_connect(server, &instance->logger, stream, server_config);
-		if (rc == -1)
-			return -1;
+	if (negotiate_tls) {
+		od_wait_event_start(OD_WAIT_CONNECT_TLS);
+		rc = od_tls_backend_connect(server, &instance->logger, tlsopts);
+		od_wait_event_end(OD_WAIT_CONNECT_TLS);
+		if (rc == NOT_OK_RESPONSE) {
+			return NOT_OK_RESPONSE;
+		}
 	}
+
+	uint64_t time_connect = 0;
+	if (log_session) {
+		time_connect = machine_time_us() - time_connect_start;
+	}
+
+	/* log server connection */
+	if (log_session) {
+		char addr_buff[256];
+		mm_io_format_socket_addr(server->io.io, addr_buff,
+					 sizeof(addr_buff));
+
+		if (address->type == OD_ADDRESS_TYPE_TCP) {
+			od_log(&instance->logger, server->client, server,
+			       "new server connection %s -> %s:%d (connect time: %d usec, "
+			       "resolve time: %d usec)",
+			       addr_buff, address->host, address->port,
+			       (int)time_connect, (int)time_resolve);
+		} else {
+			od_log(&instance->logger, server->client, server,
+			       "new server connection %s -> %s (connect time: %d usec, resolve "
+			       "time: %d usec)",
+			       addr_buff, saddr_un.sun_path, (int)time_connect,
+			       (int)time_resolve);
+		}
+	}
+
+	server->need_startup = 1;
 
 	return 0;
 }
 
-int od_backend_connect(od_server_t *server, shapito_stream_t *stream,
-                       char *context)
+static inline int od_storage_parse_rw_check_response(machine_msg_t *msg,
+						     bool *is_rw)
 {
-	od_instance_t *instance = server->global->instance;
-	od_route_t *route = server->route;
-	assert(route != NULL);
+	char *pos = (char *)machine_msg_data(msg) + 1;
+	uint32_t pos_size = machine_msg_size(msg) - 1;
 
-	od_configstorage_t *server_config;
-	server_config = route->config->storage;
-
-	/* connect to server */
+	/* size */
+	uint32_t size;
 	int rc;
-	rc = od_backend_connect_to(server, stream, server_config, context);
-	if (rc == -1)
-		return -1;
+	rc = kiwi_read32(&size, &pos, &pos_size);
+	if (kiwi_unlikely(rc == -1)) {
+		goto error;
+	}
+	/* count */
+	uint16_t count;
+	rc = kiwi_read16(&count, &pos, &pos_size);
 
-	/* log server connection */
-	if (instance->config.log_session) {
-		od_log(&instance->logger, context, server->client, server,
-		       "new server connection %s:%d",
-		       server_config->host,
-		       server_config->port);
+	if (kiwi_unlikely(rc == -1)) {
+		goto error;
+	}
+
+	if (count != 1) {
+		goto error;
+	}
+
+	/* (not used) */
+	uint32_t resp_len;
+	rc = kiwi_read32(&resp_len, &pos, &pos_size);
+	if (kiwi_unlikely(rc == -1)) {
+		goto error;
+	}
+
+	/* we expect exactly one row */
+	if (resp_len != 1) {
+		return NOT_OK_RESPONSE;
+	}
+	/* pg is in recovery false means db is open for write */
+	if (pos[0] == 'f') {
+		*is_rw = true;
+		return OK_RESPONSE;
+	} else if (pos[0] == 't') {
+		*is_rw = false;
+		return OK_RESPONSE;
+	}
+	/* fallthrough to error */
+error:
+	return NOT_OK_RESPONSE;
+}
+
+static inline int64_t strtol_safe(const char *s, int len)
+{
+	char buff[32];
+	memset(buff, 0, sizeof(buff));
+	if (len <= 0) {
+		return 0;
+	}
+	if (len >= (int)sizeof(buff)) {
+		len = sizeof(buff) - 1;
+	}
+	memcpy(buff, s, len);
+
+	return strtoll(buff, NULL, 0);
+}
+
+static inline int parse_lag_from_datarow(machine_msg_t *msg, int64_t *repl_lag)
+{
+	char *pos = (char *)machine_msg_data(msg) + 1;
+	uint32_t pos_size = machine_msg_size(msg) - 1;
+
+	/* size */
+	uint32_t size;
+	int rc;
+	rc = kiwi_read32(&size, &pos, &pos_size);
+	if (kiwi_unlikely(rc == -1)) {
+		goto error;
+	}
+	/* count */
+	uint16_t count;
+	rc = kiwi_read16(&count, &pos, &pos_size);
+
+	if (kiwi_unlikely(rc == -1)) {
+		goto error;
+	}
+
+	if (count != 1) {
+		goto error;
+	}
+
+	uint32_t lag_len;
+	rc = kiwi_read32(&lag_len, &pos, &pos_size);
+	if (kiwi_unlikely(rc == -1)) {
+		goto error;
+	}
+
+	/* SQL NULL is encoded as length = -1 (0xFFFFFFFF in uint32_t) */
+	if (lag_len == (uint32_t)-1) {
+		*repl_lag = 0;
+		return OK_RESPONSE;
+	}
+
+	*repl_lag = strtol_safe(pos, (int)lag_len);
+
+	return OK_RESPONSE;
+error:
+	return NOT_OK_RESPONSE;
+}
+
+int od_backend_update_endpoint_status(od_instance_t *instance,
+				      od_client_t *client, od_server_t *server,
+				      const char *lag_query,
+				      od_storage_endpoint_t *endpoint)
+{
+	char addr[256];
+	od_address_to_str(&endpoint->address, addr, sizeof(addr) - 1);
+
+	od_storage_endpoint_status_t status;
+	od_storage_endpoint_status_get(&endpoint->status, &status);
+
+	machine_msg_t *msg;
+
+	if (lag_query != NULL) {
+		msg = od_query_do(server, lag_query, NULL, 1000);
+		if (msg == NULL) {
+			od_error(
+				&instance->logger, client, server,
+				"receive msg failed, closing backend connection");
+			return NOT_OK_RESPONSE;
+		}
+
+		int64_t last_heartbeat;
+		int rc = parse_lag_from_datarow(msg, &last_heartbeat);
+		machine_msg_free(msg);
+		msg = NULL;
+
+		if (rc == 0) {
+			int64_t lag = machine_timeofday_sec() - last_heartbeat;
+			if (lag < 0) {
+				lag = 0;
+			}
+			status.repl_lag_sec = lag;
+
+			od_debug(
+				&instance->logger, client, server,
+				"replica lag time of %s is updated to %" PRId64,
+				addr, status.repl_lag_sec);
+		} else {
+			od_error(&instance->logger, client, server,
+				 "can't parse lag");
+			return NOT_OK_RESPONSE;
+		}
+	}
+
+	msg = od_query_do(server, "SELECT pg_is_in_recovery()", NULL, 1000);
+	if (msg == NULL) {
+		od_error(&instance->logger, client, server,
+			 "can't execute pg_is_in_recovery");
+		return NOT_OK_RESPONSE;
+	}
+
+	if (od_storage_parse_rw_check_response(msg, &status.is_read_write) !=
+	    OK_RESPONSE) {
+		od_error(&instance->logger, client, server,
+			 "can't parse pg_is_in_recovery result");
+		machine_msg_free(msg);
+		return NOT_OK_RESPONSE;
+	}
+	machine_msg_free(msg);
+
+	status.last_update_time_ms = machine_time_ms();
+	status.alive = 1;
+
+	od_storage_endpoint_status_set(&endpoint->status, &status);
+
+	od_debug(&instance->logger, client, server,
+		 "read-write status of '%s' is updated to '%s'", addr,
+		 status.is_read_write ? "true" : "false");
+
+	return OK_RESPONSE;
+}
+
+od_tsa_check_result_t od_backend_check_tsa(od_rule_storage_t *storage,
+					   od_storage_endpoint_t *endpoint,
+					   od_server_t *server,
+					   od_client_t *client,
+					   od_target_session_attrs_t attrs)
+{
+	if (attrs == OD_TARGET_SESSION_ATTRS_ANY) {
+		return OD_TSA_CHECK_OK;
+	}
+
+	od_global_t *global = server->global;
+	od_instance_t *instance = global->instance;
+
+	if (od_storage_endpoint_status_is_outdated(
+		    &endpoint->status,
+		    storage->endpoints_status_poll_interval_ms)) {
+		od_wait_event_start(OD_WAIT_CONNECT_TCP);
+		int status_rc = od_backend_update_endpoint_status(
+			instance, client, server, NULL /* do not update lag */,
+			endpoint);
+		od_wait_event_end(OD_WAIT_CONNECT_TCP);
+		if (status_rc != OK_RESPONSE) {
+			return OD_TSA_CHECK_BACKEND_ERROR;
+		}
+	}
+
+	od_storage_endpoint_status_t status;
+	od_storage_endpoint_status_get(&endpoint->status, &status);
+
+	if (!od_tsa_match_rw_state(attrs, status.is_read_write)) {
+		return OD_TSA_CHECK_FAIL;
+	}
+
+	return OD_TSA_CHECK_OK;
+}
+
+static inline int od_backend_connect_on_server_address(
+	od_rule_storage_t *storage, od_server_t *server,
+	kiwi_params_t *route_params, od_client_t *client)
+{
+	const od_address_t *address = od_server_pool_address(server);
+
+	od_retcode_t rc;
+
+	rc = od_backend_connect_to(server, address, storage->tls_opts,
+				   OD_BACKEND_TLS_DEFAULT);
+	if (rc == NOT_OK_RESPONSE) {
+		return rc;
 	}
 
 	/* send startup and do initial configuration */
-	rc = od_backend_startup(server, stream);
-	return rc;
+	rc = od_backend_startup_with_tls_fallback(server, storage, route_params,
+						  client);
+	if (rc == NOT_OK_RESPONSE) {
+		return rc;
+	}
+
+	return OK_RESPONSE;
 }
 
-int od_backend_connect_cancel(od_server_t *server,
-                              shapito_stream_t *stream,
-                              od_configstorage_t *server_config,
-                              shapito_key_t *key)
+int od_backend_connect(od_server_t *server, kiwi_params_t *route_params,
+		       od_client_t *client, od_rule_storage_t *storage)
+{
+	od_assert(server->route != NULL);
+
+	return od_backend_connect_on_server_address(storage, server,
+						    route_params, client);
+}
+
+int od_backend_connect_cancel(od_server_t *server, od_rule_storage_t *storage,
+			      const od_address_t *address, kiwi_key_t *key)
 {
 	od_instance_t *instance = server->global->instance;
-	/* connect to server */
+
+	/*
+	 * Use a bounded timeout — cancel is best-effort.
+	 * UINT32_MAX caused coroutines to hang forever if the backend
+	 * closed the connection in a way that machinarium didn't wake
+	 * the reader, leaking routing_clients counter and socket fds.
+	 * Configurable via cancel_timeout_ms (default 1000).
+	 * A value of 0 means no timeout (UINT32_MAX) — not recommended.
+	 */
+	uint32_t cancel_timeout =
+		instance->config.cancel_timeout_ms > 0 ?
+			(uint32_t)instance->config.cancel_timeout_ms :
+			UINT32_MAX;
+
+	/*
+	 * Connect to server.
+	 *
+	 * A cancel connection sends no startup packet, so the "allow" mode has
+	 * nothing to retry on and stays plaintext here. That is enough: the
+	 * postmaster handles CancelRequest before authentication and before
+	 * pg_hba.conf is consulted, so a plaintext cancel is delivered even by
+	 * a server that accepts hostssl connections only. The cancel key is
+	 * sent in cleartext then, exactly like the signal-safe PQcancel() of
+	 * libpq does it.
+	 */
 	int rc;
-	rc = od_backend_connect_to(server, stream, server_config, "cancel");
-	if (rc == -1)
-		return -1;
+	rc = od_backend_connect_to(server, address, storage->tls_opts,
+				   OD_BACKEND_TLS_DEFAULT);
+	if (rc == NOT_OK_RESPONSE) {
+		return NOT_OK_RESPONSE;
+	}
+
 	/* send cancel request */
-	shapito_stream_reset(stream);
-	rc = shapito_fe_write_cancel(stream, key->key_pid, key->key);
-	if (rc == -1)
+	machine_msg_t *msg;
+	msg = kiwi_fe_write_cancel(NULL, key);
+	if (msg == NULL) {
 		return -1;
-	rc = od_write(server->io, stream);
+	}
+
+	rc = od_write2(&server->io, msg, cancel_timeout);
 	if (rc == -1) {
-		od_error(&instance->logger, "cancel", NULL, NULL,
-		         "write error: %s",
-		         machine_error(server->io));
-	}
-	return 0;
-}
-
-int od_backend_ready_wait(od_server_t *server, shapito_stream_t *stream,
-                          char *context, int count,
-                          uint32_t time_ms)
-{
-	od_instance_t *instance = server->global->instance;
-
-	int ready = 0;
-	for (;;)
-	{
-		shapito_stream_reset(stream);
-		int rc;
-		rc = od_read(server->io, stream, time_ms);
-		if (rc == -1) {
-			if (! machine_timedout()) {
-				od_error(&instance->logger, context, server->client, server,
-				         "read error: %s",
-				         machine_error(server->io));
-			}
-			return -1;
-		}
-		shapito_be_msg_t type = *stream->start;
-		od_debug(&instance->logger, context, server->client, server, "%s",
-		         shapito_be_msg_to_string(type));
-
-		if (type == SHAPITO_BE_ERROR_RESPONSE) {
-			od_backend_error(server, context, stream->start,
-			                 shapito_stream_used(stream));
-			continue;
-		}
-		if (type == SHAPITO_BE_PARAMETER_STATUS) {
-			char *name;
-			uint32_t name_len;
-			char *value;
-			uint32_t value_len;
-			rc = shapito_fe_read_parameter(stream->start,
-			                               shapito_stream_used(stream),
-			                               &name, &name_len,
-			                               &value, &value_len);
-			if (rc == -1) {
-				od_error(&instance->logger, context, server->client, server,
-				         "failed to parse ParameterStatus message");
-				return -1;
-			}
-			/* update parameter */
-			rc = shapito_parameters_update(&server->params, name, name_len,
-			                               value, value_len);
-			if (rc == -1)
-				return -1;
-			od_debug(&instance->logger, context, server->client, server,
-			         "%.*s = %.*s",
-			         name_len, name, value_len, value);
-			continue;
-		}
-		if (type == SHAPITO_BE_READY_FOR_QUERY) {
-			od_backend_ready(server, context, stream->start,
-			                 shapito_stream_used(stream));
-			ready++;
-			if (ready == count)
-				break;
-		}
-	}
-	return 0;
-}
-
-int od_backend_query(od_server_t *server, shapito_stream_t *stream,
-                     char *context,
-                     char *query, int len)
-{
-	od_instance_t *instance = server->global->instance;
-	shapito_stream_reset(stream);
-	int rc;
-	rc = shapito_fe_write_query(stream, query, len);
-	if (rc == -1)
+		od_error(&instance->logger, NULL, NULL, "write error: %s",
+			 od_io_error(&server->io));
 		return -1;
-	rc = od_write(server->io, stream);
+	}
+
+	/*
+	 * wait the pg to process the cancel request
+	 * modern pg uses pqFlush, which falls to send + read
+	 * but there is no that powerful function in mm
+	 * so just do the things older pg did - it will work too
+	 * https://github.com/postgres/postgres/blob/REL_16_0/src/interfaces/libpq/fe-connect.c#L4946-L4960
+	 *
+	 * CancelRequest has no response packet: a clean EOF acknowledges delivery
+	 * A timeout/reset cannot prove PostgreSQL processed the packet
+	 */
+	machine_msg_t *response =
+		machine_read(server->io.io, 1, cancel_timeout);
+	if (response != NULL) {
+		machine_msg_free(response);
+		return NOT_OK_RESPONSE;
+	}
+
+	return machine_errno() == 0 ? OK_RESPONSE : NOT_OK_RESPONSE;
+}
+
+int od_backend_update_parameter(od_server_t *server, char *data, uint32_t size,
+				int server_only)
+{
+	od_instance_t *instance = server->global->instance;
+	od_client_t *client = server->client;
+
+	char *name;
+	uint32_t name_len;
+	char *value;
+	uint32_t value_len;
+
+	int rc;
+	rc = kiwi_fe_read_parameter(data, size, &name, &name_len, &value,
+				    &value_len);
 	if (rc == -1) {
-		od_error(&instance->logger, context, server->client, server,
-		         "write error: %s",
-		         machine_error(server->io));
+		od_error(&instance->logger, NULL, server,
+			 "failed to parse ParameterStatus message");
 		return -1;
 	}
 
-	/* update server sync state and stats */
-	od_server_stat_request(server, 1);
+	/* update server only or client and server parameter */
+	od_debug(&instance->logger, client, server, "%.*s = %.*s", name_len,
+		 name, value_len, value);
 
-	rc = od_backend_ready_wait(server, stream, context, 1, UINT32_MAX);
-	return rc;
+	/* ttt reports temp-rel ownership via ParameterStatus */
+	if (client != NULL &&
+	    name_len == sizeof(TTT_SESSION_OWNS_TEMP_RELS_STR) &&
+	    memcmp(name, TTT_SESSION_OWNS_TEMP_RELS_STR,
+		   sizeof(TTT_SESSION_OWNS_TEMP_RELS_STR)) == 0) {
+		client->backend_pin =
+			value_len == 3 && memcmp(value, "on", 2) == 0;
+		od_debug(&instance->logger, client, server,
+			 "ttt: backend_pin set to %d", client->backend_pin);
+	}
+
+	if (server_only) {
+		kiwi_vars_update(&server->vars, name, name_len, value,
+				 value_len);
+	} else {
+		kiwi_vars_update_both(&client->vars, &server->vars, name,
+				      name_len, value, value_len);
+	}
+
+	return 0;
 }
 
-int
-od_backend_deploy(od_server_t *server, char *context,
-                  char *request, int request_size)
+int od_backend_ready_wait(od_server_t *server, uint32_t time_ms,
+			  od_wait_event_t wait_event)
+{
+	od_frontend_status_t st = od_service_stream_server_until_rfq(
+		server, 0 /* ignore_errors */, time_ms, wait_event);
+	if (st != OD_OK) {
+		return -1;
+	}
+
+	return 0;
+}
+
+od_retcode_t od_backend_query_send(od_server_t *server, const char *query,
+				   char *param, int len, uint32_t timeout_ms)
 {
 	od_instance_t *instance = server->global->instance;
+
+	machine_msg_t *msg;
+	if (param) {
+		msg = kiwi_fe_write_prep_stmt(NULL, query, param);
+	} else {
+		msg = kiwi_fe_write_query(NULL, query, len);
+	}
+
+	if (msg == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+
 	int rc;
-	switch (*request) {
-	case SHAPITO_BE_PARAMETER_STATUS:
-	{
-		char *name;
-		uint32_t name_len;
-		char *value;
-		uint32_t value_len;
-		rc = shapito_fe_read_parameter(request, request_size,
-		                               &name, &name_len, &value, &value_len);
-		if (rc == -1) {
-			od_error(&instance->logger, context, server->client, server,
-			         "failed to parse ParameterStatus message");
-			return -1;
-		}
-		/* update parameter */
-		rc = shapito_parameters_update(&server->params, name, name_len,
-		                               value, value_len);
-		if (rc == -1)
-			return -1;
-		od_debug(&instance->logger, context, server->client, server,
-		         "(deploy) %.*s = %.*s",
-		         name_len, name, value_len, value);
-		break;
+	rc = od_write2(&server->io, msg, timeout_ms);
+	if (rc == -1) {
+		od_error(&instance->logger, server->client, server,
+			 "write error: %s", od_io_error(&server->io));
+		return NOT_OK_RESPONSE;
 	}
-	case SHAPITO_BE_ERROR_RESPONSE:
-		od_backend_error(server, context, request, request_size);
-		break;
-	case SHAPITO_BE_READY_FOR_QUERY:
-		rc = od_backend_ready(server, context, request, request_size);
-		if (rc == -1)
-			return -1;
-		server->deploy_sync--;
-		break;
-	}
-	return 0;
+
+	/* update server sync state */
+	od_server_sync_request(server, 1);
+	od_assert(server->client);
+	return OK_RESPONSE;
 }
 
-int od_backend_deploy_wait(od_server_t *server, shapito_stream_t *stream,
-                           char *context, uint32_t time_ms)
+od_retcode_t od_backend_query(od_server_t *server, char *query, char *param,
+			      int len, uint32_t timeout)
 {
-	od_instance_t *instance = server->global->instance;
-	while (server->deploy_sync > 0) {
-		shapito_stream_reset(stream);
-		int rc;
-		rc = od_read(server->io, stream, time_ms);
-		if (rc == -1) {
-			if (! machine_timedout()) {
-				od_error(&instance->logger, context, server->client, server,
-				         "read error: %s",
-				         machine_error(server->io));
-			}
-			return -1;
-		}
-		rc = od_backend_deploy(server, context, stream->start,
-		                       shapito_stream_used(stream));
-		if (rc == -1)
-			return -1;
+	od_wait_event_start(OD_WAIT_RESET_SERVER_WRITE);
+	od_retcode_t rc =
+		od_backend_query_send(server, query, param, len, timeout);
+	od_wait_event_end(OD_WAIT_RESET_SERVER_WRITE);
+	if (rc == NOT_OK_RESPONSE) {
+		return NOT_OK_RESPONSE;
 	}
-	return 0;
+
+	return od_backend_ready_wait(server, timeout,
+				     OD_WAIT_RESET_SERVER_READ);
+}
+
+int od_backend_not_connected(od_server_t *server)
+{
+	return server->io.io == NULL;
+}
+
+int od_backend_need_startup(od_server_t *server)
+{
+	return server->need_startup;
 }

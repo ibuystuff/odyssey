@@ -1,0 +1,98 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+/*
+ * address -> pool 'map'
+ */
+
+#include <stdatomic.h>
+
+#include <machinarium/mutex.h>
+
+#include <types.h>
+#include <address.h>
+#include <list.h>
+#include <server_pool.h>
+#include <server.h>
+
+typedef void (*od_server_pool_free_fn_t)(od_server_pool_t *);
+
+struct od_multi_pool_key {
+	char *dbname;
+	char *username;
+	od_address_t address;
+};
+
+struct od_multi_pool_element {
+	od_multi_pool_key_t key;
+	od_server_pool_t pool;
+	mm_wait_list_t wait_bus;
+	od_list_t link;
+};
+
+typedef int (*od_multi_pool_element_cb_t)(od_multi_pool_element_t *, void **);
+
+struct od_multi_pool {
+	od_list_t pools;
+	od_server_pool_free_fn_t pool_free_fn;
+
+	mm_mutex_t lock;
+
+	/* should increase every time servers in the route's pool are changed */
+	atomic_uint_fast64_t version;
+};
+
+static inline void od_multi_pool_lock(od_multi_pool_t *mpool)
+{
+	mm_mutex_lock2(&mpool->lock);
+}
+
+static inline void od_multi_pool_unlock(od_multi_pool_t *mpool)
+{
+	mm_mutex_unlock(&mpool->lock);
+}
+
+static inline uint64_t od_multi_pool_version(od_multi_pool_t *mpool)
+{
+	return atomic_load(&mpool->version);
+}
+
+void od_multi_pool_signal_locked(od_multi_pool_t *mpool,
+				 od_multi_pool_element_t *el,
+				 od_server_t *server);
+
+int od_multi_pool_wait(od_multi_pool_element_t *el, od_client_t *client,
+		       uint64_t version, uint32_t timeout_ms);
+
+od_multi_pool_t *od_multi_pool_create(od_server_pool_free_fn_t pool_free_fn);
+void od_multi_pool_destroy(od_multi_pool_t *mpool);
+
+od_multi_pool_element_t *
+od_multi_pool_get_or_create_locked(od_multi_pool_t *mpool,
+				   const od_multi_pool_key_t *key);
+
+/* return 1 if key fits, 0 otherwise */
+typedef int (*od_multi_pool_key_filter_t)(void *, const od_multi_pool_key_t *);
+
+od_server_t *
+od_multi_pool_foreach_locked(od_multi_pool_t *mpool,
+			     const od_multi_pool_key_filter_t filter,
+			     void *farg, od_server_state_t state,
+			     od_server_pool_cb_t callback, void **argv);
+int od_multi_pool_count_active_locked(od_multi_pool_t *mpool,
+				      const od_multi_pool_key_filter_t filter,
+				      void *farg);
+int od_multi_pool_count_idle_locked(od_multi_pool_t *mpool,
+				    const od_multi_pool_key_filter_t filter,
+				    void *farg);
+int od_multi_pool_total_locked(od_multi_pool_t *mpool,
+			       const od_multi_pool_key_filter_t filter,
+			       void *farg);
+
+od_server_t *od_multi_pool_peek_any_locked(od_multi_pool_t *mpool,
+					   od_server_state_t state);

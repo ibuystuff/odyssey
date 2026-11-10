@@ -1,0 +1,124 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <machinarium/spinlock.h>
+
+#include <kiwi/kiwi.h>
+
+#include <types.h>
+#include <tls_config.h>
+#include <balancing.h>
+#include <list.h>
+#include <pool.h>
+#include <od_memory.h>
+#include <address.h>
+
+/* Storage Watchdog */
+typedef enum {
+	OD_RULE_STORAGE_REMOTE,
+	OD_RULE_STORAGE_LOCAL,
+} od_rule_storage_type_t;
+
+struct od_storage_watchdog {
+	char *route_usr;
+	char *route_db;
+
+	char *storage_user;
+	char *storage_db;
+
+	char *query;
+	int interval;
+
+	od_global_t *global;
+
+	od_rule_storage_t *storage;
+
+	machine_wait_flag_t *online;
+};
+
+od_storage_watchdog_t *od_storage_watchdog_allocate(od_global_t *);
+int od_storage_watchdog_free(od_storage_watchdog_t *watchdog);
+
+typedef struct {
+	uint64_t last_update_time_ms;
+	mm_spinlock_t values_lock;
+	int alive;
+	bool is_read_write;
+	int64_t repl_lag_sec;
+} od_storage_endpoint_status_t;
+
+void od_storage_endpoint_status_init(od_storage_endpoint_status_t *status);
+void od_storage_endpoint_status_destroy(od_storage_endpoint_status_t *status);
+bool od_storage_endpoint_status_is_outdated(
+	od_storage_endpoint_status_t *status, uint64_t recheck_interval);
+void od_storage_endpoint_status_get(od_storage_endpoint_status_t *status,
+				    od_storage_endpoint_status_t *out);
+void od_storage_endpoint_status_set(od_storage_endpoint_status_t *status,
+				    const od_storage_endpoint_status_t *value);
+void od_storage_endpoint_status_set_dead(od_storage_endpoint_status_t *status);
+
+struct od_storage_endpoint {
+	od_address_t address;
+
+	od_storage_endpoint_status_t status;
+
+	struct od_rule_storage *storage;
+};
+
+int od_storage_parse_endpoints(const char *host_str,
+			       od_storage_endpoint_t **out, size_t *count);
+
+struct od_rule_storage {
+	od_tls_opts_t *tls_opts;
+
+	char *name;
+	char *type;
+	od_rule_storage_type_t storage_type;
+
+	od_storage_endpoint_t *endpoints;
+	size_t endpoints_count;
+
+	char *host; /* host or host,host or [host]:port[,host...] */
+	int port; /* default port */
+
+	int server_max_routing;
+	od_storage_watchdog_t *watchdog;
+	int64_t watchdog_coro_id;
+
+	od_list_t link;
+
+	int endpoints_status_poll_interval_ms;
+	od_storage_balancing_t balancing;
+
+	atomic_int_fast64_t refs;
+
+	int mark; /* transient flag used during storage merge */
+};
+
+/* storage API */
+od_rule_storage_t *od_rules_storage_allocate(void);
+
+od_rule_storage_t *od_rules_storage_ref(od_rule_storage_t *s);
+
+void od_rules_storage_unref(od_rule_storage_t *);
+
+od_storage_endpoint_t *od_storage_find_endpoint(od_rule_storage_t *storage,
+						const od_address_t *address);
+
+/*
+ * like od_storage_find_endpoint, but compares only type, host and port
+ * (ignores availability zone); port 0 means storage default port
+ */
+od_storage_endpoint_t *
+od_storage_find_endpoint_by_host(od_rule_storage_t *storage,
+				 const od_address_t *address);
+
+/* watchdog */
+void od_storage_watchdog_watch(void *arg);
+
+int od_storage_watchdog_set_offline(od_storage_watchdog_t *watchdog);

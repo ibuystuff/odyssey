@@ -1,125 +1,255 @@
-
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
+#include <odyssey.h>
 
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <machinarium/io.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <misc.h>
+#include <readahead.h>
+#include <io.h>
 
-#include "sources/macro.h"
-#include "sources/util.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/io.h"
-
-int od_read(machine_io_t *io, shapito_stream_t *stream, uint32_t time_ms)
+static int write_do_duplex_step(od_io_t *io, int no_buf_fail)
 {
-	uint32_t request_start = shapito_stream_used(stream);
-	uint32_t request_size = 0;
-	for (;;)
-	{
-		char *request_data = stream->start + request_start;
-		uint32_t len;
-		int to_read;
-		to_read = shapito_read(&len, &request_data, &request_size);
-		if (to_read == 0)
+	int rc = od_io_try_read_some(io);
+	if (rc != 0) {
+		int errno_ = mm_errno_get();
+		if (errno_ == EWOULDBLOCK) {
+			/* no data available, do nothing */
+			return 0;
+		}
+		if (errno_ == ENOBUFS) {
+			/*
+			 * data is available, but there is no place in readahead for it
+			 * this is possible full-duplex deadlock, but for now just ignore
+			 */
+			return no_buf_fail;
+		}
+
+		/* some error occurred - go out */
+		return -1;
+	}
+
+	/* some data was read into readahead, that's good */
+	return 0;
+}
+
+int od_io_write_raw(od_io_t *io, const void *buf, size_t size,
+		    size_t *processed, uint32_t timeout_ms, int flags)
+{
+	*processed = 0;
+	size_t total = 0;
+	const char *pos = buf;
+	int duplex = flags & OD_IO_WRITE_DUPLEX;
+
+	mm_io_set_deadline(io->io, timeout_ms);
+	while (total < size) {
+		int rc = machine_write_raw(io->io, pos, size - total,
+					   NULL /* TODO: processed */);
+		if (rc > 0) {
+			total += (size_t)rc;
+			*processed = total;
+			pos += rc;
+
+			if (duplex && mm_io_read_ready(io->io)) {
+				rc = write_do_duplex_step(io, 0);
+				if (rc != 0) {
+					return -1;
+				}
+			}
+			continue;
+		}
+
+		int errno_ = machine_errno();
+		if (machine_errno_retryable(errno_)) {
+			if (duplex && !mm_io_want_write(io->io)) {
+				/*
+				 * only after not WANT_WRITE because if TLS is enabled
+				 * we must retry SSL_write with exact same arguments
+				 * after SSL_WANT_WRITE
+				 */
+				rc = write_do_duplex_step(io, 1);
+				if (rc != 0) {
+					return -1;
+				}
+			}
+			rc = mm_io_wait_deadline(io->io);
+			if (rc == MM_COND_WAIT_FAIL) {
+				/* io wait will set errno to ETIMEDOUT or ECANCELLED */
+				return -1;
+			}
+			if (rc == MM_COND_WAIT_OK_PROPAGATED) {
+				mm_errno_set(EAGAIN);
+				return -1;
+			}
+			continue;
+		}
+
+		/* error or unexpected eof */
+		return -1;
+	}
+
+	return 0;
+}
+
+/* breaks iovec arg */
+static struct iovec iov_advance(struct iovec *iovec, int cnt, ssize_t size)
+{
+	while (cnt > 0) {
+		if (iovec->iov_len > (size_t)size) {
+			iovec->iov_base = (char *)iovec->iov_base + size;
+			iovec->iov_len -= size;
 			break;
-		if (to_read == -1)
-			return -1;
-		int rc = shapito_stream_ensure(stream, to_read);
-		if (rc == -1)
-			return -1;
-		rc = machine_read(io, stream->pos, to_read, time_ms);
-		if (rc == -1)
-			return -1;
-		shapito_stream_advance(stream, to_read);
-		request_size += to_read;
+		}
+
+		size -= iovec->iov_len;
+		++iovec;
+		--cnt;
 	}
-	return request_start;
+
+	struct iovec ret;
+	ret.iov_base = iovec;
+	ret.iov_len = cnt;
+
+	return ret;
 }
 
-int od_write(machine_io_t *io, shapito_stream_t *stream)
+int od_io_writev(od_io_t *io, struct iovec *iov, int iovcnt,
+		 uint32_t timeout_ms, int flags)
 {
-	int rc;
-	rc = machine_write(io, stream->start, shapito_stream_used(stream),
-	                   UINT32_MAX);
-	return rc;
+	int duplex = flags & OD_IO_WRITE_DUPLEX;
+	mm_io_set_deadline(io->io, timeout_ms);
+	while (iovcnt > 0) {
+		size_t processed = 0;
+		ssize_t rc =
+			machine_writev_raw(io->io, iov, iovcnt, &processed);
+
+		/*
+		 * Advance the scatter-gather vector by the number of consumed
+		 * input bytes. For the socket/TLS paths and for streaming
+		 * compression on success, rc itself is that number. For
+		 * compression, *processed is additionally set by the compressor
+		 * on partial-progress errors (rc <= 0) and holds the bytes
+		 * already accepted; those must not be resent on retry. This
+		 * additive accounting mirrors machine_write_no_free() which
+		 * uses machine_write_raw() the same way.
+		 */
+		size_t consumed = processed + (rc > 0 ? (size_t)rc : 0);
+		if (consumed > 0) {
+			struct iovec a = iov_advance(iov, iovcnt, consumed);
+			iov = a.iov_base;
+			iovcnt = a.iov_len;
+		}
+
+		if (rc > 0) {
+			if (duplex && mm_io_read_ready(io->io)) {
+				rc = write_do_duplex_step(io, 0);
+				if (rc != 0) {
+					return -1;
+				}
+			}
+			continue;
+		}
+
+		int errno_ = machine_errno();
+		if (machine_errno_retryable(errno_)) {
+			if (duplex && !mm_io_want_write(io->io)) {
+				rc = write_do_duplex_step(io, 1);
+				if (rc != 0) {
+					return -1;
+				}
+			}
+			rc = mm_io_wait_deadline(io->io);
+			if (rc == MM_COND_WAIT_FAIL) {
+				/* io wait will set errno to ETIMEDOUT or ECANCELLED */
+				return -1;
+			}
+			if (rc == MM_COND_WAIT_OK_PROPAGATED) {
+				mm_errno_set(EAGAIN);
+				return -1;
+			}
+			continue;
+		}
+
+		/* error or unexpected eof */
+		return -1;
+	}
+
+	return 0;
 }
 
-static int
-od_getsockaddrname(struct sockaddr *sa, char *buf, int size,
-                   int add_addr,
-                   int add_port)
+int od_io_read_some(od_io_t *io, uint32_t timeout_ms)
 {
-	char addr[128];
-	if (sa->sa_family == AF_INET) {
-		struct sockaddr_in *sin = (struct sockaddr_in*)sa;
-		inet_ntop(sa->sa_family, &sin->sin_addr, addr, sizeof(addr));
-		if (add_addr && add_port)
-			od_snprintf(buf, size, "%s:%d", addr, ntohs(sin->sin_port));
-		else
-		if (add_addr)
-			od_snprintf(buf, size, "%s", addr);
-		else
-		if (add_port)
-			od_snprintf(buf, size, "%d", ntohs(sin->sin_port));
+	mm_io_set_deadline(io->io, timeout_ms);
+	while (1) {
+		struct iovec vec = od_readahead_write_begin(&io->readahead);
+		if (vec.iov_len == 0) {
+			return -1;
+		}
+
+		int rc = machine_read_raw(io->io, vec.iov_base, vec.iov_len);
+		if (rc > 0) {
+			od_readahead_write_commit(&io->readahead, (size_t)rc);
+			return 0;
+		}
+
+		int errno_ = machine_errno();
+		if (machine_errno_retryable(errno_)) {
+			rc = mm_io_wait_deadline(io->io);
+			if (rc == MM_COND_WAIT_FAIL) {
+				/* io wait will set errno to ETIMEDOUT or ECANCELLED */
+				return -1;
+			}
+			if (rc == MM_COND_WAIT_OK_PROPAGATED) {
+				mm_errno_set(EAGAIN);
+				return -1;
+			}
+			continue;
+		}
+
+		/* error or unexpected eof */
+		return -1;
+	}
+
+	abort();
+}
+
+int od_io_try_read_some(od_io_t *io)
+{
+	struct iovec vec = od_readahead_write_begin(&io->readahead);
+	if (vec.iov_len == 0) {
+		if (mm_io_read_pending(io->io)) {
+			mm_errno_set(ENOBUFS);
+		} else {
+			mm_errno_set(EWOULDBLOCK);
+		}
+		return -1;
+	}
+
+	int rc = machine_read_raw(io->io, vec.iov_base, vec.iov_len);
+	if (rc > 0) {
+		od_readahead_write_commit(&io->readahead, (size_t)rc);
 		return 0;
 	}
-	if (sa->sa_family == AF_INET6) {
-		struct sockaddr_in6 *sin = (struct sockaddr_in6*)sa;
-		inet_ntop(sa->sa_family, &sin->sin6_addr, addr, sizeof(addr));
-		if (add_addr && add_port)
-			od_snprintf(buf, size, "[%s]:%d", addr, ntohs(sin->sin6_port));
-		else
-		if (add_addr)
-			od_snprintf(buf, size, "%s", addr);
-		else
-		if (add_port)
-			od_snprintf(buf, size, "%d", ntohs(sin->sin6_port));
-		return 0;
+
+	int errno_ = machine_errno();
+	if (machine_errno_retryable(errno_)) {
+		mm_errno_set(EWOULDBLOCK);
+		return -1;
 	}
-	od_snprintf(buf, size, "%s", "");
+
+	/* error or unexpected eof */
 	return -1;
 }
 
-int od_getaddrname(struct addrinfo *ai, char *buf, int size, int add_addr, int add_port)
+int od_io_write_flush(od_io_t *io, uint32_t timeout_ms)
 {
-	return od_getsockaddrname(ai->ai_addr, buf, size, add_addr, add_port);
-}
-
-int od_getpeername(machine_io_t *io, char *buf, int size, int add_addr, int add_port)
-{
-	struct sockaddr_storage sa;
-	int salen = sizeof(sa);
-	int rc = machine_getpeername(io, (struct sockaddr*)&sa, &salen);
-	if (rc < 0) {
-		od_snprintf(buf, size, "%s", "");
-		return -1;
-	}
-	return od_getsockaddrname((struct sockaddr*)&sa, buf, size, add_addr, add_port);
-}
-
-int od_getsockname(machine_io_t *io, char *buf, int size, int add_addr, int add_port)
-{
-	struct sockaddr_storage sa;
-	int salen = sizeof(sa);
-	int rc = machine_getsockname(io, (struct sockaddr*)&sa, &salen);
-	if (rc < 0) {
-		od_snprintf(buf, size, "%s", "");
-		return -1;
-	}
-	return od_getsockaddrname((struct sockaddr*)&sa, buf, size, add_addr, add_port);
+	const uint8_t flush[] = { KIWI_FE_FLUSH, 0, 0, 0, sizeof(uint32_t) };
+	od_assert(sizeof(flush) == 5);
+	size_t unused;
+	return od_io_write_raw(io, flush, sizeof(flush), &unused, timeout_ms,
+			       0);
 }

@@ -3,602 +3,1330 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
-
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
-
-#include <machinarium.h>
-#include <shapito.h>
-
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/frontend.h"
-#include "sources/backend.h"
-#include "sources/cancel.h"
-#include "sources/cron.h"
-
-typedef struct
-{
-	od_routerstatus_t status;
-	od_client_t *client;
-	machine_channel_t *response;
-	od_routercancel_t *cancel;
-} od_msgrouter_t;
-
-static od_route_t*
-od_router_fwd(od_router_t *router, shapito_be_startup_t *startup)
-{
-	od_instance_t *instance = router->global->instance;
-
-	assert(startup->database != NULL);
-	assert(startup->user != NULL);
-
-	/* match latest version of route config */
-	od_configroute_t *config;
-	config = od_configroute_forward(&instance->config,
-	                                shapito_parameter_value(startup->database),
-	                                shapito_parameter_value(startup->user));
-	assert(config != NULL);
-
-	od_routeid_t id = {
-		.database     = shapito_parameter_value(startup->database),
-		.database_len = startup->database->value_len,
-		.user         = shapito_parameter_value(startup->user),
-		.user_len     = startup->user->value_len
-	};
-
-	/* force settings required by route */
-	if (config->storage_db) {
-		id.database = config->storage_db;
-		id.database_len = strlen(config->storage_db) + 1;
-	}
-	if (config->storage_user) {
-		id.user = config->storage_user;
-		id.user_len = strlen(config->storage_user) + 1;
-	}
-
-	/* match or create dynamic route */
-	od_route_t *route;
-	route = od_routepool_match(&router->route_pool, &id, config);
-	if (route)
-		return route;
-	route = od_routepool_new(&router->route_pool, config, &id);
-	if (route == NULL) {
-		od_error(&instance->logger, "router", NULL, NULL,
-		         "failed to allocate route");
-		return NULL;
-	}
-	return route;
-}
-
-static inline void
-od_router_attacher(void *arg)
-{
-	machine_msg_t *msg;
-	msg = arg;
-
-	od_msgrouter_t *msg_attach;
-	msg_attach = machine_msg_get_data(arg);
-
-	od_client_t *client;
-	client = msg_attach->client;
-
-	od_instance_t *instance;
-	instance = client->global->instance;
-
-	od_router_t *router;
-	router = client->global->router;
-
-	od_route_t  *route;
-	route = client->route;
-
-	/* get server connection from route idle pool */
-	od_server_t *server;
-	for (;;)
-	{
-		server = od_serverpool_next(&route->server_pool, OD_SIDLE);
-		if (server)
-			goto on_attach;
-
-		/* always start new connection, if pool_size is zero */
-		if (route->config->pool_size == 0)
-			break;
-
-		/* maybe start new connection */
-		if (od_serverpool_total(&route->server_pool) < route->config->pool_size)
-			break;
-
-		/* pool_size limit implementation.
-		 *
-		 * If the limit reached, wait wakeup condition for
-		 * pool_timeout milliseconds.
-		 *
-		 * The condition triggered when a server connection
-		 * put into idle state by DETACH events.
-		 */
-		od_debug(&instance->logger, "router", client, NULL,
-		         "route '%s.%s' pool limit reached (%d), waiting",
-		          route->config->db_name,
-		          route->config->user_name,
-		          route->config->pool_size);
-
-		/* enqueue client */
-		od_clientpool_set(&route->client_pool, client, OD_CQUEUE);
-
-		uint32_t timeout = route->config->pool_timeout;
-		if (timeout == 0)
-			timeout = UINT32_MAX;
-		int rc;
-		rc = machine_condition(timeout);
-		if (rc == -1) {
-			od_clientpool_set(&route->client_pool, client, OD_CPENDING);
-			od_error(&instance->logger, "router", client, NULL,
-			         "route '%s.%s' server pool wait timedout, closing",
-			         route->config->db_name,
-			         route->config->user_name);
-			msg_attach->status = OD_RERROR_TIMEDOUT;
-			machine_channel_write(msg_attach->response, msg);
-			return;
-		}
-		assert(client->state == OD_CPENDING);
-
-		/* retry */
-		od_debug(&instance->logger, "router", client, NULL,
-		         "server pool attach retry");
-		continue;
-	}
-
-	/* create new server object */
-	server = od_server_allocate();
-	if (server == NULL) {
-		msg_attach->status = OD_RERROR;
-		machine_channel_write(msg_attach->response, msg);
-		return;
-	}
-	od_idmgr_generate(&instance->id_mgr, &server->id, "s");
-	server->global = router->global;
-	server->route = route;
-
-on_attach:
-	od_serverpool_set(&route->server_pool, server, OD_SACTIVE);
-	od_clientpool_set(&route->client_pool, client, OD_CACTIVE);
-	client->server = server;
-	server->client = client;
-	server->idle_time = 0;
-	/* assign client session key */
-	server->key_client = client->key;
-	msg_attach->status = OD_ROK;
-	machine_channel_write(msg_attach->response, msg);
-}
-
-static inline void
-od_router_wakeup(od_router_t *router, od_route_t *route)
-{
-	od_instance_t *instance;
-	instance = router->global->instance;
-	/* wake up first client waiting for route
-	 * server connection */
-	if (route->client_pool.count_queue > 0) {
-		od_client_t *waiter;
-		waiter = od_clientpool_next(&route->client_pool, OD_CQUEUE);
-		int rc;
-		rc = machine_signal(waiter->coroutine_attacher_id);
-		assert(rc == 0);
-		(void)rc;
-		od_clientpool_set(&route->client_pool, waiter, OD_CPENDING);
-		od_debug(&instance->logger, "router", NULL, NULL,
-		         "server released, waking up");
-	}
-}
-
-static inline void
-od_router(void *arg)
-{
-	od_router_t *router = arg;
-	od_instance_t *instance = router->global->instance;
-
-	for (;;)
-	{
-		machine_msg_t *msg;
-		msg = machine_channel_read(router->channel, UINT32_MAX);
-		if (msg == NULL)
-			break;
-
-		od_msg_t msg_type;
-		msg_type = machine_msg_get_type(msg);
-		switch (msg_type) {
-		case OD_MROUTER_ROUTE:
-		{
-			/* attach client to route */
-			od_msgrouter_t *msg_route;
-			msg_route = machine_msg_get_data(msg);
-
-			/* ensure global client_max limit */
-			if (instance->config.client_max_set) {
-				if (router->clients >= instance->config.client_max) {
-					od_log(&instance->logger, "router", NULL, NULL,
-					       "router: global client_max limit reached (%d)",
-					       instance->config.client_max);
-					msg_route->status = OD_RERROR_LIMIT;
-					machine_channel_write(msg_route->response, msg);
-					break;
-				}
-			}
-
-			/* match route */
-			od_route_t *route;
-			route = od_router_fwd(router, &msg_route->client->startup);
-			if (route == NULL) {
-				msg_route->status = OD_RERROR_NOT_FOUND;
-				machine_channel_write(msg_route->response, msg);
-				break;
-			}
-
-			/* ensure route client_max limit */
-			if (route->config->client_max_set) {
-				int client_total;
-				client_total = od_clientpool_total(&route->client_pool);
-				if (client_total >= route->config->client_max) {
-					od_log(&instance->logger, "router", NULL, NULL,
-					       "route '%s.%s' client_max limit reached (%d)",
-					       route->config->db_name,
-					       route->config->user_name,
-					       route->config->client_max);
-					msg_route->status = OD_RERROR_LIMIT;
-					machine_channel_write(msg_route->response, msg);
-					break;
-				}
-			}
-
-			/* add client to route client pool */
-			od_clientpool_set(&route->client_pool, msg_route->client, OD_CPENDING);
-			router->clients++;
-
-			msg_route->client->config = route->config;
-			msg_route->client->route = route;
-			msg_route->status = OD_ROK;
-			machine_channel_write(msg_route->response, msg);
-			break;
-		}
-
-		case OD_MROUTER_UNROUTE:
-		{
-			/* detach client from route */
-			od_msgrouter_t *msg_unroute;
-			msg_unroute = machine_msg_get_data(msg);
-
-			od_client_t *client = msg_unroute->client;
-			od_route_t *route = client->route;
-			client->route = NULL;
-			assert(client->server == NULL);
-			od_clientpool_set(&route->client_pool, client, OD_CUNDEF);
-
-			assert(router->clients > 0);
-			router->clients--;
-
-			msg_unroute->status = OD_ROK;
-			machine_channel_write(msg_unroute->response, msg);
-			break;
-		}
-
-		case OD_MROUTER_ATTACH:
-		{
-			/* get client server from route server pool */
-			od_msgrouter_t *msg_attach;
-			msg_attach = machine_msg_get_data(msg);
-
-			od_client_t *client;
-			client = msg_attach->client;
-
-			int64_t coroutine_id;
-			coroutine_id = machine_coroutine_create(od_router_attacher, msg);
-			if (coroutine_id == -1) {
-				msg_attach->status = OD_RERROR;
-				machine_channel_write(msg_attach->response, msg);
-				break;
-			}
-			client->coroutine_attacher_id = coroutine_id;
-			break;
-		}
-
-		case OD_MROUTER_DETACH:
-		{
-			/* push client server back to route server pool */
-			od_msgrouter_t *msg_detach;
-			msg_detach = machine_msg_get_data(msg);
-
-			od_client_t *client = msg_detach->client;
-			od_route_t *route = client->route;
-			od_server_t *server = client->server;
-
-			client->server = NULL;
-			server->client = NULL;
-			server->last_client_id = client->id;
-			od_serverpool_set(&route->server_pool, server, OD_SIDLE);
-			od_clientpool_set(&route->client_pool, client, OD_CPENDING);
-
-			/* wakeup attachers */
-			od_router_wakeup(router, route);
-
-			msg_detach->status = OD_ROK;
-			machine_channel_write(msg_detach->response, msg);
-			break;
-		}
-
-		case OD_MROUTER_DETACH_AND_UNROUTE:
-		{
-			/* push client server back to route server pool,
-			 * unroute client */
-			od_msgrouter_t *msg_detach;
-			msg_detach = machine_msg_get_data(msg);
-
-			od_client_t *client = msg_detach->client;
-			od_route_t *route = client->route;
-			od_server_t *server = client->server;
-
-			server->last_client_id = client->id;
-			server->client = NULL;
-			od_serverpool_set(&route->server_pool, server, OD_SIDLE);
-
-			client->server = NULL;
-			client->route = NULL;
-			od_clientpool_set(&route->client_pool, client, OD_CUNDEF);
-			assert(router->clients > 0);
-			router->clients--;
-
-			/* wakeup attachers */
-			od_router_wakeup(router, route);
-
-			msg_detach->status = OD_ROK;
-			machine_channel_write(msg_detach->response, msg);
-			break;
-		}
-
-		case OD_MROUTER_CLOSE:
-		{
-			/* detach closed server connection */
-			od_msgrouter_t *msg_detach;
-			msg_detach = machine_msg_get_data(msg);
-
-			od_client_t *client = msg_detach->client;
-			od_route_t *route = client->route;
-			od_server_t *server = client->server;
-
-			client->server = NULL;
-			od_clientpool_set(&route->client_pool, client, OD_CPENDING);
-
-			od_serverpool_set(&route->server_pool, server, OD_SUNDEF);
-			server->last_client_id = client->id;
-			server->client = NULL;
-			server->route  = NULL;
-
-			assert(server->io == NULL);
-			od_backend_close(server);
-
-			msg_detach->status = OD_ROK;
-			machine_channel_write(msg_detach->response, msg);
-			break;
-		}
-
-		case OD_MROUTER_CLOSE_AND_UNROUTE:
-		{
-			/* detach closed server connection and unroute client */
-			od_msgrouter_t *msg_close;
-			msg_close = machine_msg_get_data(msg);
-
-			od_client_t *client = msg_close->client;
-			od_route_t *route = client->route;
-			od_server_t *server = client->server;
-			od_serverpool_set(&route->server_pool, server, OD_SUNDEF);
-			server->client = NULL;
-			server->route  = NULL;
-
-			/* remove client from route client pool */
-			client->server = NULL;
-			client->route  = NULL;
-			od_clientpool_set(&route->client_pool, client, OD_CUNDEF);
-			assert(router->clients > 0);
-			router->clients--;
-
-			assert(server->io == NULL);
-			od_backend_close(server);
-
-			msg_close->status = OD_ROK;
-			machine_channel_write(msg_close->response, msg);
-			break;
-		}
-
-		case OD_MROUTER_CANCEL:
-		{
-			/* match server key and config by client key */
-			od_msgrouter_t *msg_cancel;
-			msg_cancel = machine_msg_get_data(msg);
-			int rc;
-			rc = od_cancel_find(&router->route_pool,
-			                    &msg_cancel->client->startup.key,
-			                     msg_cancel->cancel);
-			if (rc == -1)
-				msg_cancel->status = OD_RERROR;
-			else
-				msg_cancel->status = OD_ROK;
-			machine_channel_write(msg_cancel->response, msg);
-			break;
-		}
-		default:
-			assert(0);
-			break;
-		}
-	}
-}
+ */
+
+#include <odyssey.h>
+
+#include <machinarium/machinarium.h>
+
+#include <status.h>
+#include <router.h>
+#include <system.h>
+#include <global.h>
+#include <wait_event.h>
+#include <module.h>
+#include <backend.h>
+#include <instance.h>
+#include <extension.h>
+#include <misc.h>
+#include <od_ldap.h>
+#include <util.h>
+#include <stat.h>
+#include <pool.h>
+#include <cancel.h>
 
 void od_router_init(od_router_t *router, od_global_t *global)
 {
-	od_routepool_init(&router->route_pool);
-	router->global  = global;
-	router->clients = 0;
-	router->channel = NULL;
+	mm_mutex_init(&router->lock);
+	od_rules_init(&router->rules);
+	od_list_init(&router->servers);
+	od_route_pool_init(&router->route_pool);
+	atomic_init(&router->clients, 0);
+	atomic_init(&router->servers_routing, 0);
+
+	router->global = global;
+
+	router->router_err_logger = od_err_logger_create_default();
 }
 
-int od_router_start(od_router_t *router)
+static inline int od_router_immed_close_server_cb(od_server_t *server,
+						  void **argv)
 {
-	od_instance_t *instance = router->global->instance;
+	(void)argv;
 
-	router->channel = machine_channel_create(instance->is_shared);
-	if (router->channel == NULL) {
-		od_error(&instance->logger, "router", NULL, NULL,
-		         "failed to create router channel");
-		return -1;
+	/* remove server for server pool */
+	od_server_set_pool_state(server, OD_SERVER_UNDEF);
+
+	server->route = NULL;
+
+	od_backend_close_connection(server);
+	od_backend_close(server);
+
+	return 0;
+}
+
+static inline int od_router_immed_close_cb(od_route_t *route, void **argv)
+{
+	od_route_lock(route);
+	od_route_server_pool_foreach_locked(
+		route, OD_SERVER_IDLE, od_router_immed_close_server_cb, argv);
+	od_route_unlock(route);
+	return 0;
+}
+
+void od_router_free(od_router_t *router)
+{
+	od_list_t *i;
+	od_list_t *n;
+	od_list_foreach_safe (&router->servers, i, n) {
+		od_system_server_t *server;
+		server = od_container_of(i, od_system_server_t, link);
+		od_system_server_free(server);
 	}
-	int64_t coroutine_id;
-	coroutine_id = machine_coroutine_create(od_router, router);
-	if (coroutine_id == -1) {
-		od_error(&instance->logger, "router", NULL, NULL,
-		         "failed to start router");
-		return -1;
+
+	/* Destruction requires exclusive ownership of the router. Avoid its
+	 * coroutine mutex so config errors can clean up before startup. */
+	od_route_pool_foreach(&router->route_pool, od_router_immed_close_cb,
+			      NULL);
+	od_rules_free(&router->rules);
+	od_route_pool_free(&router->route_pool);
+	mm_mutex_destroy(&router->lock);
+	od_err_logger_free(router->router_err_logger);
+}
+
+int od_router_foreach(od_router_t *router, od_route_pool_cb_t callback,
+		      void **argv)
+{
+	od_router_lock(router);
+	int rc;
+	rc = od_route_pool_foreach(&router->route_pool, callback, argv);
+	od_router_unlock(router);
+	return rc;
+}
+
+static inline int od_drop_obsolete_rule_connections_cb(od_route_t *route,
+						       void **argv)
+{
+	od_list_t *i;
+	od_rule_t *rule = route->rule;
+	od_list_t *obsolete_rules = argv[0];
+	od_list_foreach (obsolete_rules, i) {
+		od_rule_key_t *obsolete_rule;
+		obsolete_rule = od_container_of(i, od_rule_key_t, link);
+		od_assert(rule);
+		od_assert(obsolete_rule);
+		if (strcmp(rule->user_name, obsolete_rule->usr_name) == 0 &&
+		    strcmp(rule->db_name, obsolete_rule->db_name) == 0 &&
+		    od_address_range_equals(&rule->address_range,
+					    &obsolete_rule->address_range)) {
+			od_route_kill_client_pool(route);
+			return 0;
+		}
 	}
 	return 0;
 }
 
-static od_routerstatus_t
-od_router_do(od_client_t *client, od_msg_t msg_type, od_routercancel_t *cancel)
+int od_router_reconfigure(od_router_t *router, od_rules_t *rules)
 {
-	od_router_t *router = client->global->router;
+	od_instance_t *instance = router->global->instance;
+	od_router_lock(router);
+
+	int updates;
+	od_list_t added;
+	od_list_t deleted;
+	od_list_t to_drop;
+	od_list_t not_changed;
+	od_list_t *i, *j;
+	od_list_init(&added);
+	od_list_init(&deleted);
+	od_list_init(&to_drop);
+	od_list_init(&not_changed);
+
+	updates = od_rules_merge(&router->rules, rules, &added, &deleted,
+				 &to_drop, &not_changed);
+
+	od_list_foreach_safe (&not_changed, i, j) {
+		od_rule_key_t *rk;
+		rk = od_container_of(i, od_rule_key_t, link);
+		od_debug(&instance->logger, NULL, NULL,
+			 "rule %s.%s %s %s was not changed", rk->db_name,
+			 rk->usr_name, rk->address_range.string_value,
+			 od_rule_conn_type_to_str(rk->conn_type));
+
+		od_rule_key_free(rk);
+	}
+
+	od_extension_t *extensions = router->global->extensions;
+	od_module_t *modules = extensions->modules;
+
+	od_list_foreach (&added, i) {
+		od_rule_key_t *rk;
+		rk = od_container_of(i, od_rule_key_t, link);
+		od_log(&instance->logger, NULL, NULL,
+		       "rule %s.%s %s %s was added", rk->db_name, rk->usr_name,
+		       rk->address_range.string_value,
+		       od_rule_conn_type_to_str(rk->conn_type));
+	}
+
+	od_list_foreach (&deleted, i) {
+		od_rule_key_t *rk;
+		rk = od_container_of(i, od_rule_key_t, link);
+		od_log(&instance->logger, NULL, NULL,
+		       "rule %s %s %s %s was deleted", rk->db_name,
+		       rk->usr_name, rk->address_range.string_value,
+		       od_rule_conn_type_to_str(rk->conn_type));
+	}
+
+	if (updates != 0) {
+		void *argv[] = { &to_drop };
+		od_route_pool_foreach(&router->route_pool,
+				      od_drop_obsolete_rule_connections_cb,
+				      argv);
+	}
+
+	/* reloadcallback */
+	od_list_foreach (&modules->link, i) {
+		od_module_t *module;
+		module = od_container_of(i, od_module_t, link);
+		if (module->od_config_reload_cb == NULL) {
+			continue;
+		}
+
+		if (module->od_config_reload_cb(&added, &deleted) ==
+		    OD_MODULE_CB_FAIL_RETCODE) {
+			break;
+		}
+	}
+
+	od_list_foreach_safe (&added, i, j) {
+		od_rule_key_t *rk;
+		rk = od_container_of(i, od_rule_key_t, link);
+		od_rule_key_free(rk);
+	}
+
+	od_list_foreach_safe (&deleted, i, j) {
+		od_rule_key_t *rk;
+		rk = od_container_of(i, od_rule_key_t, link);
+		od_rule_key_free(rk);
+	}
+
+	od_list_foreach_safe (&to_drop, i, j) {
+		od_rule_key_t *rk;
+		rk = od_container_of(i, od_rule_key_t, link);
+		od_debug(&instance->logger, NULL, NULL,
+			 "rule %s.%s %s %s was dropped", rk->db_name,
+			 rk->usr_name, rk->address_range.string_value,
+			 od_rule_conn_type_to_str(rk->conn_type));
+
+		od_rule_key_free(rk);
+	}
+
+	od_router_unlock(router);
+	return updates;
+}
+
+static inline int od_router_expire_server_cb(od_server_t *server, void **argv)
+{
+	od_list_t *expire_list = argv[0];
+	int *count = argv[1];
+
+	/* remove server for server pool */
+	od_server_set_pool_state(server, OD_SERVER_UNDEF);
+
+	od_list_append(expire_list, &server->link);
+	(*count)++;
+
+	return 0;
+}
+
+static inline int od_router_pool_ttl_expired(od_server_t *server)
+{
+	od_route_t *route = server->route;
+
+	if (route->rule->pool->ttl == 0 /* disabled */) {
+		return 0;
+	}
+
+	return server->idle_time >= route->rule->pool->ttl;
+}
+
+static inline int od_router_lifetime_expired(od_server_t *server,
+					     uint64_t *now_us)
+{
+	od_route_t *route = server->route;
+	uint64_t max_lifetime = route->rule->server_lifetime_us;
+
+	if (max_lifetime == 0 /* disabled */) {
+		return 0;
+	}
+
+	uint64_t server_life = *now_us - server->init_time_us;
+
+	return server_life >= max_lifetime;
+}
+
+static inline int od_router_server_expired(od_server_t *server,
+					   uint64_t *now_us)
+{
+	return od_router_pool_ttl_expired(server) ||
+	       od_router_lifetime_expired(server, now_us);
+}
+
+static inline int od_router_expire_server_tick_cb(od_server_t *server,
+						  void **argv)
+{
+	od_list_t *expire_list = argv[0];
+	int *count = argv[1];
+	uint64_t *now_us = argv[2];
+
+	if (!server->offline) {
+		int expired = od_router_server_expired(server, now_us);
+
+		/* advance idle time for 1 sec */
+		if (!expired) {
+			server->idle_time++;
+			return 0;
+		}
+
+		/*
+		 * Do not expire more servers than we are allowed to connect at one time
+		 * This avoids need to re-launch lot of connections together
+		 */
+		if (*count > server->endpoint->storage->server_max_routing) {
+			return 0;
+		}
+	} /* else remove server because we are forced to */
+
+	/* remove server for server pool */
+	od_server_set_pool_state(server, OD_SERVER_UNDEF);
+
+	/* add to expire list */
+	od_list_append(expire_list, &server->link);
+	(*count)++;
+
+	return 0;
+}
+
+static inline int od_router_expire_cb(od_route_t *route, void **argv)
+{
+	od_route_lock(route);
+
+	/* expire by config obsoletion */
+	if (route->rule->obsolete &&
+	    !od_client_pool_total(&route->client_pool)) {
+		od_route_server_pool_foreach_locked(route, OD_SERVER_IDLE,
+						    od_router_expire_server_cb,
+						    argv);
+
+		od_route_unlock(route);
+		return 0;
+	}
+
+	int pool_ttl_disabled = route->rule->pool->ttl == 0;
+	int server_lifetime_disabled = route->rule->server_lifetime_us == 0;
+
+	if (pool_ttl_disabled && server_lifetime_disabled) {
+		od_route_unlock(route);
+		return 0;
+	}
+
+	od_route_server_pool_foreach_locked(
+		route, OD_SERVER_IDLE, od_router_expire_server_tick_cb, argv);
+
+	/*
+	 * maybe we have closed expired IDLE
+	 * connection and pool state has been changed
+	 */
+	od_route_signal_locked(route, NULL);
+
+	od_route_unlock(route);
+
+	return 0;
+}
+
+int od_router_expire(od_router_t *router, od_list_t *expire_list)
+{
+	int count = 0;
+	uint64_t now_us = machine_time_us();
+	void *argv[] = { expire_list, &count, &now_us };
+	od_router_foreach(router, od_router_expire_cb, argv);
+	return count;
+}
+
+static inline od_server_t *
+od_router_create_connected_server(od_route_t *route,
+				  od_multi_pool_element_t *pool)
+{
+	od_server_t *server = od_server_allocate(
+		route->rule->pool->reserve_prepared_statement);
+	if (server == NULL) {
+		return NULL;
+	}
+
+	od_id_generate(&server->id, "s");
+	server->global = od_global_get();
+	server->route = route;
+	server->pool_element = pool;
+
+	od_rule_storage_t *storage = route->rule->storage;
+	const od_address_t *address = od_server_pool_address(server);
+
+	server->endpoint = od_storage_find_endpoint(storage, address);
+	od_assert(server->endpoint != NULL);
+	od_rules_storage_ref(server->endpoint->storage);
+
+	/* connect is long operation, so release lock, which was taken by the caller */
+	od_route_unlock(route);
+
+	int rc = od_backend_connect_to(server, address, storage->tls_opts,
+				       OD_BACKEND_TLS_DEFAULT);
+
+	/* caller function believes the lock is held */
+	od_route_lock(route);
+
+	if (rc != OK_RESPONSE) {
+		/* No startup session: close without waiting on io under the lock. */
+		od_backend_abort_connection(server);
+		server->route = NULL;
+		od_backend_close(server);
+		return NULL;
+	}
+
+	/*
+	 * startup was not performed
+	 * must be done later by od_backend_startup_preallocated
+	 * after connect is taken from the pool
+	 */
+
+	return server;
+}
+
+static inline int od_router_create_idle_server(od_route_t *route,
+					       od_multi_pool_element_t *pool)
+{
+	int min_pool_size = route->rule->pool->min_size;
+
+	od_server_t *server = od_router_create_connected_server(route, pool);
+	if (server == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+
+	if (od_server_pool_total(&pool->pool) >= min_pool_size) {
+		/*
+		 * min pool size was reached in some other way
+		 * while we was connecting to server
+		 * 
+		 * so just release this connection and exit
+		 */
+
+		/* This connection has not performed startup either. */
+		od_backend_abort_connection(server);
+		server->route = NULL;
+		od_backend_close(server);
+
+		return NOT_OK_RESPONSE;
+	}
+
+	/*
+	 * detach from current thread event loop
+	 * need to do it manually, because we 'return' the connection to pool
+	 * manually, not by od_router_detach
+	 */
+	od_io_detach(&server->io);
+
+	/* the pool still need in that connection */
+	od_server_set_pool_state(server, OD_SERVER_IDLE);
+
+	od_logger_t *logger = &server->global->instance->logger;
+	od_debug(logger, NULL, server,
+		 "idle server connection preallocated for %s.%s",
+		 route->id.database, route->id.user);
+
+	return OK_RESPONSE;
+}
+
+/* returns number of allocated connections or -1 for errors */
+static inline int
+od_router_keep_min_size_for_pool(od_multi_pool_element_t *element,
+				 od_route_t *route, int max_created)
+{
+	int min_pool_size = route->rule->pool->min_size;
+
+	if (od_server_pool_total(&element->pool) >= min_pool_size) {
+		return 0;
+	}
+
+	int need = min_pool_size - od_server_pool_total(&element->pool);
+	int created = 0;
+
+	if (max_created > need) {
+		max_created = need;
+	}
+
+	while (created < max_created) {
+		int rc = od_router_create_idle_server(route, element);
+		if (rc != OK_RESPONSE) {
+			return -1;
+		}
+
+		++created;
+	}
+
+	return created;
+}
+
+/* returns number of allocated connections or -1 for errors */
+static inline int od_router_keep_min_pool_size_for_route(od_route_t *route,
+							 int max)
+{
+	od_route_lock(route);
+
+	/* preallocation doesn't work with shared_pools */
+	if (od_route_has_shared_pool(route)) {
+		od_route_unlock(route);
+		return 0;
+	}
+
+	od_rule_t *rule = route->rule;
+	od_rule_storage_t *storage = rule->storage;
+	od_storage_endpoint_t *endpoints = storage->endpoints;
+	size_t count = storage->endpoints_count;
+
+	int total = 0;
+
+	for (size_t i = 0; i < count; ++i) {
+		od_storage_endpoint_t *endpoint = &endpoints[i];
+		const od_address_t *address = &endpoint->address;
+
+		od_multi_pool_key_t pool_key;
+		memset(&pool_key, 0, sizeof(od_multi_pool_key_t));
+		memcpy(&pool_key.address, address, sizeof(od_address_t));
+
+		od_multi_pool_element_t *element =
+			od_multi_pool_get_or_create_locked(
+				od_route_server_pools(route), &pool_key);
+		if (element == NULL) {
+			od_route_unlock(route);
+			return -1;
+		}
+
+		int count =
+			od_router_keep_min_size_for_pool(element, route, max);
+		if (count < 0) {
+			od_route_unlock(route);
+			return -1;
+		}
+		total += count;
+	}
+
+	od_route_unlock(route);
+
+	return total;
+}
+
+/* returns number of allocated connections or -1 for errors */
+int od_router_keep_min_pool_size_for_rule(od_router_t *router, od_rule_t *rule)
+{
+	od_route_id_t id = {
+		.database = rule->db_name,
+		.user = rule->user_name,
+		/* +1 here because it added in code above for storage_* */
+		.database_len = rule->db_name_len + 1,
+		/* and because kiwi sets string length including 0-byte ? */
+		.user_len = rule->user_name_len + 1,
+		.physical_rep = false,
+		.logical_rep = false
+	};
+	if (rule->storage_db) {
+		id.database = rule->storage_db;
+		id.database_len = strlen(rule->storage_db) + 1;
+	}
+	if (rule->storage_user) {
+		id.user = rule->storage_user;
+		id.user_len = strlen(rule->storage_user) + 1;
+	}
+
+	od_route_t *route;
+	route = od_route_pool_match(&router->route_pool, &id, rule);
+	if (route == NULL) {
+		route = od_route_pool_new(&router->route_pool, &id, rule);
+		if (route == NULL) {
+			return -1;
+		}
+	}
+
+	int allocated = od_router_keep_min_pool_size_for_route(route, 1);
+
+	return allocated;
+}
+
+void od_router_keep_min_pool_size_step(od_router_t *router)
+{
+	od_router_lock(router);
+
+	/*
+	 * perform here a step only for one rule for connection allocations
+	 * to make sure we dont create much load
+	 * by allocation many connections simultaneously
+	 * 
+	 * and to keep code simple, by not using wait group for every rule
+	 */
+
+	od_list_t *i;
+	od_list_foreach (&router->rules.rules, i) {
+		od_rule_t *rule = od_container_of(i, od_rule_t, link);
+
+		/* disabled */
+		if (rule->pool->min_size == 0) {
+			continue;
+		}
+
+		/* dont know for which user preallocate the connections */
+		if (rule->user_is_default || rule->db_is_default) {
+			continue;
+		}
+
+		int allocated =
+			od_router_keep_min_pool_size_for_rule(router, rule);
+		/* allocated some connections or got error */
+		if (allocated != 0) {
+			break;
+		}
+	}
+
+	od_router_unlock(router);
+}
+
+static inline int od_router_gc_cb(od_route_t *route, void **argv)
+{
+	od_route_pool_t *pool = argv[0];
+	od_route_lock(route);
+
+	int nservers = od_route_server_pool_count_total_locked(
+		route, 1 /* only for this route's db.user */);
+	int nclients = od_client_pool_total(&route->client_pool);
+
+	if (nservers > 0 || nclients > 0) {
+		goto done;
+	}
+
+	if (route->auth_query_cache.refresh_in_progress) {
+		goto done;
+	}
+
+	if (!od_route_is_dynamic(route) && !route->rule->obsolete) {
+		goto done;
+	}
+
+	/* remove route from route pool */
+	od_assert(pool->count > 0);
+	pool->count--;
+	od_list_unlink(&route->link);
+
+	od_route_unlock(route);
+
+	od_route_free(route);
+	return 0;
+done:
+	od_route_unlock(route);
+	return 0;
+}
+
+void od_router_gc(od_router_t *router)
+{
+	void *argv[] = { &router->route_pool };
+	od_router_foreach(router, od_router_gc_cb, argv);
+}
+
+void od_router_stat(od_router_t *router, uint64_t prev_time_us,
+#ifdef PROM_FOUND
+		    od_prom_metrics_t *metrics,
+#endif
+		    od_route_pool_stat_cb_t callback, void **argv)
+{
+	od_router_lock(router);
+	od_route_pool_stat(&router->route_pool, prev_time_us,
+#ifdef PROM_FOUND
+			   metrics,
+#endif
+			   callback, argv);
+	od_router_unlock(router);
+}
+
+od_router_status_t od_router_route(od_router_t *router, od_client_t *client)
+{
+	kiwi_be_startup_t *startup = &client->startup;
 	od_instance_t *instance = router->global->instance;
 
-	/* send request to router */
-	machine_msg_t *msg;
-	msg = machine_msg_create(msg_type, sizeof(od_msgrouter_t));
-	if (msg == NULL)
-		return OD_RERROR;
-	od_msgrouter_t *msg_route;
-	msg_route = machine_msg_get_data(msg);
-	msg_route->status = OD_RERROR;
-	msg_route->client = client;
-	msg_route->response = NULL;
-	msg_route->cancel = cancel;
-
-	/* create response channel */
-	machine_channel_t *response;
-	response = machine_channel_create(instance->is_shared);
-	if (response == NULL) {
-		machine_msg_free(msg);
-		return OD_RERROR;
+	struct sockaddr_storage sa;
+	int salen;
+	struct sockaddr *saddr;
+	int rc;
+	salen = sizeof(sa);
+	saddr = (struct sockaddr *)&sa;
+	if (client->type == OD_POOL_CLIENT_EXTERNAL) {
+		rc = machine_getpeername(client->io.io, saddr, &salen);
+		if (rc == -1) {
+			return OD_ROUTER_ERROR;
+		}
 	}
-	msg_route->response = response;
-	machine_channel_write(router->channel, msg);
 
-	/* wait for reply */
-	msg = machine_channel_read(response, UINT32_MAX);
-	if (msg == NULL) {
-		/* todo:  */
-		abort();
-		machine_channel_free(response);
-		return OD_RERROR;
+	/* match route */
+	od_assert(startup->database.value_len);
+	od_assert(startup->user.value_len);
+
+	od_router_lock(router);
+
+	/* match latest version of route rule */
+	od_rule_t *rule =
+		NULL; /* initialize rule for (line 365) and flag '-Wmaybe-uninitialized' */
+
+	switch (client->type) {
+	case OD_POOL_CLIENT_INTERNAL:
+		rule = od_rules_forward(&router->rules, startup, NULL, 1);
+		break;
+	case OD_POOL_CLIENT_EXTERNAL:
+		rule = od_rules_forward(&router->rules, startup, &sa, 0);
+		break;
+	case OD_POOL_CLIENT_UNDEF: /* create that case for correct work of '-Wswitch' flag */
+		break;
 	}
-	msg_route = machine_msg_get_data(msg);
-	od_routerstatus_t status;
-	status = msg_route->status;
-	machine_channel_free(response);
-	machine_msg_free(msg);
-	return status;
+
+	if (rule == NULL) {
+		od_router_unlock(router);
+		return OD_ROUTER_ERROR_NOT_FOUND;
+	}
+	od_debug(&instance->logger, NULL, NULL,
+		 "matching rule: %s %s %s with %s routing type to %s client",
+		 rule->db_name, rule->user_name,
+		 rule->address_range.string_value,
+		 rule->pool->routing_type == NULL ? "client visible" :
+						    rule->pool->routing_type,
+		 client->type == OD_POOL_CLIENT_INTERNAL ? "internal" :
+							   "external");
+	if (!od_rule_matches_client(rule->pool, client->type)) {
+		/* emulate not found error */
+		od_router_unlock(router);
+		return OD_ROUTER_ERROR_NOT_FOUND;
+	}
+
+	/* force settings required by route */
+	od_route_id_t id = { .database = startup->database.value,
+			     .user = startup->user.value,
+			     .database_len = startup->database.value_len,
+			     .user_len = startup->user.value_len,
+			     .physical_rep = client->physical_rep,
+			     .logical_rep = client->logical_rep };
+	if (rule->storage_db) {
+		id.database = rule->storage_db;
+		id.database_len = strlen(rule->storage_db) + 1;
+	}
+	if (rule->storage_user) {
+		id.user = rule->storage_user;
+		id.user_len = strlen(rule->storage_user) + 1;
+	}
+#ifdef LDAP_FOUND
+	if (rule->ldap_storage_credentials_attr) {
+		od_rules_ref(rule);
+
+		/* need to unlock - will do i/o operation */
+		od_router_unlock(router);
+		od_wait_event_start(OD_WAIT_AUTH_LDAP);
+		int rc = od_auth_ldap_resolve_storage_credentials(client, rule);
+		od_wait_event_end(OD_WAIT_AUTH_LDAP);
+		od_router_lock(router);
+
+		od_rules_unref(rule);
+
+		if (rc == OK_RESPONSE) {
+			id.user = client->ldap_storage_username;
+			id.user_len = client->ldap_storage_username_len + 1;
+			if (rule->storage_user != NULL) {
+				od_free(rule->storage_user);
+			}
+			rule->storage_user =
+				od_strdup(client->ldap_storage_username);
+			rule->storage_user_len =
+				client->ldap_storage_username_len;
+			if (rule->storage_password != NULL) {
+				od_free(rule->storage_password);
+			}
+			rule->storage_password =
+				od_strdup(client->ldap_storage_password);
+			rule->storage_password_len =
+				client->ldap_storage_password_len;
+			od_debug(&instance->logger, client, NULL,
+				 "route->id.user changed to %s", id.user);
+		} else {
+			/* mask the possible insufficient access error */
+			od_router_unlock(router);
+			return OD_ROUTER_ERROR_NOT_FOUND;
+		}
+	}
+#endif
+	/* match or create dynamic route */
+	od_route_t *route;
+	route = od_route_pool_match(&router->route_pool, &id, rule);
+	if (route == NULL) {
+		route = od_route_pool_new(&router->route_pool, &id, rule);
+		/*od_debug() */
+		if (route == NULL) {
+			od_router_unlock(router);
+			return OD_ROUTER_ERROR;
+		}
+	}
+
+	/*
+	 * we assign client's rule to pass connection limit to the place where
+	 * error is handled Client does not actually belong to the pool
+	 */
+	od_rules_ref(rule);
+	client->rule = rule;
+
+	od_route_lock(route);
+
+	/* increase counter of new tot tcp connections */
+	++route->tcp_connections;
+
+	/* ensure route client_max limit */
+	if (rule->client_max_set &&
+	    od_client_pool_total(&route->client_pool) >= rule->client_max) {
+		od_route_unlock(route);
+		od_router_unlock(router);
+
+		od_router_status_t ret = OD_ROUTER_ERROR_LIMIT_ROUTE;
+		if (route->extra_logging_enabled) {
+			od_error_logger_store_err(route->err_logger, ret);
+		}
+		return ret;
+	}
+	od_router_unlock(router);
+
+	/* add client to route client pool */
+	od_client_pool_set(&route->client_pool, client, OD_CLIENT_PENDING);
+	client->route = route;
+	if (client->type == OD_POOL_CLIENT_EXTERNAL) {
+		od_stat_client_connect(&route->stats);
+	}
+
+	od_route_unlock(route);
+	return OD_ROUTER_OK;
 }
 
-od_routerstatus_t
-od_route(od_client_t *client)
+void od_router_unroute(od_router_t *router, od_client_t *client)
 {
-	return od_router_do(client, OD_MROUTER_ROUTE, NULL);
+	(void)router;
+
+	/* detach client from route */
+	od_assert(client->route);
+	od_assert(client->server == NULL);
+
+	od_route_t *route = client->route;
+	od_route_lock(route);
+	od_client_pool_set(&route->client_pool, client, OD_CLIENT_UNDEF);
+	if (client->type == OD_POOL_CLIENT_EXTERNAL) {
+		od_stat_client_disconnect(&route->stats);
+	}
+	client->route = NULL;
+	od_route_unlock(route);
 }
 
-od_routerstatus_t
-od_unroute(od_client_t *client)
+bool od_should_not_spun_connection_yet(int connections_in_pool, int pool_size,
+				       int currently_routing, int max_routing)
 {
-	return od_router_do(client, OD_MROUTER_UNROUTE, NULL);
+	if (pool_size == 0) {
+		return currently_routing >= max_routing;
+	}
+	/*
+	 * This routine controls ramping of server connections.
+	 * When we have a lot of server connections we try to avoid opening new
+	 * in parallel. Meanwhile when we have no server connections we go at
+	 * maximum configured parallelism.
+	 *
+	 * This equation means that we gradually reduce parallelism until we reach
+	 * half of possible connections in the pool.
+	 */
+	max_routing =
+		max_routing * (pool_size - connections_in_pool * 2) / pool_size;
+	if (max_routing <= 0) {
+		max_routing = 1;
+	}
+	return currently_routing >= max_routing;
 }
 
-od_routerstatus_t
-od_router_attach(od_client_t *client)
+#define MAX_BUZYLOOP_RETRY 10
+
+static inline od_router_status_t
+od_router_try_create_new_server(od_router_t *router, od_client_t *client,
+				od_storage_endpoint_t *endpoint,
+				od_server_t **out_server)
 {
-	od_instance_t *instance = client->global->instance;
-	od_routerstatus_t status;
-	status = od_router_do(client, OD_MROUTER_ATTACH, NULL);
+	od_server_t *server = NULL;
+	od_route_t *route = client->route;
+	od_rule_pool_t *rule_pool = route->rule->pool;
+	int pool_size = rule_pool->size;
+	if (od_route_has_shared_pool(route)) {
+		pool_size = route->shared_pool->pool_size;
+	}
+
+	od_multi_pool_element_t *pool_element =
+		od_route_get_server_pool_element_locked(route,
+							&endpoint->address);
+	if (pool_element == NULL) {
+		od_route_unlock(route);
+		return OD_ROUTER_ERROR;
+	}
+
+	*out_server = NULL;
+
+	/*
+	 * Maybe start new connection, if pool_size allows it
+	 */
+	if (!od_route_server_pool_can_add_locked(route, pool_element)) {
+		/* can't add new connection - wait for some released */
+		od_route_unlock(route);
+		return OD_ROUTER_NEED_WAIT;
+	}
+
+	uint32_t max_routing = (uint32_t)endpoint->storage->server_max_routing;
+
+	int busyloop_sleep = 0;
+	int busyloop_retry = 0;
+	while (od_should_not_spun_connection_yet(
+		od_route_server_pool_total(route, pool_element), pool_size,
+		(int)atomic_load(&router->servers_routing), (int)max_routing)) {
+		/* concurrent server connection in progress. */
+		od_route_unlock(route);
+		machine_sleep(busyloop_sleep);
+		busyloop_retry++;
+		/* TODO: support this opt in configure file */
+		if (busyloop_retry > MAX_BUZYLOOP_RETRY) {
+			busyloop_sleep = 1;
+		}
+		od_route_lock(route);
+
+		/* if the idle server was created while busyloop - lets use it */
+		int rc = od_route_server_pool_next_idle_locked(route, endpoint,
+							       &server);
+		if (rc != OD_ROUTER_OK) {
+			od_route_unlock(route);
+			return rc;
+		}
+		if (server != NULL) {
+			*out_server = server;
+			return OD_ROUTER_OK;
+		}
+	}
+
+	/* create new server object */
+	od_route_unlock(route);
+	server = od_server_allocate(
+		route->rule->pool->reserve_prepared_statement);
+	if (server == NULL) {
+		return OD_ROUTER_ERROR;
+	}
+	od_id_generate(&server->id, "s");
+	server->global = client->global;
+	server->route = route;
+	server->pool_element = pool_element;
+	server->endpoint = endpoint;
+	od_rules_storage_ref(endpoint->storage);
+
+	od_route_lock(route);
+
+	/*
+	 * pool size might have been changed by another workers
+	 * need to check it again and do wait if limit reached
+	 */
+
+	if (!od_route_server_pool_can_add_locked(route, pool_element)) {
+		od_route_unlock(route);
+		od_server_free(server);
+		return OD_ROUTER_NEED_WAIT;
+	}
+
+	*out_server = server;
+
+	return OD_ROUTER_OK;
+}
+
+static inline od_router_status_t
+od_router_try_attach(od_router_t *router, od_client_t *client,
+		     bool wait_for_idle, od_storage_endpoint_t *endpoint)
+{
+	od_server_t *server;
+	od_route_t *route = client->route;
+
+	uint64_t now_us = machine_time_us();
+
+	od_route_lock(route);
+
+	/*
+	 * stamp on the first transition only: the caller retries in a loop
+	 * and re-stamping would keep resetting the measured waiting time
+	 */
+	if (client->state != OD_CLIENT_QUEUE) {
+		client->time_queue_start = now_us;
+	}
+
+	od_client_pool_set(&route->client_pool, client, OD_CLIENT_QUEUE);
+
+	/*
+	 * try to get IDLE connection
+	 * if there are no free servers, then try to
+	 * create new
+	 */
+
+	int rc =
+		od_route_server_pool_next_idle_locked(route, endpoint, &server);
+	if (rc != OD_ROUTER_OK) {
+		od_route_unlock(route);
+		return rc;
+	}
+
+	if (server == NULL) {
+		if (wait_for_idle) {
+			/*
+			 * special case, when we are interested only in an idle connection
+			 * and do not want to start a new one
+			 */
+			int nactive = od_route_server_pool_count_active_locked(
+				route,
+				0 /* not for only route's db.user in case of shared pools */);
+			if (nactive == 0) {
+				/*
+				 * there are no servers at all, so can't wait
+				 * for some ACTIVE that will become free
+				 */
+				od_route_unlock(route);
+				return OD_ROUTER_ERROR_TIMEDOUT;
+			}
+
+			/* there is ACTIVE server that we can wait */
+			od_route_unlock(route);
+			return OD_ROUTER_NEED_WAIT;
+		}
+
+		od_router_status_t st = od_router_try_create_new_server(
+			router, client, endpoint, &server);
+		if (st != OD_ROUTER_OK) {
+			/*
+			 * od_router_try_create_new_server keeps lock held if everything ok
+			 * and unlocks it otherwise
+			 */
+			return st;
+		}
+	}
+
+	od_assert(server != NULL);
+
+	od_client_pool_set(&route->client_pool, client, OD_CLIENT_ACTIVE);
+	od_server_attach_client(server, client);
+
+	od_assert(od_server_synchronized(server));
+
+	/*
+	* XXX: this logic breaks some external solutions that use
+ 	* PostgreSQL logical replication. Need to tests this and fix
+	*
+	 * walsender connections are in "graceful shutdown" mode since we cannot
+	 * reuse it.
+	 *
+	if (client->physical_rep || client->logical_rep)
+		server->offline = 1;
+	*/
+
+	od_route_unlock(route);
+
 	/* attach server io to clients machine context */
-	od_server_t *server = client->server;
-	if (instance->is_shared) {
-		if (server && server->io)
-			machine_io_attach(server->io);
+	if (server->io.io) {
+		od_io_attach(&server->io);
 	}
+
+	return OD_ROUTER_OK;
+}
+
+static inline int send_waiting_notice(od_client_t *client)
+{
+	char buf[64];
+	int n = kiwi_be_format_notice(buf, sizeof(buf), 'M',
+				      "waiting for free backend connection");
+
+	size_t unused;
+	return od_io_write_raw(&client->io, buf, n, &unused, 1000, 0);
+}
+
+static inline int send_waiting_finished_notice(od_client_t *client,
+					       uint64_t time_spent, int timeout)
+{
+	char msg[64];
+	char buf[64];
+	od_snprintf(msg, sizeof(msg), "waiting took %" PRIu64 " ms%s",
+		    time_spent, timeout ? ", timeout" : "");
+	int n = kiwi_be_format_notice(buf, sizeof(buf), 'M', msg);
+	size_t unused;
+	return od_io_write_raw(&client->io, buf, n, &unused, 1000, 0);
+}
+
+od_router_status_t od_router_attach(od_router_t *router, od_client_t *client,
+				    bool wait_for_idle,
+				    od_storage_endpoint_t *endpoint,
+				    int immediate)
+{
+	od_route_t *route;
+	od_router_status_t rc;
+	uint64_t end_time_ms;
+
+	route = client->route;
+	od_assert(route != NULL);
+
+	uint64_t now_ms = machine_time_ms();
+	if (route->rule->pool->timeout_ms == 0) {
+		end_time_ms = UINT64_MAX;
+	} else {
+		end_time_ms = now_ms + route->rule->pool->timeout_ms;
+	}
+
+	int internal = route->rule->pool->routing == OD_RULE_POOL_INTERNAL;
+
+	int notice_sent = 0;
+	int notice_sending =
+		route->rule->pool->notice_after_waiting_ms >= 0 && !internal;
+	uint64_t notice_deadline =
+		now_ms + route->rule->pool->notice_after_waiting_ms;
+	uint64_t waiting_start = now_ms;
+
+	od_router_status_t status = OD_ROUTER_ERROR_TIMEDOUT;
+
+	while (now_ms < end_time_ms) {
+		rc = od_router_try_attach(router, client, wait_for_idle,
+					  endpoint);
+		if (rc != OD_ROUTER_NEED_WAIT) {
+			/* ok or some other error */
+			status = rc;
+			break;
+		}
+
+		if (rc == OD_ROUTER_NEED_WAIT && immediate) {
+			/* no need to stat waiting time or send notice */
+			return OD_ROUTER_ERROR_TIMEDOUT;
+		}
+
+		if (notice_sending && !notice_sent &&
+		    machine_time_ms() >= notice_deadline) {
+			if (send_waiting_notice(client) != 0) {
+				status = OD_ROUTER_CLIENT_DISCONNECTED;
+				break;
+			}
+
+			notice_sent = 1;
+		}
+
+		uint32_t until_notice = 1000;
+		if (notice_sending && !notice_sent) {
+			until_notice =
+				od_min(until_notice,
+				       notice_deadline - machine_time_ms());
+		}
+
+		od_route_wait(route, client, &endpoint->address,
+			      od_min(end_time_ms - now_ms, until_notice));
+		if (client->server != NULL) {
+			/* someone attached freed server directly to us */
+			od_route_lock(route);
+			od_client_pool_set(&route->client_pool, client,
+					   OD_CLIENT_ACTIVE);
+			od_route_unlock(route);
+			if (client->server->io.io) {
+				od_io_attach(&client->server->io);
+			}
+			status = OD_ROUTER_OK;
+			break;
+		}
+
+		/* client disconnected while awaiting for attaching */
+		if (!internal && !od_io_connected(&client->io)) {
+			return OD_ROUTER_CLIENT_DISCONNECTED;
+		}
+
+		now_ms = machine_time_ms();
+	}
+
+	uint64_t wait_time = machine_time_ms() - waiting_start;
+
+	od_stat_wait_time(&route->stats, wait_time * 1000 /* convert to us */);
+
+	if ((status == OD_ROUTER_OK || status == OD_ROUTER_ERROR_TIMEDOUT) &&
+	    notice_sent) {
+		if (send_waiting_finished_notice(
+			    client, wait_time,
+			    status == OD_ROUTER_ERROR_TIMEDOUT) != 0) {
+			status = OD_ROUTER_CLIENT_DISCONNECTED;
+		}
+	}
+
 	return status;
 }
 
-od_routerstatus_t
-od_router_detach(od_client_t *client)
+void od_router_detach(od_router_t *router, od_client_t *client)
 {
+	(void)router;
+	od_route_t *route = client->route;
+	od_assert(route != NULL);
+
 	od_instance_t *instance = client->global->instance;
+
+	mm_hashmap_keylock_t client_klock;
+	int rc;
+	/*
+	 * only the per-key serialization against the cancel lookup is
+	 * needed here, so take the shard mutex without the chain
+	 * walk.  the client may already be unregistered from the map
+	 * (frontend cleanup removes it before unroute), but the lock
+	 * must still be taken: it also serializes with concurrent
+	 * lock_key users on the same shard, and the old found=0 path
+	 * silently skipped that
+	 */
+	rc = od_global_clients_map_lock_shard(
+		client->global->instance->clients_by_key, &client_klock,
+		client->key_hash);
+	(void)rc;
+	od_assert(rc == 0);
+
+	/* detach from current machine event loop */
 	od_server_t *server = client->server;
-	if (instance->is_shared)
-		machine_io_detach(server->io);
-	return od_router_do(client, OD_MROUTER_DETACH, NULL);
+	od_server_t *to_close = NULL;
+
+	od_assert(server != NULL);
+	od_assert(od_server_synchronized(server));
+	od_io_detach(&server->io);
+
+	od_route_lock(route);
+
+	int is_repl = client->physical_rep || client->logical_rep;
+	int offline = server->offline;
+
+	/* also sets server to IDLE */
+	od_server_detach_client(server);
+
+	if (offline || is_repl) {
+		od_server_set_pool_state(server, OD_SERVER_UNDEF);
+		server->route = NULL;
+		to_close = server;
+		server = NULL;
+	} else if (server->stats_connected) {
+		od_stat_server_detach(&route->stats);
+	}
+
+	od_client_pool_set(&route->client_pool, client, OD_CLIENT_PENDING);
+	od_route_signal_locked(route, server);
+
+	od_route_unlock(route);
+
+	od_global_clients_map_unlock(client->global->instance->clients_by_key,
+				     &client_klock);
+
+	if (to_close != NULL) {
+		if (is_repl) {
+			od_debug(&instance->logger, NULL, to_close,
+				 "closing replication connection");
+		} else if (offline) {
+			od_debug(&instance->logger, NULL, to_close,
+				 "closing obsolete server connection");
+		}
+
+		od_backend_close_connection(to_close);
+		od_backend_close(to_close);
+	}
 }
 
-od_routerstatus_t
-od_router_detach_and_unroute(od_client_t *client)
+void od_router_close(od_router_t *router, od_client_t *client)
 {
-	od_instance_t *instance = client->global->instance;
-	od_server_t *server = client->server;
-	if (instance->is_shared)
-		machine_io_detach(server->io);
-	return od_router_do(client, OD_MROUTER_DETACH_AND_UNROUTE, NULL);
-}
+	(void)router;
 
-od_routerstatus_t
-od_router_close(od_client_t *client)
-{
+	mm_hashmap_keylock_t client_klock;
+	int rc;
+	rc = od_global_clients_map_lock_shard(
+		client->global->instance->clients_by_key, &client_klock,
+		client->key_hash);
+	(void)rc;
+	od_assert(rc == 0);
+
+	od_route_t *route = client->route;
+	od_assert(route != NULL);
+
 	od_server_t *server = client->server;
+
+	od_route_lock(route);
+
+	od_client_pool_set(&route->client_pool, client, OD_CLIENT_PENDING);
+	od_server_detach_client(server);
+	od_server_set_pool_state(server, OD_SERVER_UNDEF);
+	server->route = NULL;
+
+	od_route_signal_locked(route, NULL);
+
+	od_route_unlock(route);
+
+	od_global_clients_map_unlock(client->global->instance->clients_by_key,
+				     &client_klock);
+
+	/* Console readers cannot see this server after it leaves the pool. */
+	/* Terminate may wait on io, so send it without holding the pool lock. */
 	od_backend_close_connection(server);
-	return od_router_do(client, OD_MROUTER_CLOSE, NULL);
+	od_assert(server->io.io == NULL);
+	od_server_free(server);
 }
 
-od_routerstatus_t
-od_router_close_and_unroute(od_client_t *client)
+void od_router_cancel(od_router_t *router, kiwi_key_t *key)
 {
+	od_global_t *global = router->global;
+
+	mm_hashmap_keylock_t client_klock;
+	int rc;
+	rc = od_global_clients_map_lock(global->instance->clients_by_key, key,
+					&client_klock);
+	(void)rc;
+	od_assert(rc == 0);
+
+	if (!client_klock.found) {
+		return;
+	}
+
+	od_client_t *client = od_global_clients_map_get_val(
+		global->instance->clients_by_key, &client_klock);
+	od_route_t *route = client->route;
+	od_route_lock(route);
+
 	od_server_t *server = client->server;
-	od_backend_close_connection(server);
-	return od_router_do(client, OD_MROUTER_CLOSE_AND_UNROUTE, NULL);
+	if (server == NULL) {
+		od_route_unlock(route);
+		od_global_clients_map_unlock(global->instance->clients_by_key,
+					     &client_klock);
+		return;
+	}
+
+	od_rule_storage_t *storage = route->rule->storage;
+	const od_address_t *address = od_server_pool_address(server);
+
+	od_route_unlock(route);
+
+	od_stat_cancel(&route->stats);
+	int status =
+		od_cancel(global, storage, address, &server->key, &server->id);
+	if (status != OK_RESPONSE) {
+		/* The packet can arrive after our transport has failed. The client
+		 * key lock prevents detach until this backend is marked offline;
+		 * it must never be assigned to another frontend afterward. */
+		od_route_lock(route);
+		server->offline = 1;
+		od_route_unlock(route);
+	}
+
+	od_global_clients_map_unlock(global->instance->clients_by_key,
+				     &client_klock);
 }
 
-od_routerstatus_t
-od_router_cancel(od_client_t *client, od_routercancel_t *cancel)
+static inline int od_router_kill_cb(od_route_t *route, void **argv)
 {
-	return od_router_do(client, OD_MROUTER_CANCEL, cancel);
+	od_route_lock(route);
+	od_route_kill_client(route, argv[0]);
+	od_route_unlock(route);
+	return 0;
+}
+
+void od_router_kill(od_router_t *router, od_id_t *id)
+{
+	void *argv[] = { id };
+	od_router_foreach(router, od_router_kill_cb, argv);
 }

@@ -1,0 +1,1143 @@
+# Rules section
+
+Odyssey allows you to define client routing rules by specifying
+`database`, `user`, and `storage` sections.
+
+When a client connects, the appropriate route is assigned by matching `database` and
+`user` sections. All requests are then forwarded to a `storage`
+(which is referenced from the `user` section).
+
+`database <name> | default { users }`
+
+Defines database name requested by client. Each `database` section structure
+consists of `user` subsections.
+
+A special `database default` is used when no database is matched.
+
+`user <name> | default { options }`
+
+Defines authentication, pooling and storage settings for
+requested route.
+
+A special `user default` is used when no user is matched.
+
+---
+
+
+## Configuration Parameters Reference
+| Parameter                         | Type                                   | Default       | Reload                    | Notes                                                                                                                                                                      |
+|-----------------------------------|----------------------------------------|---------------|---------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| authentication                    | string (none/block/clear_text/external/md5/scram-sha-256/cert) | — (not set)   | runtime (new connections) | Must be set per rule; validated to one of: none, block, clear_text, md5, scram-sha-256, cert. If omitted, config validation errors ("authentication mode is not defined"). |
+| password                          | string                                 | — (not set)   | runtime (new connections) | Route auth secret (plain, MD5 hash, or SCRAM secret).                                                                                                                      |
+| auth_common_name                  | string/list + keyword default          | — (none)      | runtime (new connections) | For cert auth. You can list CNs; special keyword default toggles "accept any CN" for certificates.                                                                         |
+| auth_query                        | string                                 | — (not set)   | runtime (new connections) | External auth SQL query; optional parameter for custom authentication logic.                                                                                               |
+| auth_pam_service                  | string                                 | — (not set)   | runtime (new connections) | PAM service name (only available if PAM support is compiled in).                                                                                                           |
+| client_max                        | integer                                | 0             | runtime (new connections) | Per-route client connection limit; 0 = unlimited connections.                                                                                                              |
+| storage                           | string                                 | — (not set)   | runtime (new connections) | Storage block reference containing backend connection details (endpoints, TLS, etc.). Must be configured for the route to be usable.                                       |
+| storage_db                        | string                                 | — (not set)   | runtime (new connections) | Overrides database name for backend connections.                                                                                                                           |
+| storage_user                      | string                                 | — (not set)   | runtime (new connections) | Overrides username for backend connections.                                                                                                                                |
+| storage_password                  | string                                 | — (not set)   | runtime (new connections) | Password for backend connections.                                                                                                                                          |
+| ldap_endpoint_name                | string                                 | — (not set)   | runtime (new connections) | LDAP endpoint name used when LDAP authentication is enabled.                                                                                                               |
+| ldap_storage_credentials_attr     | string                                 | — (not set)   | runtime (new connections) | LDAP attribute name to extract storage credentials from LDAP response.                                                                                                     |
+| ldap_pool_size                    | integer                                | 0             | runtime (new connections) | LDAP connection pool size; 0 = no pooling.                                                                                                                                 |
+| ldap_pool_timeout                 | integer (ms)                           | 0             | runtime (new connections) | Timeout for getting connection from LDAP pool.                                                                                                                             |
+| ldap_pool_ttl                     | integer (sec)                          | 0             | runtime (new connections) | Time-to-live for idle connections in LDAP pool.                                                                                                                            |
+| password_passthrough              | boolean (yes/no)                       | no (0)        | runtime (new connections) | Enables password passthrough mode; allows forwarding client credentials to backend.                                                                                        |
+| pool                              | string (session/transaction/statement) | — (not set)   | runtime (new connections) | Required: connection pooling mode. Must be explicitly configured.                                                                                                          |
+| pool_size                         | integer                                | 0             | runtime (new connections) | Maximum connections in pool; 0 = unlimited.                                                                                                                                |
+| min_pool_size                     | integer                                | 0             | runtime (new connections) | Minimum connections to maintain in pool.                                                                                                                                   |
+| pool_timeout                      | duration (ms)                          | 0             | runtime (new connections) | Maximum wait time for acquiring connection from pool.                                                                                                                      |
+| pool_ttl                          | duration (sec)                         | 0             | runtime (new connections) | Time-to-live for idle server connections.                                                                                                                                  |
+| pool_discard                      | boolean                                | yes (1)       | runtime (new connections) | Execute DISCARD ALL when returning connections to pool.                                                                                                                    |
+| pool_smart_discard                | boolean                                | no (0)        | runtime (new connections) | Use custom discard query instead of DISCARD ALL when enabled.                                                                                                              |
+| pool_discard_query               | string                                 | — (not set)   | runtime (new connections) | Custom discard query; if includes DEALLOCATE ALL, prepared statements are disallowed.                                                                                      |
+| pool_cancel                       | boolean                                | yes (1)       | runtime (new connections) | Send cancel request to backend when client disconnects.                                                                                                                    |
+| pool_rollback                     | boolean                                | yes (1)       | runtime (new connections) | Execute ROLLBACK when returning connections with open transactions.                                                                                                        |
+| client_fwd_error                  | boolean                                | no (0)        | runtime (new connections) | Forward backend connection errors to client during connection establishment.                                                                                               |
+| application_name_add_host         | boolean                                | no (0)        | runtime (new connections) | Append client hostname to application_name parameter.                                                                                                                      |
+| reserve_session_server_connection | boolean                                | yes (1)       | runtime (new connections) | Immediately establish backend connection when client connects.                                                                                                             |
+| server_lifetime                   | duration (sec)                         | 3600          | runtime (new connections) | Maximum lifetime for backend connections (1 hour default).                                                 |
+| server_drop_on_cached_plan_error  | boolean(yes/no)                        | no          | runtime (new connections) | Do drop server connection on ERROR 0A000 cached plan must not change result type |
+| server_drop_on_oom                | boolean (yes/no)                       | yes (1)       | runtime (new connections) | Drop the client and server connections when the server process reports OOM.                                                |
+| pool_client_idle_timeout          | duration (sec)                       | 0             | runtime (new connections) | Timeout for idle client connections; only applies to session pooling mode.                                                                                                 |
+| pool_idle_in_transaction_timeout    | duration (sec)                         | 0             | runtime (new connections) | Timeout for idle clients with open transactions; session pooling only.                                                                                                     |
+| pool_reserve_prepared_statement   | boolean                                | yes (0)       | runtime (new connections) | Enable prepared statement support; incompatible with session pooling and certain discard modes.                                                                            |
+| server_pstmt_cache_size           | integer                                | 0             | runtime (new connections) | Per-server limit of reserved prepared statements; evicts statements not recently used (SIEVE policy) on server reset; 0 = unlimited. Only meaningful with prepared statement support enabled. |
+| pool_pin_on_listen          | boolean                        | no (0)             | runtime (new connections) | Enable pinning client to server after LISTEN execution                                                                                    |
+| log_debug                         | boolean                                | no (0)        | runtime (new connections) | Enable debug logging for this route.                                                                                                                                       |
+| log_debug_sampling (per-route)    | integer (0..100)                       | — (global)    | runtime (new connections) | Percentage of client connections with debug logging for this route; overrides global `log_debug_sampling`.                                                                |
+| group_checker_interval            | duration (ms)                          | 7000 (global) | runtime (global)          | Global setting: interval for checking group membership changes (7 seconds default).                                                                                        |
+| maintain_params                   | boolean                                | yes (1)       | runtime (new connections) | Maintain client connection parameters across backend connections for compatibility.                                                                                        |
+| target_session_attrs              | string enum                            | — (not set)   | runtime (new connections) | Target session attributes for connection routing; defaults to undefined behavior.                                                                                          |
+| auto_route_ro_on_standby          | boolean                                | no (0)        | runtime (new connections) | Reserved for automatic routing of read-only queries to standby replicas; see the section below.                                                                            |
+| quantiles                         | string (comma-separated)               | — (not set)   | runtime (new connections) | Comma-separated list of quantile values for statistics collection; disabled when not set.                                                                                  |
+| catchup_timeout                   | duration (sec)                         | 0             | runtime (new connections) | Timeout for replica catchup operations; 0 = no timeout.                                                                                                                    |
+| catchup_checks                    | integer                                | 0             | runtime (new connections) | **Deprecated.** Accepted but ignored.                                                                                                                                      |
+| role                              | string (admin/client)                  | — (not set)   | runtime (new connections) | Route role. `"admin"` grants access to the admin console.                                                                                                                  |
+| client_show_id                    | boolean                                | no (0)        | runtime (new connections) | Include Odyssey client ID in log messages for this route.                                                                                                                  |
+| pool_routing                      | string                                 | — (not set)   | runtime (new connections) | Internal routing mode. Use `"internal"` for watchdog/system routes.                                                                                                        |
+| pool_reset_timeout_ms             | integer (ms)                           | 0             | runtime (new connections) | Timeout for executing the reset/discard query when returning a connection to the pool; 0 = no timeout.                                                                     |
+| auth_module                       | string                                 | — (not set)   | runtime (new connections) | Name of the external authentication module to use.                                                                                                                         |
+| enable_mdb_iamproxy_auth          | boolean                                | no (0)        | runtime (new connections) | Enable Yandex MDB IAM proxy authentication.                                                                                                                                |
+| mdb_iamproxy_socket_path          | string                                 | — (not set)   | runtime (new connections) | Path to the MDB IAM proxy UNIX socket.                                                                                                                                     |
+| log_query (per-route)             | boolean                                | no (0)        | runtime (new connections) | Log queries for this specific route (overrides global `log_query`).                                                                                                        |
+| log_query_sampling (per-route)    | integer (0..100)                       | — (global)    | runtime (new connections) | Percentage of queries to log for this route; overrides global `log_query_sampling`.                                                                                        |
+| ldap_pool_size                    | integer                                | 0             | runtime (new connections) | **Deprecated.** Accepted but ignored.                                                                                                                                      |
+| ldap_pool_timeout                 | integer (ms)                           | 0             | runtime (new connections) | **Deprecated.** Accepted but ignored.                                                                                                                                      |
+| ldap_pool_ttl                     | integer (sec)                          | 0             | runtime (new connections) | **Deprecated.** Accepted but ignored.                                                                                                                                      |
+
+## **authentication**
+
+*string*
+
+Set route authentication method. Supported:
+
+```
+"none"       	- authentication turned off
+"block"      	- block this user
+"clear_text" 	- PostgreSQL clear text authentication
+"md5"        	- PostgreSQL md5 authentication
+"scram-sha-256" - PostgreSQL scram-sha-256 authentication
+"cert"       	- Compare client certificate Common Name against auth_common_name's
+```
+
+`authentication "none"`
+
+---
+
+## **password**
+
+*string*
+
+Set route authentication password. Depending on selected method, password can be
+in plain text, md5 hash or SCRAM secret.
+
+To generate SCRAM secret you can use [this](https://github.com/DenisMedeirosBBD/PostgresSCRAM256PasswordGenerator) tool.
+
+`password "test"`
+
+---
+
+## **auth\_common\_name**
+
+default|*string*
+
+Specify common names to check for "cert" authentication method.
+If more than one common name is defined, all of them
+will be checked until a match is found.
+
+Set 'default' to check for the current user.
+
+```
+auth_common_name default
+auth_common_name "test"
+```
+
+---
+
+## **auth\_query**
+
+*string*
+
+Enable remote route authentication. Use another route to authenticate clients
+following this logic:
+
+Use the selected 'auth\_query\_db' and 'auth\_query\_user' to match a route.
+Use the matched route server to send 'auth\_query' to get the username and password needed
+to authenticate a client.
+
+```
+auth_query "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"
+auth_query_db ""
+auth_query_user ""
+```
+
+Disabled by default.
+
+---
+
+## **auth\_pam\_service**
+
+Enables PAM (Pluggable Authentication Modules) as the authentication mechanism.
+It is incompatible with the auth query method. The password must be passed in plain text form, as
+standard PostgreSQL requires.
+
+```
+auth_pam_service "name desired pam service"
+```
+
+---
+
+## **client\_max**
+
+*integer*
+
+Set client connections limit for this route.
+
+Comment out 'client\_max' to disable the limit. When the client limit is reached, Odyssey will
+reply with 'too many connections'.
+
+`client_max 100`
+
+---
+
+## **storage**
+
+*string*
+
+Set remote server to use.
+
+By default, route database and user names are used as connection
+parameters to the remote server. It is possible to override these values
+by specifying `storage_db` and `storage_user`. The remote server password
+can be set using the `storage_password` field.
+
+```plain
+storage "postgres_server"
+storage_db "database"
+storage_user "test"
+storage_password "test"
+```
+
+---
+
+## **ldap_storage_credentials**
+
+This subsection must be located within the `user` subsection and is used to route clients to a remote PostgreSQL server with special credentials 
+(`storage_user` and `storage_password`), depending on the client account attributes stored on the LDAP server 
+(based on OpenLDAP, Active Directory or others). This routing method allows to grant access 
+with different privileges to different databases located on the same host. 
+
+This routing method may only be used if the variables ldap_endpoint_name and ldap_storage_credentials_attr 
+are set. For example:
+
+```
+storage "test_server" {
+     type "remote"
+     port 5432
+     host "postgres_server"
+}
+ldap_endpoint "ldap1" {
+     ldapscheme "ldap"
+     ldapbasedn "dc=example,dc=org"
+     ldapbinddn "cn=admin,dc=example,dc=org"
+     ldapbindpasswd "admin"
+     ldapsearchfilter "(memberOf=cn=localhost,ou=groups,dc=example,dc=org)"
+     ldapsearchattribute "gecos"
+     ldapserver "192.168.233.16"
+     ldapport 389
+}
+database default {
+    user default {
+          authentication "clear_text"
+          storage "test_server"
+	    
+          ldap_endpoint_name "ldap1"
+          ldap_storage_credentials_attr "memberof"
+          ldap_storage_credentials "group_ro" {
+               ldap_storage_username "ldap_ro"
+               ldap_storage_password "password1"
+          }
+          ldap_storage_credentials "group_rw" {
+               ldap_storage_username "ldap_rw"
+               ldap_storage_password "password2"
+          }
+	    
+          #other required regular parameters are hidden from this example
+     }
+}
+```
+To successfully route the client to the PostgreSQL server with correct credentials, client account attributes
+stored on the LDAP server must contain three required values separated by the `_` character:
+hostname of PostgreSQL server (`host` value from `storage` section), name of target `database`,
+and name of `ldap_storage_credentials` in format `%host_%database_%ldap_storage_credentials`
+For example, look at `memberof` attributes in [usr4.ldiff](https://github.com/yandex/odyssey/tree/master/docker/ldap):
+```
+dn: uid=user4,dc=example,dc=org
+objectClass: top
+objectClass: account
+objectClass: posixAccount
+objectClass: shadowAccount
+cn: user4
+uid: user4
+memberof: cn=localhost,ou=groups,dc=example,dc=org
+memberof: cn=localhost_ldap_db1_group_ro,ou=groups,dc=example,dc=org
+memberof: cn=localhost_ldap_db2_group_rw,ou=groups,dc=example,dc=org
+uidNumber: 16860
+gidNumber: 101
+homeDirectory: /home/user4
+loginShell: /bin/bash
+gecos: user4
+userPassword: default
+shadowLastChange: 0
+shadowMax: 0
+shadowWarning: 0
+```
+
+---
+
+## **ldap_storage_credentials_attr**
+
+*string*
+
+Sets the account attribute name from the LDAP server, whose values
+will be used to determine the route and parameters for connecting the client to the PostgreSQL server.
+
+---
+
+## **ldap_endpoint_name**
+
+*string*
+
+Specifies the name of the ldap_endpoint to be used to connect to the LDAP server.
+
+---
+
+## **ldap_endpoint**
+
+The ldap_endpoint section is used to configure parameters for connecting to the LDAP server. For example:
+
+```
+ldap_endpoint "ldap1" {
+	ldapscheme "ldap"
+	ldapbasedn "dc=example,dc=org"
+	ldapbinddn "cn=admin,dc=example,dc=org"
+	ldapbindpasswd "admin"
+	ldapsearchattribute "gecos"
+	ldapserver "192.168.233.16"
+	ldapport 389
+}
+```
+
+The way the client DN is determined depends on whether `ldapbasedn` is set:
+
+* **search+bind** — used when `ldapbasedn` is set. Odyssey searches the
+  directory below `ldapbasedn` for the entry matching the connecting user and
+  then binds with the DN it found.
+* **simple bind** — used when `ldapbasedn` is not set. No search is
+  performed: the client DN is formed by concatenating `ldapprefix`, the user
+  name the client connected with, and `ldapsuffix`.
+
+The scope of the search in search+bind mode is not configurable: Odyssey
+always searches the whole subtree below `ldapbasedn`. The `ldapscope` option
+is accepted by the configuration parser and shown when the configuration is
+dumped, but its value is not used. PostgreSQL behaves the same way and has no
+separate option for the search scope either.
+
+In both modes Odyssey first opens the connection to the LDAP server and binds
+with `ldapbinddn` / `ldapbindpasswd`, or anonymously when they are not set.
+`ldapprefix` and `ldapsuffix` are ignored when `ldapbasedn` is set. The names
+and the meaning of these two options follow the options of the same name in
+PostgreSQL `pg_hba.conf`.
+
+```
+ldap_endpoint "ldap2" {
+	ldapscheme "ldap"
+	ldapserver "192.168.233.16"
+	ldapport 389
+	ldapprefix "cn="
+	ldapsuffix ",ou=people,dc=example,dc=org"
+}
+```
+
+With this endpoint a client connecting as `user4` is authenticated as
+`cn=user4,ou=people,dc=example,dc=org`.
+
+---
+
+## **ldap\_pool\_size**
+
+*integer*
+
+LDAP server pool size
+
+Keep the number of servers in the pool up to 'pool\_size'.
+Clients are put in a wait queue when all servers are busy.
+
+Set to zero to disable.
+
+`ldap_pool_size 10`
+
+---
+
+## **ldap\_pool\_timeout**
+
+*integer*
+
+LDAP server pool timeout
+
+Time to wait in milliseconds for an available server.
+Disconnect the client when the timeout is reached.
+
+Set to zero to disable.
+
+`ldap_pool_timeout 1000`
+
+---
+
+## **ldap\_pool\_ttl**
+
+*integer*
+
+LDAP server pool idle timeout.
+
+Close the LDAP server connection when it becomes idle for 'ldap\_pool\_ttl' seconds.
+
+Set to zero to disable.
+
+`ldap_pool_ttl 60`
+
+---
+
+## **password_passthrough**
+
+*bool*
+
+By default, Odyssey authenticates users itself, but if a side authentication application is used,
+such as a LDAP server, PAM module, or custom auth module, sometimes
+instead of configuring `storage_password`, it is more convenient to reuse the
+client-provided password to perform backend authentication. If you set this option to "yes",
+Odyssey will store the client token and use it when a new server connection is opened. However, if
+you configure `storage_password` for the route, `password_passthrough` is essentially ignored.
+
+---
+
+## **pool**
+
+*string*
+
+Set route server pool mode.
+
+Supported modes:
+
+```
+"session"     - assign server connection to a client until it disconnects
+"transaction" - assign server connection to a client for a transaction processing
+```
+
+`pool "transaction"`
+
+---
+
+## **pool\_size**
+
+*integer*
+
+Server pool size.
+
+Keep the number of servers in the pool up to 'pool\_size'.
+Clients are put in a wait queue when all servers are busy.
+
+Set to zero to disable the limit.
+
+`pool_size 100`
+
+---
+
+## **min_pool_size**
+
+*integer*
+
+Minimum server pool size.
+
+Keep the number of servers in the pool at a minimum of 'min_pool_size'.
+Helps to handle unexpected high load.
+Default: 0
+
+`min_pool_size 50`
+
+---
+
+## **pool\_timeout**
+
+*integer*
+
+Server pool wait timeout.
+
+Time to wait in milliseconds for an available server.
+Disconnect the client when the timeout is reached.
+
+Set to zero to disable.
+
+`pool_timeout 4000`
+
+---
+
+## **pool\_ttl**
+
+*integer*
+
+Server pool idle timeout.
+
+Close a server connection when it becomes idle for 'pool\_ttl' seconds.
+
+Set to zero to disable.
+
+`pool_ttl 60`
+
+---
+
+## **pool\_discard**
+
+*yes|no*
+
+Server pool parameters discard.
+
+Execute `DISCARD ALL` and reset client parameters before using a server
+from the pool.
+
+`pool_discard no`
+
+---
+
+## **pool\_smart\_discard**
+
+*yes|no*
+
+When this parameter is enabled, Odyssey sends a smart discard query instead of the default `DISCARD ALL` when it
+returns a connection to the pool. Its default value may be overwritten by the pool\_discard\_query setting.
+
+---
+
+## **pool\_discard\_query**
+
+*string*
+
+When resetting a database connection, a pre-defined query string is sent to the server. This query string consists of a set of SQL statements that will be executed during a `DISCARD ALL` command, except for `DEALLOCATE ALL`. The default query string includes the following statements:
+
+```sql
+SET SESSION AUTHORIZATION DEFAULT;
+RESET ALL;
+CLOSE ALL;
+UNLISTEN *;
+SELECT pg_advisory_unlock_all();
+DISCARD PLANS;
+DISCARD SEQUENCES;DISCARD TEMP;
+```
+
+This sequence of statements is designed to reset the connection to a clean state, without affecting the authentication credentials of the session. By executing these queries, any open transactions will be closed, locks will be released, and any cached execution plans and sequences will be discarded.
+
+---
+
+## **pool\_cancel**
+
+*yes|no*
+
+Server pool auto-cancel.
+
+Start an additional Cancel connection if the server is left with an
+executing query. Close the connection otherwise.
+
+`pool_cancel no`
+
+---
+
+## **pool\_rollback**
+
+*yes|no*
+
+Server pool auto-rollback.
+
+Execute 'ROLLBACK' if the server is left in an active transaction.
+Close the connection otherwise.
+
+`pool_rollback yes`
+
+---
+
+## **client\_fwd\_error**
+
+*yes|no*
+
+Forward PostgreSQL errors during remote server connection.
+
+`client_fwd_error no`
+
+---
+
+## **application_name_add_host**
+
+*yes|no*
+
+Add the client host name to the application_name parameter
+
+`application_name_add_host yes`
+
+---
+
+## **reserve_session_server_connection**
+
+*yes|no*
+
+Connect a new client to the server immediately or wait for the first query
+
+`reserve_session_server_connection yes`
+
+---
+
+## **server_lifetime**
+
+*integer*
+
+Server lifetime - maximum number of seconds for a server connection to live. Prevents cache bloat.
+Server connection is deallocated only in the idle state.
+Defaults to 3600 (1 hour).
+Use 0 to disable.
+
+`server_lifetime 3600`
+
+---
+
+## *server_drop_on_cached_plan_error*
+
+*yes/no*
+
+Drop server connection when prepared statements support are enabled
+and `ERROR 0A000 cached plan must not change result type` are met. Useful
+when driver cant do Close+Prepare by itself.
+
+Default: no
+
+`server_drop_on_cached_plan_error yes`
+
+---
+
+## *server_drop_on_oom*
+
+*yes/no*
+
+Drop both the client connection and its attached server connection when the
+server process has entered an out-of-memory state. This prevents reuse of a
+server connection that encountered OOM.
+
+Default: yes
+
+Set `server_drop_on_oom no` to keep the previous behavior.
+
+`server_drop_on_oom yes`
+
+---
+
+## **pool\_client\_idle\_timeout**
+
+*duration*
+
+Client pool idle timeout.
+
+Drop stale client connections after this many seconds of idleness when not in a transaction.
+
+Set to zero to disable.
+
+`pool_client_idle_timeout 30`
+
+---
+
+## **pool\_idle\_in\_transaction\_timeout**
+
+*duration*
+
+Client pool idle in transaction timeout.
+
+Drop client connections in a transaction after this many seconds of idleness.
+
+Set to zero to disable.
+
+`pool_idle_in_transaction_timeout 15`
+
+---
+
+## **pool\_notice\_after\_waiting\_ms**
+
+*integer*
+
+Sent NOTICE to client after specified amount of milliseconds spent
+int waiting for free backend connection.
+
+Negative values disables the feature.
+
+```
+db1=> select 42;
+NOTICE:  waiting for free backend connection
+NOTICE:  waiting took 12319 ms
+ ?column? 
+----------
+       42
+(1 row)
+```
+
+`pool_notice_after_waiting_ms 5000`
+
+---
+
+## pool\_attach\_check**
+
+*yes/no*
+
+Check server connection before attaching to client.
+Default: yes
+
+`pool_attach_check no`
+
+---
+
+## pool\_acquire\_fail\_fast
+
+*yes/no*
+
+Do not wait for free connection on host if pools are busy,
+immediately try to get connection from next host
+Default: no
+
+`pool_acquire_fail_fast yes`
+
+### odyssey.opportunistic\_acquire *(runtime GUC)*
+
+*on/off*
+
+Per-client override that can be set at runtime via `SET odyssey.opportunistic_acquire = 'on'`.
+When enabled, Odyssey never waits for a free connection from the pool — it immediately
+fails with a "too many connections" error, even if there is only one host. Unlike
+`pool_acquire_fail_fast`, this option works per-client and does not require multiple
+hosts; it also does not retry with waiting.
+
+Can be inspected with `SHOW odyssey.opportunistic_acquire`.
+
+Requires `virtual_processing yes` in the global config.
+
+```sql
+SET odyssey.opportunistic_acquire = 'on';
+SHOW odyssey.opportunistic_acquire;
+```
+
+## **pool_reserve_prepared_statement**
+
+*yes|no*
+
+Enable support of prepared statements in transactional pooling.
+
+`pool_reserve_prepared_statement yes`
+
+SQL `EXECUTE` can invoke a statement created by protocol `Parse`: Odyssey
+rewrites the name and deploys the saved `Parse` when needed. PostgreSQL evaluates
+the original argument expressions. Only a single top-level simple query is
+rewritten, subject to the configured parser's syntax and limits.
+The minimal parser treats arguments as opaque SQL; Unicode-escaped names require
+the full parser.
+Backend diagnostics may refer to the rewritten name and SQL positions.
+
+SQL `PREPARE`/`EXECUTE`/`DEALLOCATE` names beginning with `odyssey` are reserved
+(SQLSTATE `42939`). The check uses the selected parser: mini handles one simple
+command; full also handles wrapped `EXECUTE` and Unicode-escaped names. Parsing
+must be enabled and the query accepted within `query_parsing_max_query_len`.
+Multi-statement queries and other unparsed queries pass through.
+
+## **server_pstmt_cache_size**
+
+*integer*
+
+Per-server-connection limit of reserved prepared statements.
+Eviction happens on returning connection to the pool.
+Eviction is best-effort: statements still referenced by clients or by other servers are not evicted, so the number of reserved statements may stay above the configured limit.
+Default: 0 (disabled)
+
+`server_pstmt_cache_size 512`
+
+## **pool_pin_on_listen**
+*yes/no*
+*Experimental*
+
+Enable pinning client connection to server, after LISTEN command execute.
+
+Default: `no`
+
+`pool_pin_on_listen yes`
+
+---
+
+## **log\_debug**
+
+*yes|no*
+
+Enable verbose mode for a specific route only.
+
+`log_debug no`
+
+---
+
+## **group\_checker\_interval**
+
+*integer*
+
+Soft interval between group checks (in ms)
+7000 by default
+
+`group_checker_interval 7000`
+
+---
+
+## **maintain_params**
+
+*yes|no*
+
+User parameters maintenance
+
+By default, Odyssey saves parameter values defined by the user
+and deploys them on server attach if they are different from the server's.
+This option disables the feature.
+
+`maintain_params no`
+
+---
+
+## **target_session_attrs**
+
+*string*
+
+Target session attributes feature. Odyssey will look up primary/standby
+for connections of this user, depending on the value set.
+Possible values are:
+
+- read-write - always select host, available for write
+- read-only - never select host, available for write
+- prefer-standby - try to select host available for write last of all
+- any (the default) - select host randomly
+
+`target_session_attrs "read-write"`
+
+---
+
+## **auto_route_ro_on_standby**
+
+*yes|no*
+
+Switch for automatic routing of read-only queries (simple and extended
+protocols, outside transactions) to standby replicas, while the rest of the
+traffic is routed to the primary. Has no effect when `target_session_attrs`
+is set for the connection (rule, listen or client
+`odyssey.target_session_attrs`).
+
+Specifying `target_session_attrs` and `auto_route_ro_on_standby` in the same
+section is a configuration error.
+
+When set on a [listen](listen.md#auto_route_ro_on_standby) endpoint, the
+listen value overrides the rule value.
+
+Requires [query_parsing_mode](query-parsing.md#query_parsing_mode) `full` in the global config,
+otherwise the configuration is rejected. With `full` parsing enabled globally,
+clients without `auto_route_ro_on_standby` (neither on the rule nor on the
+listen) still use the cheaper `minimal` parser automatically.
+
+Incompatible with session pooling.
+
+`auto_route_ro_on_standby yes`
+
+---
+
+## **quantiles**
+
+*string*
+
+Compute quantiles of query times, transaction times, and disconnected client
+lifetimes. Client lifetime observations are collected by the session cleanup
+handler. See [client lifetime metrics](../features/prometheus-metrics.md#client-lifetime)
+for collection and export details.
+
+`quantiles "0.99,0.95,0.5"`
+
+---
+
+## **catchup_timeout**
+
+*duration*
+
+Specify maximum replication lag in seconds for the user
+(one-second granularity, sub-second durations are rounded up).
+See [catchup-timeout.md](../features/catchup-timeout.md) for more details
+
+`catchup_timeout 10`
+
+---
+
+## **catchup\_checks** *(deprecated)*
+
+*integer*
+
+**Deprecated.** Accepted for backwards compatibility but ignored — a
+deprecation warning is emitted.
+
+---
+
+## **role**
+
+*string*
+
+Set the route role. Supported values:
+
+```
+"admin"  - grants access to the Odyssey admin console
+"client" - regular client route (default when not set)
+```
+
+`role "admin"`
+
+---
+
+## **client\_show\_id**
+
+*yes|no*
+
+Include the internal Odyssey client ID in log messages produced for
+connections on this route. Useful when correlating logs for a specific
+database/user pair.
+
+`client_show_id yes`
+
+---
+
+## **pool\_routing**
+
+*string*
+
+Internal routing mode for the connection. Use `"internal"` for
+system routes such as the `watchdog` sub-section. Normal client routes
+should leave this unset.
+
+`pool_routing "internal"`
+
+---
+
+## **pool\_reset\_timeout\_ms**
+
+*integer*
+
+Timeout in milliseconds for executing the reset/discard query when a
+server connection is returned to the pool. If the query does not
+complete within this time the connection is dropped instead.
+Set to 0 to disable the timeout.
+
+`pool_reset_timeout_ms 3000`
+
+---
+
+## **auth\_module**
+
+*string*
+
+Name of the external authentication module to use for this route.
+The module must be registered via `external_auth_socket_path` in the
+global section.
+
+`auth_module "my_auth_module"`
+
+---
+
+## **enable\_mdb\_iamproxy\_auth**
+
+*yes|no*
+
+Enable Yandex MDB IAM proxy authentication for this route.
+When set to `yes`, Odyssey will delegate token validation to the MDB IAM
+proxy service specified by `mdb_iamproxy_socket_path`.
+
+`enable_mdb_iamproxy_auth yes`
+
+---
+
+## **mdb\_iamproxy\_socket\_path**
+
+*string*
+
+Path to the UNIX socket of the MDB IAM proxy service.
+Used when `enable_mdb_iamproxy_auth yes`.
+
+`mdb_iamproxy_socket_path "/var/run/mdb-iamproxy.sock"`
+
+---
+
+## **log\_query** *(per-route)*
+
+*yes|no*
+
+Enable query logging for this specific route only, without enabling it
+globally. Overrides the global `log_query` setting for connections
+matched by this route.
+
+`log_query yes`
+
+---
+
+## **log\_debug\_sampling** *(per-route)*
+
+*integer (0..100)*
+
+Percentage of client connections for which debug messages are logged
+for this route when debug logging is enabled (globally or per-route).
+The decision is made once per client connection, so a sampled client is
+logged as a whole. When unset, the global `log_debug_sampling` value is
+used.
+
+`log_debug_sampling 10`
+
+---
+
+## **log\_query\_sampling** *(per-route)*
+
+*integer (0..100)*
+
+Percentage of queries logged for this route when query logging is
+enabled (globally or per-route). When unset, the global
+`log_query_sampling` value is used.
+
+`log_query_sampling 10`
+
+---
+
+## **options**
+
+Key-value block that sets PostgreSQL GUC parameters sent to the server
+via the startup message (equivalent to `PGOPTIONS`). Each entry is a
+pair of quoted strings.
+
+```plain
+options {
+    "search_path" "myschema,public"
+    "TimeZone"    "UTC"
+}
+```
+
+---
+
+## **backend\_startup\_options**
+
+Key-value block for additional parameters sent to the backend during the
+startup handshake. Similar to `options` but intended for parameters that
+must arrive in the startup packet rather than as `SET` commands.
+
+```plain
+backend_startup_options {
+    "application_name" "my_app"
+}
+```
+
+---
+
+## **group**
+
+A `group` sub-section inside a `database` block defines a named set of
+route settings that is selected based on the client's group membership
+(looked up via a SQL query). A database block can contain multiple
+`group` entries as well as `user` entries.
+
+```
+database "mydb" {
+    group "power_users" {
+        group_query      "SELECT group FROM user_groups WHERE usename=$1"
+        group_query_user "monitor"
+        group_query_db   "postgres"
+
+        authentication "md5"
+        storage        "postgres_server"
+        pool           "transaction"
+        pool_size      20
+    }
+
+    user default {
+        authentication "md5"
+        storage        "postgres_server"
+        pool           "transaction"
+        pool_size      5
+    }
+}
+```
+
+### **group\_query**
+
+*string*
+
+SQL query executed to determine the group of the connecting client.
+The query must return a single string value (the group name). The client
+username is passed as `$1`.
+
+`group_query "SELECT grp FROM user_groups WHERE usename=$1"`
+
+### **group\_query\_user**
+
+*string*
+
+Username used to connect to the database when executing `group_query`.
+
+`group_query_user "monitor"`
+
+### **group\_query\_db**
+
+*string*
+
+Database used when executing `group_query`.
+
+`group_query_db "postgres"`
+
+---
+
+## Deprecated parameters
+
+The following per-route parameters are accepted for backwards compatibility
+but are **ignored** — a deprecation warning is emitted in the log.
+
+| Parameter | Notes |
+|---|---|
+| `catchup_checks` | Removed. Use `catchup_timeout` instead. |
+| `ldap_pool_size` | Removed. |
+| `ldap_pool_timeout` | Removed. |
+| `ldap_pool_ttl` | Removed. |
+
+---
+
+## example (remote)
+
+```
+database default {
+	user default {
+		authentication "none"
+#		password ""
+#		auth_common_name default
+#		auth_common_name "test"
+#		auth_query "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"
+#		auth_query_db ""
+#		auth_query_user ""
+#		client_max 100
+
+		storage "postgres_server"
+#		storage_db "database"
+#		storage_user "test"
+#		storage_password "test"
+
+		pool "transaction"
+		pool_size 0
+		pool_timeout 0
+		pool_ttl 60
+		pool_cancel no
+		pool_rollback yes
+
+		client_fwd_error no
+		log_debug no
+	}
+}
+```
+
+---
+
+## example (admin console)
+
+```
+storage "local" {
+	type "local"
+}
+
+database "console" {
+	user default {
+		authentication "none"
+		pool "session"
+		storage "local"
+	}
+}
+```

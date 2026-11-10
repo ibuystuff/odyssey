@@ -1,0 +1,53 @@
+name: Drivers tests
+on:
+  push:
+    branches: [ master, 'REL_*' ]
+  pull_request:
+    branches: [ master ]
+    paths:
+      - ".github/actions/test-logs/**"
+      - ".github/workflows/drivers-tests.yml"
+      - "sources/**"
+      - "test/**"
+      - "CMakeLists.txt"
+      - "docker/**"
+      - "modules/**"
+      - "cmake/**"
+      - "!docker/prom-exporter/**"
+      - "!test/prom-exporter/**"
+      - "!sources/machinarium/gdb/**"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  jdbc:
+    name: jdbc
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: docker buildx
+      uses: docker/setup-buildx-action@v4
+    - name: Odyssey JDBC compatibility tests
+      shell: bash
+      run: make jdbc_test 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs
+  userver:
+    name: userver
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: docker buildx
+      uses: docker/setup-buildx-action@v4
+    - name: Odyssey userver compatibility tests
+      shell: bash
+      run: make userver_test 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs

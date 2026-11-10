@@ -1,0 +1,100 @@
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <odyssey.h>
+
+#include <status.h>
+#include <frontend.h>
+#include <instance.h>
+#include <router.h>
+#include <backend.h>
+#include <server.h>
+
+od_frontend_status_t
+od_attach_extended_endpoint(od_instance_t *instance, od_router_t *router,
+			    od_client_t *client,
+			    od_storage_endpoint_t *endpoint)
+{
+	od_router_status_t status;
+
+	status = od_router_attach(router, client, 0 /* wait for idle */,
+				  endpoint, 0 /* wait if needed */);
+	od_debug(&instance->logger, client, NULL,
+		 "attaching service client to backend connection status: %s",
+		 od_router_status_to_str(status));
+
+	if (status != OD_ROUTER_OK) {
+		od_debug(
+			&instance->logger, client, NULL,
+			"failed to attach internal service client to route: %s",
+			od_router_status_to_str(status));
+
+		return OD_EATTACH;
+	}
+
+	od_server_t *server;
+	server = client->server;
+	od_debug(&instance->logger, client, server, "attached to server %s%.*s",
+		 server->id.id_prefix, (int)sizeof(server->id.id),
+		 server->id.id);
+
+	if (od_backend_not_connected(server)) {
+		od_rule_storage_t *storage = client->rule->storage;
+		int rc = od_backend_connect(server, NULL, client, storage);
+		if (rc == NOT_OK_RESPONSE) {
+			od_router_close(router, client);
+			od_storage_endpoint_status_set_dead(&endpoint->status);
+			return OD_ESERVER_CONNECT;
+		}
+	}
+
+	int rc = od_backend_startup_preallocated(server, NULL, client);
+	if (rc != OK_RESPONSE) {
+		od_router_close(router, client);
+		od_storage_endpoint_status_set_dead(&endpoint->status);
+		return OD_ESERVER_CONNECT;
+	}
+
+	return OD_OK;
+}
+
+int od_attach_extended(od_instance_t *instance, od_router_t *router,
+		       od_client_t *client)
+{
+	od_rule_storage_t *storage = client->rule->storage;
+
+	od_endpoint_attach_candidate_t candidates[OD_STORAGE_MAX_ENDPOINTS];
+	od_frontend_attach_init_candidates(instance, storage, candidates,
+					   OD_TARGET_SESSION_ATTRS_ANY,
+					   1 /* prefer localhost */);
+
+	for (size_t i = 0; i < storage->endpoints_count; ++i) {
+		od_storage_endpoint_t *endpoint = candidates[i].endpoint;
+		od_frontend_status_t status = OD_EATTACH;
+
+		if (candidates[i].priority >= 0) {
+			if (client->server != NULL) {
+				od_router_close(router, client);
+			}
+
+			status = od_attach_extended_endpoint(instance, router,
+							     client, endpoint);
+		}
+
+		if (status == OD_OK) {
+			return OK_RESPONSE;
+		}
+
+		char addr[256];
+		od_address_to_str(&endpoint->address, addr, sizeof(addr) - 1);
+
+		od_debug(&instance->logger, client, NULL,
+			 "attach to %s failed with status: %s", addr,
+			 od_frontend_status_to_str(status));
+	}
+
+	return NOT_OK_RESPONSE;
+}

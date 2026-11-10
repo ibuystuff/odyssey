@@ -1,0 +1,581 @@
+
+/*
+ * machinarium.
+ *
+ * cooperative multitasking engine.
+ */
+
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+
+#include <machinarium/build.h>
+
+#include <machinarium/machinarium.h>
+#include <machinarium/machine.h>
+#include <machinarium/io.h>
+#include <machinarium/lrand48.h>
+#include <machinarium/mm.h>
+
+#ifdef HAVE_TSAN
+#include <sanitizer/tsan_interface.h>
+#endif
+
+__thread mm_machine_t *mm_self = NULL;
+
+static int mm_idle_cb(mm_idle_t *handle)
+{
+	(void)handle;
+	mm_scheduler_run(&mm_self->scheduler);
+	return mm_scheduler_online(&mm_self->scheduler);
+}
+
+static inline void machine_instance_free(mm_machine_t *machine)
+{
+	/* todo: check active timers and other allocated
+	 *       resources */
+	mm_msgcache_free(&machine->msg_cache);
+	mm_coroutine_cache_free(&machine->system_coroutine_cache);
+	mm_coroutine_cache_free(&machine->general_coroutine_cache);
+	mm_eventmgr_free(&machine->event_mgr, &machine->loop);
+	mm_signalmgr_free(&machine->signal_mgr, &machine->loop);
+	mm_loop_shutdown(&machine->loop);
+	mm_scheduler_free(&machine->scheduler);
+}
+
+static inline void free_tls_container(struct mm_tls_ctx *ctx_container)
+{
+	while (ctx_container != NULL) {
+		struct mm_tls_ctx *next = ctx_container->next;
+
+		mm_tls_ctx_free(ctx_container);
+
+		ctx_container = next;
+	}
+}
+
+static void *machine_main(void *arg)
+{
+	mm_machine_t *machine = arg;
+	mm_self = machine;
+
+	mm_thread_disable_cancel();
+
+	/* set thread name */
+	if (machine->name) {
+		mm_thread_set_name(machine->name);
+	}
+#ifdef HAVE_TSAN
+	char name[256];
+	if (machine->name) {
+		snprintf(name, sizeof(name), "%s (in machine_main)",
+			 machine->name);
+	} else {
+		snprintf(name, sizeof(name),
+			 "Machine ID: %" PRIu64 " (in machine_main)",
+			 mm_self->id);
+	}
+	__tsan_set_fiber_name(__tsan_get_current_fiber(), name);
+#endif
+
+	mm_lrand48_seed();
+
+	/* create main coroutine */
+	int64_t id;
+	id = machine_coroutine_create_system(machine->main, machine->main_arg,
+					     machine->name);
+	(void)id;
+
+	/* run main loop */
+	atomic_store(&machine->online, 1);
+	for (;;) {
+		if (!(mm_scheduler_online(&machine->scheduler) &&
+		      atomic_load(&machine->online))) {
+			break;
+		}
+		mm_loop_step(&machine->loop);
+	}
+
+	if (machine->global_dtor != NULL) {
+		machine->global_dtor(machine->thread_global_private);
+	}
+
+	free_tls_container(machine->client_tls_ctx);
+
+	free_tls_container(machine->server_tls_ctx);
+
+	for (size_t i = 0; i < machine->natexit; ++i) {
+		mm_machine_atexit_entry_t *e = &machine->atexit[i];
+		e->fptr(e->arg);
+	}
+
+	mm_wait_flag_set(machine->join_flag);
+
+	atomic_store(&machine->online, 0);
+	machine_instance_free(machine);
+
+	return NULL;
+}
+
+static int64_t machine_create_impl(int64_t forced_id, char *name,
+				   machine_coroutine_t function, void *arg)
+{
+	mm_machine_t *machine;
+	machine = mm_malloc(sizeof(*machine));
+	if (machine == NULL) {
+		return -1;
+	}
+	atomic_init(&machine->online, 0);
+	machine->id = 0;
+	machine->main = function;
+	machine->main_arg = arg;
+	machine->server_tls_ctx = NULL;
+	machine->client_tls_ctx = NULL;
+	machine->name = NULL;
+	machine->global_dtor = NULL;
+	machine->natexit = 0;
+	memset(machine->atexit, 0, sizeof(machine->atexit));
+#ifdef MM_MEM_PROF
+	machine->allocated_bytes = 0;
+	machine->freed_bytes = 0;
+#endif
+
+	machine->join_flag = mm_wait_flag_create();
+	if (machine->join_flag == NULL) {
+		mm_free(machine);
+		mm_errno_set(ENOMEM);
+		return -1;
+	}
+
+	if (name) {
+		machine->name = mm_strdup(name);
+		if (machine->name == NULL) {
+			mm_free(machine);
+			return -1;
+		}
+	}
+	mm_list_init(&machine->link);
+
+	mm_msgcache_init(&machine->msg_cache);
+	mm_msgcache_set_gc_watermark(&machine->msg_cache,
+				     machinarium.config.msg_cache_gc_size);
+	mm_msgcache_set_gc_count_watermark(
+		&machine->msg_cache, machinarium.config.msg_cache_gc_count);
+
+	mm_coroutine_cache_init(&machine->system_coroutine_cache,
+				machinarium.config.system_stack_size *
+					machinarium.config.page_size,
+				machinarium.config.page_size,
+				machinarium.config.coroutine_cache_size);
+
+	mm_coroutine_cache_init(&machine->general_coroutine_cache,
+				machinarium.config.stack_size *
+					machinarium.config.page_size,
+				machinarium.config.page_size,
+				machinarium.config.coroutine_cache_size);
+
+	mm_scheduler_init(&machine->scheduler);
+	int rc;
+	rc = mm_loop_init(&machine->loop);
+	if (rc < 0) {
+		mm_scheduler_free(&machine->scheduler);
+		mm_free(machine);
+		return -1;
+	}
+	mm_loop_set_idle(&machine->loop, mm_idle_cb, NULL);
+	rc = mm_eventmgr_init(&machine->event_mgr, &machine->loop);
+	if (rc == -1) {
+		mm_loop_shutdown(&machine->loop);
+		mm_scheduler_free(&machine->scheduler);
+		mm_free(machine);
+		return -1;
+	}
+	rc = mm_signalmgr_init(&machine->signal_mgr, &machine->loop);
+	if (rc == -1) {
+		mm_eventmgr_free(&machine->event_mgr, &machine->loop);
+		mm_loop_shutdown(&machine->loop);
+		mm_scheduler_free(&machine->scheduler);
+		mm_free(machine);
+		return -1;
+	}
+	if (forced_id >= 0) {
+		mm_machinemgr_add_with_id(&machinarium.machine_mgr, machine,
+					  (uint64_t)forced_id);
+	} else {
+		mm_machinemgr_add(&machinarium.machine_mgr, machine);
+	}
+
+	rc = mm_thread_create(&machine->thread, 0, machine_main, machine);
+	if (rc == -1) {
+		mm_machinemgr_delete(&machinarium.machine_mgr, machine);
+		mm_eventmgr_free(&machine->event_mgr, &machine->loop);
+		mm_loop_shutdown(&machine->loop);
+		mm_scheduler_free(&machine->scheduler);
+		mm_free(machine);
+		return -1;
+	}
+	return machine->id;
+}
+
+MACHINE_API int64_t machine_reserve_ids(int count)
+{
+	if (count <= 0) {
+		mm_errno_set(EINVAL);
+		return -1;
+	}
+
+	mm_machinemgr_t *mgr = &machinarium.machine_mgr;
+	mm_spinlock_lock(&mgr->lock);
+	uint64_t base = mgr->seq;
+	mgr->seq += (uint64_t)count;
+	mm_spinlock_unlock(&mgr->lock);
+	return (int64_t)base;
+}
+
+MACHINE_API int64_t machine_create_at(uint64_t machine_id, char *name,
+				      machine_coroutine_t function, void *arg)
+{
+	return machine_create_impl((int64_t)machine_id, name, function, arg);
+}
+
+MACHINE_API int64_t machine_create(char *name, machine_coroutine_t function,
+				   void *arg)
+{
+	return machine_create_impl(-1, name, function, arg);
+}
+
+MACHINE_API int machine_wait(uint64_t machine_id)
+{
+	mm_machine_t *machine;
+	machine = mm_machinemgr_delete_by_id(&machinarium.machine_mgr,
+					     machine_id);
+	if (machine == NULL) {
+		return -1;
+	}
+	int rc;
+	rc = mm_thread_join(&machine->thread);
+	if (machine->name) {
+		mm_free(machine->name);
+	}
+
+	mm_wait_flag_destroy(machine->join_flag);
+	mm_free(machine);
+	return rc;
+}
+
+int machine_wait_nb(uint64_t machine_id)
+{
+	mm_machine_t *machine;
+	machine = mm_machinemgr_delete_by_id(&machinarium.machine_mgr,
+					     machine_id);
+	if (machine == NULL) {
+		return -1;
+	}
+	int rc;
+	rc = mm_wait_flag_wait(machine->join_flag, UINT32_MAX);
+	mm_thread_join(&machine->thread);
+	if (machine->name) {
+		mm_free(machine->name);
+	}
+
+	mm_wait_flag_destroy(machine->join_flag);
+	mm_free(machine);
+	return rc;
+}
+
+MACHINE_API int machine_stop(uint64_t machine_id)
+{
+	mm_machine_t *machine;
+	machine = mm_machinemgr_delete_by_id(&machinarium.machine_mgr,
+					     machine_id);
+	if (machine == NULL) {
+		return -1;
+	}
+	atomic_store(&machine->online, 0);
+	return 0;
+}
+
+MACHINE_API int machine_active(void)
+{
+	return atomic_load(&mm_self->online);
+}
+
+MACHINE_API uint64_t machine_self(void)
+{
+	return mm_self->id;
+}
+
+MACHINE_API void **machine_thread_private(void)
+{
+	return &(mm_self->thread_global_private);
+}
+
+MACHINE_API void machine_stop_current(void)
+{
+	atomic_store(&mm_self->online, 0);
+}
+
+void machine_set_global_dtor(void (*dtor)(void *gl))
+{
+	mm_self->global_dtor = dtor;
+}
+
+enum {
+	MM_CORO_SYSTEM = 1 << 0,
+};
+
+static inline mm_coroutine_t *
+mm_coroutine_create_internal(machine_coroutine_t function, void *arg,
+			     const char *name, int flags)
+{
+	mm_errno_set(0);
+
+	mm_coroutine_cache_t *cache;
+	if (flags & MM_CORO_SYSTEM) {
+		cache = &mm_self->system_coroutine_cache;
+	} else {
+		cache = &mm_self->general_coroutine_cache;
+	}
+
+	mm_coroutine_t *coroutine;
+	coroutine = mm_coroutine_cache_pop(cache);
+	if (coroutine == NULL) {
+		mm_errno_set(ENOMEM);
+		return NULL;
+	}
+	mm_scheduler_new(&mm_self->scheduler, coroutine, function, arg);
+
+	mm_coroutine_set_name(coroutine, name);
+
+	return coroutine;
+}
+
+MACHINE_API int64_t machine_coroutine_create(machine_coroutine_t function,
+					     void *arg)
+{
+	mm_coroutine_t *coroutine;
+	coroutine = mm_coroutine_create_internal(function, arg, NULL, 0);
+	if (coroutine == NULL) {
+		return -1;
+	}
+
+	return coroutine->id;
+}
+
+MACHINE_API int64_t machine_coroutine_create_named(machine_coroutine_t function,
+						   void *arg, const char *name)
+{
+	mm_coroutine_t *coroutine;
+	coroutine = mm_coroutine_create_internal(function, arg, name, 0);
+	if (coroutine == NULL) {
+		return -1;
+	}
+
+	return coroutine->id;
+}
+
+MACHINE_API int64_t machine_coroutine_create_system(
+	machine_coroutine_t function, void *arg, const char *name)
+{
+	mm_coroutine_t *coroutine;
+	coroutine = mm_coroutine_create_internal(function, arg, name,
+						 MM_CORO_SYSTEM);
+	if (coroutine == NULL) {
+		return -1;
+	}
+
+	return coroutine->id;
+}
+
+MACHINE_API void machine_sleep(uint32_t time_ms)
+{
+	mm_errno_set(0);
+	mm_call_t call;
+	mm_call(&call, MM_CALL_SLEEP, time_ms);
+}
+
+MACHINE_API int machine_join(uint64_t coroutine_id)
+{
+	mm_errno_set(0);
+	if (coroutine_id == mm_self->scheduler.current->id) {
+		mm_errno_set(EINVAL);
+		return -1;
+	}
+
+	mm_coroutine_t *coroutine;
+	coroutine = mm_scheduler_find(&mm_self->scheduler, coroutine_id);
+	if (coroutine == NULL) {
+		mm_errno_set(ENOENT);
+		return -1;
+	}
+	mm_coroutine_t *waiter;
+	waiter = mm_scheduler_current(&mm_self->scheduler);
+	mm_scheduler_join(coroutine, waiter);
+	mm_scheduler_yield(&mm_self->scheduler);
+	return 0;
+}
+
+MACHINE_API int machine_cancel(uint64_t coroutine_id)
+{
+	mm_errno_set(0);
+	mm_coroutine_t *coroutine;
+	coroutine = mm_scheduler_find(&mm_self->scheduler, coroutine_id);
+	if (coroutine == NULL) {
+		mm_errno_set(ENOENT);
+		return -1;
+	}
+	mm_coroutine_cancel(coroutine);
+	return 0;
+}
+
+MACHINE_API const char *machine_coroutine_get_name(uint64_t coroutine_id)
+{
+	mm_errno_set(0);
+	mm_coroutine_t *coroutine;
+	coroutine = mm_scheduler_find(&mm_self->scheduler, coroutine_id);
+	if (coroutine == NULL) {
+		mm_errno_set(ENOENT);
+		return NULL;
+	}
+
+	return mm_coroutine_get_name(coroutine);
+}
+
+MACHINE_API int machine_cancelled(void)
+{
+	mm_coroutine_t *coroutine;
+	coroutine = mm_scheduler_current(&mm_self->scheduler);
+	if (coroutine == NULL) {
+		return -1;
+	}
+	return coroutine->cancel > 0;
+}
+
+MACHINE_API int machine_timedout(void)
+{
+	return mm_errno_get() == ETIMEDOUT;
+}
+
+MACHINE_API int machine_errno(void)
+{
+	return mm_errno_get();
+}
+
+MACHINE_API int machine_errno_retryable(int errno_)
+{
+	return errno_ == EAGAIN || errno_ == EWOULDBLOCK || errno_ == EINTR;
+}
+
+/* See also accept(2) */
+MACHINE_API int machine_accept_errno_retryable(int errno_)
+{
+	if (machine_errno_retryable(errno_)) {
+		return 1;
+	}
+
+	switch (errno_) {
+	case ENETDOWN:
+	case EPROTO:
+	case ENOPROTOOPT:
+	case EHOSTDOWN:
+#ifdef ENONET
+	case ENONET:
+#endif
+	case EHOSTUNREACH:
+	case EOPNOTSUPP:
+	case ENETUNREACH:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+MACHINE_API uint64_t machine_time_ms(void)
+{
+	mm_clock_update(&mm_self->loop.clock);
+	return mm_self->loop.clock.time_ms;
+}
+
+MACHINE_API uint64_t machine_time_us(void)
+{
+	mm_clock_update(&mm_self->loop.clock);
+	return mm_self->loop.clock.time_us;
+}
+
+MACHINE_API int64_t machine_timeofday_sec(void)
+{
+	mm_clock_update(&mm_self->loop.clock);
+	return mm_self->loop.clock.time_sec;
+}
+
+MACHINE_API void
+machine_stat(uint64_t *coroutine_count, uint64_t *coroutine_cache_count,
+	     uint64_t *msg_allocated, uint64_t *msg_cache_count,
+	     uint64_t *msg_cache_gc_count, uint64_t *msg_cache_size)
+{
+	uint64_t general_coroutine_count = 0;
+	uint64_t general_coroutine_cache_count = 0;
+	uint64_t system_coroutine_count = 0;
+	uint64_t system_coroutine_cache_count = 0;
+
+	mm_coroutine_cache_stat(&mm_self->general_coroutine_cache,
+				&general_coroutine_count,
+				&general_coroutine_cache_count);
+
+	mm_coroutine_cache_stat(&mm_self->system_coroutine_cache,
+				&system_coroutine_count,
+				&system_coroutine_cache_count);
+
+	*coroutine_count = general_coroutine_count + system_coroutine_count;
+	*coroutine_cache_count =
+		general_coroutine_cache_count + system_coroutine_cache_count;
+
+	mm_msgcache_stat(&mm_self->msg_cache, msg_allocated, msg_cache_gc_count,
+			 msg_cache_count, msg_cache_size);
+}
+
+void mm_machine_atexit(void (*fun)(void *), void *arg)
+{
+	mm_machine_t *s = mm_self;
+	if (s->natexit == MM_MACHINE_MAX_ATEXIT) {
+		abort();
+	}
+
+	mm_machine_atexit_entry_t *e = &s->atexit[s->natexit++];
+
+	e->fptr = fun;
+	e->arg = arg;
+}
+
+MACHINE_API int machinarium_check_stack_depth(void)
+{
+	if (mm_self == NULL) {
+		return 0;
+	}
+
+	mm_coroutine_t *coro = mm_self->scheduler.current;
+	if (coro == NULL) {
+		return 0;
+	}
+
+	uintptr_t sp;
+	uintptr_t base = (uintptr_t)coro->stack.pointer;
+	uintptr_t end = base + coro->stack.size;
+
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_frame_address)
+	sp = (uintptr_t)__builtin_frame_address(0);
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
+	sp = (uintptr_t)__builtin_frame_address(0);
+#else
+	int unused = 42;
+	sp = (uintptr_t)(&unused);
+#endif
+
+	if (sp > end) {
+		return 0;
+	}
+
+	return (end - sp) >= coro->stack.max_depth;
+}

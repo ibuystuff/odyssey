@@ -3,216 +3,676 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
+#include <odyssey.h>
+
 #include <signal.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <sys/resource.h>
+#include <sys/types.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/console.h"
-#include "sources/system.h"
-#include "sources/cron.h"
-#include "sources/worker.h"
-#include "sources/worker_pool.h"
-#include "sources/frontend.h"
+#include <machinarium/machinarium.h>
 
-void od_instance_init(od_instance_t *instance)
+#include <status.h>
+#include <daemon.h>
+#include <types.h>
+#include <instance.h>
+#include <router.h>
+#include <global.h>
+#include <option.h>
+#include <pstmt.h>
+#include <hba.h>
+#include <hba_rule.h>
+#include <cron.h>
+#include <worker_pool.h>
+#include <system.h>
+#include <extension.h>
+#include <util.h>
+#include <cfg/reader.h>
+#include <cfg/convert.h>
+#include <cfg_import.h>
+
+int od_cfg_import(od_logger_t *logger, od_config_t *config, od_rules_t *rules,
+		  od_global_t *global, od_hba_rules_t *hba_rules,
+		  const char *config_file)
 {
+	return od_cfg_import_with_autoconf(logger, config, rules, global,
+					   hba_rules, config_file, NULL);
+}
+
+int od_cfg_import_with_autoconf(od_logger_t *logger, od_config_t *config,
+				od_rules_t *rules, od_global_t *global,
+				od_hba_rules_t *hba_rules,
+				const char *config_file,
+				const char *autoconf_file)
+{
+	od_cfg_model_t model;
+	od_cfg_diag_list_t diags;
+
+	od_cfg_model_init(&model);
+	od_cfg_diag_list_init(&diags);
+
+	int rc = od_cfg_parse_file_with_autoconf(config_file, autoconf_file,
+						 &model, &diags);
+
+	for (size_t i = 0; i < diags.count; i++) {
+		od_cfg_diag_t *d = &diags.items[i];
+		const char *fname = d->location.filename ?
+					    d->location.filename :
+					    config_file;
+		if (d->level == OD_CFG_DIAG_WARNING) {
+			od_log(logger, NULL, NULL, "%s:%d:%d: warning: %s",
+			       fname, d->location.first_line,
+			       d->location.first_column, d->message);
+		} else {
+			od_error(logger, NULL, NULL, "%s:%d:%d: %s", fname,
+				 d->location.first_line,
+				 d->location.first_column, d->message);
+		}
+		if (d->hint != NULL) {
+			od_error(logger, NULL, NULL, "  hint: %s", d->hint);
+		}
+	}
+
+	if (rc != 0 || od_cfg_diag_has_errors(&diags)) {
+		od_cfg_diag_list_free(&diags);
+		od_cfg_model_free(&model);
+		return -1;
+	}
+
+	od_cfg_diag_list_free(&diags);
+	od_cfg_diag_list_init(&diags);
+
+	rc = od_cfg_convert_model(&model, config, rules, global, hba_rules,
+				  &diags);
+
+	for (size_t i = 0; i < diags.count; i++) {
+		od_cfg_diag_t *d = &diags.items[i];
+		const char *fname = d->location.filename ?
+					    d->location.filename :
+					    config_file;
+		if (d->level == OD_CFG_DIAG_WARNING) {
+			od_log(logger, NULL, NULL, "%s:%d:%d: warning: %s",
+			       fname, d->location.first_line,
+			       d->location.first_column, d->message);
+		} else {
+			od_error(logger, NULL, NULL, "%s:%d:%d: %s", fname,
+				 d->location.first_line,
+				 d->location.first_column, d->message);
+		}
+		if (d->hint != NULL) {
+			od_error(logger, NULL, NULL, "  hint: %s", d->hint);
+		}
+	}
+
+	int has_errors = od_cfg_diag_has_errors(&diags);
+	od_cfg_diag_list_free(&diags);
+	od_cfg_model_free(&model);
+
+	return (rc != 0 || has_errors) ? -1 : 0;
+}
+
+void fill_supported_features_string(char *out, size_t max)
+{
+	char *end = out + max;
+
+	memset(out, 0, max);
+
+#ifdef PAM_FOUND
+	out += od_snprintf(out, end - out, " +pam");
+#else
+	out += od_snprintf(out, end - out, " -pam");
+#endif
+
+#ifdef LDAP_FOUND
+	out += od_snprintf(out, end - out, " +ldap");
+#else
+	out += od_snprintf(out, end - out, " -ldap");
+#endif
+
+#ifdef HAVE_SYSTEMD
+	out += od_snprintf(out, end - out, " +systemd");
+#else
+	out += od_snprintf(out, end - out, " -systemd");
+#endif
+
+#if defined(PROM_FOUND) && defined(PROM_HTTP_FOUND)
+	out += od_snprintf(out, end - out, " +prom");
+#else
+	out += od_snprintf(out, end - out, " -prom");
+#endif
+}
+
+static inline void free_cmdline(od_instance_t *instance)
+{
+	if (instance->cmdline.envp != NULL) {
+		int i = 0;
+		while (instance->cmdline.envp[i] != NULL) {
+			od_free(instance->cmdline.envp[i]);
+			++i;
+		}
+
+		od_free(instance->cmdline.envp);
+		instance->cmdline.envp = NULL;
+	}
+
+	for (int i = 0; i < instance->cmdline.argc; ++i) {
+		od_free(instance->cmdline.argv[i]);
+	}
+	od_free(instance->cmdline.argv);
+	instance->cmdline.argv = NULL;
+
+	instance->cmdline.argc = 0;
+}
+
+od_instance_t *od_instance_create(void)
+{
+	od_instance_t *instance = od_malloc(sizeof(od_instance_t));
+	if (instance == NULL) {
+		return NULL;
+	}
+
 	od_pid_init(&instance->pid);
+
 	od_logger_init(&instance->logger, &instance->pid);
 	od_config_init(&instance->config);
-	od_idmgr_init(&instance->id_mgr);
-	shapito_cache_init(&instance->stream_cache);
+
 	instance->config_file = NULL;
-	instance->is_shared = 0;
+
+	instance->pstmts = NULL;
+
+	atomic_store(&instance->config_load_failed, 0);
+
+	instance->cmdline.argc = 0;
+	instance->cmdline.argv = NULL;
+	instance->cmdline.envp = NULL;
 
 	sigset_t mask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, OD_SIG_LOG_ROTATE);
+	sigaddset(&mask, OD_SIG_ONLINE_RESTART);
 	sigaddset(&mask, SIGHUP);
 	sigaddset(&mask, SIGPIPE);
 	sigprocmask(SIG_BLOCK, &mask, NULL);
+
+	return instance;
 }
 
 void od_instance_free(od_instance_t *instance)
 {
-	if (instance->config.pid_file)
+	free_cmdline(instance);
+
+	if (instance->config.pid_file &&
+	    od_pid_restart_new_get(&instance->pid) == -1) {
 		od_pid_unlink(&instance->pid, instance->config.pid_file);
+	}
 	od_config_free(&instance->config);
+
+	if (instance->pstmts != NULL) {
+		od_global_pstmts_map_free(instance->pstmts);
+	}
+	od_global_clients_map_free(instance->clients_by_key);
+
+	/* as mallocd on start */
+	od_free(instance->config_file);
+	od_free(instance->exec_path);
 	od_logger_close(&instance->logger);
-	shapito_cache_free(&instance->stream_cache);
 	machinarium_free();
+
+	od_free(instance);
 }
 
-static inline void
-od_usage(od_instance_t *instance, char *path)
+void od_usage(od_instance_t *instance, char *path)
 {
-	od_log(&instance->logger, "init", NULL, NULL,
-	       "odyssey (git: %s %s)",
-	       OD_VERSION_GIT,
-	       OD_VERSION_BUILD);
-	od_log(&instance->logger, "init", NULL, NULL,
-	       "usage: %s <config_file>", path);
+	od_log(&instance->logger, NULL, NULL, "%s %s", ODYSSEY_NAME,
+	       ODYSSEY_VERSION_FULL);
+	od_log(&instance->logger, NULL, NULL, "usage: %s <config_file>", path);
 }
 
-int od_instance_main(od_instance_t *instance, int argc, char **argv)
+int od_cfg_check(od_logger_t *logger, const char *config_file,
+		 const char *autoconf_file)
 {
-	/* validate command line options */
-	if (argc != 2) {
-		od_usage(instance, argv[0]);
+	/* Validation must not access or update running services. */
+	od_global_t global = { 0 };
+
+	od_config_t config;
+	od_config_init(&config);
+
+	od_rules_t rules;
+	od_rules_init(&rules);
+
+	od_hba_rules_t hba_rules;
+	od_hba_rules_init(&hba_rules);
+
+	/* the same checks as od_system_config_reload(), nothing is applied */
+	int rc = od_cfg_import_with_autoconf(logger, &config, &rules, &global,
+					     &hba_rules, config_file,
+					     autoconf_file);
+	if (rc == 0) {
+		rc = od_config_validate(&config, logger);
+	}
+	if (rc == 0) {
+		rc = od_rules_validate(&rules, &config, logger);
+	}
+
+	od_hba_rules_free(&hba_rules);
+	/* od_rules_free() keeps the storages, they are released separately */
+	od_rules_cleanup(&rules);
+	od_rules_free(&rules);
+	od_config_free(&config);
+	return rc == 0 ? 0 : -1;
+}
+
+int od_config_testing(od_instance_t *instance)
+{
+	if (od_cfg_check(&instance->logger, instance->config_file, NULL) != 0) {
+		return 1;
+	}
+
+	od_log(&instance->logger, NULL, NULL, "config is valid");
+	return 0;
+}
+
+static inline od_retcode_t od_args_init(od_arguments_t *args,
+					od_instance_t *instance)
+{
+	args->silent = 0;
+	args->verbose = 0;
+	args->console = 0;
+	args->test = 0;
+	args->instance = instance;
+	return OK_RESPONSE;
+}
+
+static inline int fill_cmdline(od_instance_t *instance, int argc, char **argv,
+			       char **envp)
+{
+	instance->cmdline.argv =
+		od_malloc(sizeof(char *) * (argc + 1 /* for NULL */));
+	if (instance->cmdline.argv == NULL) {
 		return -1;
 	}
-	if (strcmp(argv[1], "-h") == 0 ||
-	    strcmp(argv[1], "--help") == 0) {
-		od_usage(instance, argv[0]);
-		return 0;
+	memset(instance->cmdline.argv, 0,
+	       sizeof(char *) * (argc + 1 /* for NULL */));
+
+	for (int i = 0; i < argc; ++i) {
+		instance->cmdline.argv[i] = od_strdup(argv[i]);
+		if (instance->cmdline.argv[i] == NULL) {
+			instance->cmdline.argc = i;
+			goto error;
+		}
 	}
-	instance->config_file = argv[1];
+	instance->cmdline.argv[argc] = NULL;
+
+	instance->cmdline.argc = argc;
+
+	int count = 0;
+	while (envp[count] != NULL) {
+		++count;
+	}
+
+	instance->cmdline.envp =
+		od_malloc(sizeof(char *) * (count + 1 /* for NULL */));
+	if (instance->cmdline.envp == NULL) {
+		goto error;
+	}
+
+	memset(instance->cmdline.envp, 0,
+	       sizeof(char *) * (count + 1 /* for NULL */));
+
+	for (int i = 0; i < count; ++i) {
+		instance->cmdline.envp[i] = od_strdup(envp[i]);
+		if (instance->cmdline.envp[i] == NULL) {
+			goto error;
+		}
+	}
+
+	instance->cmdline.envp[count] = NULL;
+
+	return 0;
+
+error:
+	free_cmdline(instance);
+	return -1;
+}
+
+char *od_instance_getenv(od_instance_t *instance, const char *name)
+{
+	int len = strlen(name);
+
+	for (int i = 0; instance->cmdline.envp[i] != NULL; ++i) {
+		if (strncmp(instance->cmdline.envp[i], name, len) == 0 &&
+		    instance->cmdline.envp[i][len] == '=') {
+			return &(instance->cmdline.envp[i][len + 1]);
+		}
+	}
+
+	return NULL;
+}
+
+int od_instance_main(od_instance_t *instance, int argc, char **argv,
+		     char **envp)
+{
+	od_arguments_t args;
+	memset(&args, 0, sizeof(args));
+
+	/* odyssey accept only ONE positional arg - to path config */
+	if (od_args_init(&args, instance) != OK_RESPONSE) {
+		return NOT_OK_RESPONSE;
+	}
+	instance->exec_path = od_strdup(argv[0]);
+	if (instance->exec_path == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+	/* validate command line options */
+	od_parse_args(argc, argv, &args);
+
+	od_log(&instance->logger, NULL, NULL, "Starting Odyssey");
+
+	if (fill_cmdline(instance, argc, argv, envp) != 0) {
+		od_error(&instance->logger, NULL, NULL,
+			 "can't preserve main arguments");
+		return NOT_OK_RESPONSE;
+	}
+
+	/* prepare system services */
+	od_router_t router;
+	od_cron_t cron;
+	od_worker_pool_t worker_pool;
+	od_hba_t hba;
+	od_extension_t *extensions = NULL;
+	od_system_t *system = NULL;
+	od_global_t *global = NULL;
+	bool router_initialized = false;
+	bool cron_initialized = false;
+
+	extensions = od_extensions_create();
+	if (extensions == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to extensions init");
+		goto error;
+	}
+
+	system = od_system_create();
+	if (system == NULL) {
+		goto error;
+	}
+
+	od_router_init(&router, NULL /* will set global later */);
+	router_initialized = true;
+
+	if (od_cron_init(&cron) != 0) {
+		od_error(&instance->logger, NULL, NULL, "failed to init cron");
+		goto error;
+	}
+	cron_initialized = true;
+
+	od_worker_pool_init(&worker_pool);
+
+	od_hba_init(&hba);
+
+	global = od_global_create(instance, system, &router, &cron,
+				  &worker_pool, extensions, &hba);
+	if (global == NULL) {
+		goto error;
+	}
+
+	router.global = global;
 
 	/* read config file */
-	od_error_t error;
-	od_error_init(&error);
-
 	int rc;
-	rc = od_configreader_import(&instance->config, &error, instance->config_file);
+	rc = od_cfg_import(&instance->logger, &instance->config, &router.rules,
+			   global, &hba.rules, instance->config_file);
 	if (rc == -1) {
-		od_error(&instance->logger, "config", NULL, NULL, "%s", error.error);
-		return -1;
+		goto error;
 	}
 
-	/* validate configuration config */
+	rc = od_apply_validate_cli_args(&instance->logger, &instance->config,
+					&args, &router.rules);
+	if (rc != OK_RESPONSE) {
+		goto error;
+	}
+
+	/* validate configuration */
 	rc = od_config_validate(&instance->config, &instance->logger);
-	if (rc == -1)
-		return -1;
+	if (rc == -1) {
+		goto error;
+	}
 
-	/* set log format */
-	od_logger_set_format(&instance->logger, instance->config.log_format);
+	/* validate rules */
+	rc = od_rules_validate(&router.rules, &instance->config,
+			       &instance->logger);
+	if (rc == -1) {
+		goto error;
+	}
 
-	/* set log debug messages */
-	od_logger_set_debug(&instance->logger, instance->config.log_debug);
+	/* auto-generate default rule for auth_query if none specified */
+	rc = od_rules_autogenerate_defaults(&router.rules, &instance->logger);
 
-	/* set log to stdout */
-	od_logger_set_stdout(&instance->logger, instance->config.log_to_stdout);
+	od_rules_sort_for_matching(&router.rules);
 
-	/* set cache limits */
-	shapito_cache_set_limit(&instance->stream_cache, instance->config.cache);
-	shapito_cache_set_limit_size(&instance->stream_cache, instance->config.cache_chunk);
+	if (rc == -1) {
+		goto error;
+	}
 
-	/* run as daemon */
-	if (instance->config.daemonize) {
+	/*
+	 * run as daemon
+	 * should not daemonize when process was born by online restart
+	 */
+	if (instance->pid.restart_ppid == -1 && instance->config.daemonize) {
 		rc = od_daemonize();
-		if (rc == -1)
-			return -1;
+		if (rc == -1) {
+			goto error;
+		}
 		/* update pid */
 		od_pid_init(&instance->pid);
 	}
 
-	/* init machinarium machinery */
-	machinarium_set_pool_size(instance->config.resolvers);
-	machinarium_set_coroutine_cache_size(instance->config.cache_coroutine);
-	machinarium_init();
+#ifdef PROM_FOUND
+	rc = od_prom_metrics_init(cron.metrics);
+	if (rc != OK_RESPONSE) {
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to initialize metrics");
+		goto error;
+	}
+#ifdef PROMHTTP_FOUND
+	if (instance->config.log_route_stats_prom) {
+		rc = od_prom_activate_route_metrics(cron.metrics);
+		if (rc != OK_RESPONSE) {
+			od_error(&instance->logger, NULL, NULL, "%s",
+				 "could not activate prom_http server");
+			goto error;
+		}
+	} else if (instance->config.log_general_stats_prom) {
+		rc = od_prom_activate_general_metrics(cron.metrics);
+		if (rc != OK_RESPONSE) {
+			od_error(&instance->logger, NULL, NULL, "%s",
+				 "could not activate prom_http server");
+			goto error;
+		}
+	}
+#endif
+#endif
 
 	/* reopen log file after config parsing */
 	if (instance->config.log_file) {
-		rc = od_logger_open(&instance->logger, instance->config.log_file);
+		rc = od_logger_open(&instance->logger,
+				    instance->config.log_file);
 		if (rc == -1) {
-			od_error(&instance->logger, "init", NULL, NULL,
-			         "failed to open log file '%s'",
-			         instance->config.log_file);
-			return -1;
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to open log file '%s'",
+				 instance->config.log_file);
+			goto error;
 		}
 	}
+
+	/* configure logger */
+	od_logger_set_format(&instance->logger, instance->config.log_format);
+	od_logger_set_debug(&instance->logger, instance->config.log_debug,
+			    instance->config.log_debug_sampling);
+	od_logger_set_stdout(&instance->logger, instance->config.log_to_stdout);
+	od_logger_set_async(&instance->logger, instance->config.log_async);
+	od_logger_set_queue_depth(&instance->logger,
+				  instance->config.log_queue_depth);
 
 	/* syslog */
 	if (instance->config.log_syslog) {
 		od_logger_open_syslog(&instance->logger,
-		                      instance->config.log_syslog_ident,
-		                      instance->config.log_syslog_facility);
+				      instance->config.log_syslog_ident,
+				      instance->config.log_syslog_facility);
 	}
-	od_log(&instance->logger, "init", NULL, NULL, "odyssey (git: %s %s)",
-	       OD_VERSION_GIT,
-	       OD_VERSION_BUILD);
-	od_log(&instance->logger, "init", NULL, NULL, "");
+
+	char features[128];
+	fill_supported_features_string(features, sizeof(features));
+
+#ifdef ODYSSEY_VERSION_GIT
+	od_log(&instance->logger, NULL, NULL, "%s %s (git: %s) %s%s",
+	       ODYSSEY_NAME, ODYSSEY_VERSION_NUMBER, ODYSSEY_VERSION_GIT,
+	       ODYSSEY_BUILD_TYPE, features);
+#else
+	od_log(&instance->logger, NULL, NULL, "%s %s %s%s", ODYSSEY_NAME,
+	       ODYSSEY_VERSION_NUMBER, ODYSSEY_BUILD_TYPE, features);
+#endif
 
 	/* print configuration */
-	od_log(&instance->logger, "init", NULL, NULL, "using configuration file '%s'",
+	od_log(&instance->logger, NULL, NULL, "using configuration file '%s'",
 	       instance->config_file);
-	od_log(&instance->logger, "init", NULL, NULL, "");
 
-	if (instance->config.log_config)
-		od_config_print(&instance->config, &instance->logger, 0);
+	if (instance->config.log_config) {
+		od_config_print(&instance->config, &instance->logger);
+		od_rules_print(&router.rules, &instance->logger);
+		if (instance->config.hba_file) {
+			od_hba_rules_print(&hba, &instance->logger);
+		}
+	}
+
+	/* set process priority */
+	if (instance->config.priority != 0) {
+		int rc;
+		rc = setpriority(PRIO_PROCESS, 0, instance->config.priority);
+		if (rc == -1) {
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to set process priority: %s",
+				 strerror(errno));
+			goto error;
+		}
+	}
+
+	/* initialize machinarium */
+	machinarium_set_stack_size(instance->config.coroutine_stack_size);
+	machinarium_set_system_stack_size(
+		instance->config.system_coroutine_stack_size);
+	machinarium_set_pool_size(instance->config.resolvers);
+	machinarium_set_coroutine_cache_size(instance->config.cache_coroutine);
+	machinarium_set_msg_cache_gc_size(instance->config.cache_msg_gc_size);
+	machinarium_set_msg_cache_gc_count(instance->config.cache_msg_gc_count);
+	machinarium_set_dns_ttl_ms(instance->config.dns_cache_ttl_ms);
+	rc = machinarium_init();
+	if (rc == -1) {
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to init machinarium");
+		goto error;
+	}
 
 	/* create pid file */
-	if (instance->config.pid_file)
-		od_pid_create(&instance->pid, instance->config.pid_file);
+	if (instance->config.pid_file) {
+		rc = od_pid_create(&instance->pid, instance->config.pid_file);
+		if (rc == -1) {
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to create pid file %s: %s",
+				 instance->config.pid_file, strerror(errno));
+			goto error;
+		}
+	}
 
-	/* seed id manager */
-	od_idmgr_seed(&instance->id_mgr);
+	/* start aync logging thread if needed */
+	od_logger_load(&instance->logger);
 
-	/* is multi-worker deploy */
-	instance->is_shared = instance->config.workers > 1;
+	if (instance->config.soft_oom.enabled) {
+		rc = od_soft_oom_start_checker(&instance->config.soft_oom,
+					       &global->soft_oom);
+		if (rc != OK_RESPONSE) {
+			goto error;
+		}
+	}
 
-	/* prepare global services */
-	od_system_t system;
-	od_system_init(&system);
-
-	od_router_t router;
-	od_console_t console;
-	od_cron_t cron;
-	od_workerpool_t worker_pool;
-
-	od_global_t *global;
-	global = &system.global;
-	global->instance    = instance;
-	global->system      = &system;
-	global->router      = &router;
-	global->console     = &console;
-	global->cron        = &cron;
-	global->worker_pool = &worker_pool;
-
-	od_router_init(&router, global);
-	od_console_init(&console, global);
-	od_cron_init(&cron, global);
-	od_workerpool_init(&worker_pool);
+	if (instance->config.host_watcher_enabled) {
+		rc = od_host_watcher_init(&global->host_watcher);
+		if (rc != OK_RESPONSE) {
+			goto error;
+		}
+	}
 
 	/* start system machine thread */
-	rc = od_system_start(&system);
-	if (rc == -1)
-		return -1;
+	rc = od_system_start(system, global);
+	if (rc == -1) {
+		goto error;
+	}
 
-	machine_wait(system.machine);
-	return 0;
+	rc = machine_wait(system->machine);
+
+	return rc;
+
+error:
+	if (cron_initialized) {
+		od_cron_free(&cron);
+	}
+	if (router_initialized) {
+		/* od_rules_free() would be done in od_router_free */
+		od_rules_cleanup(&router.rules);
+		od_router_free(&router);
+	}
+	od_extension_free(&instance->logger, extensions);
+	od_system_free(system);
+	/* TODO: clean up the remaining startup resources and started machines. */
+	return NOT_OK_RESPONSE;
+}
+
+void od_instance_reset_reason_inc(od_instance_t *instance,
+				  od_reset_reason_t reason)
+{
+	atomic_fetch_add_explicit(&instance->reset_stats[reason], 1,
+				  memory_order_relaxed);
+}
+
+uint64_t od_instance_reset_reason_get(od_instance_t *instance,
+				      od_reset_reason_t reason)
+{
+	return atomic_load_explicit(&instance->reset_stats[reason],
+				    memory_order_relaxed);
+}
+
+const char *od_reset_reason_to_str(od_reset_reason_t reason)
+{
+	switch (reason) {
+	case OD_RESET_REASON_OOM:
+		return "oom";
+	case OD_RESET_REASON_CACHED_PLAN_BROKEN:
+		return "cached_plan_broken";
+	case OD_RESET_REASON_COPY_MODE:
+		return "left_in_copy";
+	case OD_RESET_REASON_MSG_BROKEN:
+		return "partly_read_message";
+	case OD_RESET_REASON_XPROTO_MODE:
+		return "left_in_extended_query";
+	case OD_RESET_REASON_IN_TRANSACTION:
+		return "in_active_transaction";
+	case OD_RESET_REASON_LEFT_IN_QUERY:
+		return "left_in_query";
+	case OD_RESET_REASON_RFQ_WAIT_FAILED:
+		return "rfq_wait_failed";
+	case OD_RESET_REASON_SYNC_FAILED:
+		return "sync_failed";
+	case OD_RESET_REASON_COUNT:
+		break;
+	}
+	return "unknown";
+}
+
+od_global_pstmt_map_t *od_instance_get_pstmts_map(od_instance_t *instance)
+{
+	return instance->pstmts;
 }

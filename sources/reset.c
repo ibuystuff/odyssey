@@ -3,173 +3,258 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
+#include <odyssey.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <machinarium/machinarium.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/frontend.h"
-#include "sources/backend.h"
-#include "sources/reset.h"
-#include "sources/auth.h"
-#include "sources/tls.h"
-#include "sources/cancel.h"
+#include <reset.h>
+#include <server.h>
+#include <route.h>
+#include <backend.h>
+#include <instance.h>
+#include <global.h>
+#include <query.h>
+#include <cancel.h>
+#include <stream.h>
+#include <wait_event.h>
 
 int od_reset(od_server_t *server)
 {
 	od_instance_t *instance = server->global->instance;
 	od_route_t *route = server->route;
 
-	/* reserve separate stream from reset */
-	shapito_stream_t *stream = shapito_cache_pop(&instance->stream_cache);
-	if (stream == NULL) {
-		od_error(&instance->logger, "reset", server->client, server,
-		         "memory allocation error");
-		goto error;
+	if (server->oom) {
+		od_debug(&instance->logger, server->client, server,
+			 "server in oom mode, closing and drop connection");
+		od_instance_reset_reason_inc(instance, OD_RESET_REASON_OOM);
+		goto drop;
 	}
 
-	/* server left in copy mode */
-	if (server->is_copy) {
-		od_log(&instance->logger, "reset", server->client, server,
-		       "in copy, closing");
+	if (server->cached_plan_broken) {
+		od_debug(
+			&instance->logger, server->client, server,
+			"server has broken cached plan, closing and drop connection");
+		od_instance_reset_reason_inc(
+			instance, OD_RESET_REASON_CACHED_PLAN_BROKEN);
+		goto drop;
+	}
+
+	/* server left in copy mode
+	 * check that number of received CopyIn/CopyOut Responses 
+	 * is equal to number received CopyDone msgs.
+	 * it is indeed very strange situation if this numbers difference
+	 * is more that 1 (in absolute value).
+	 */
+	if (server->copy_mode) {
+		od_debug(&instance->logger, server->client, server,
+			 "server left in copy, closing and drop connection");
+		od_instance_reset_reason_inc(instance,
+					     OD_RESET_REASON_COPY_MODE);
+		goto drop;
+	}
+
+	if (server->msg_broken) {
+		od_debug(
+			&instance->logger, server->client, server,
+			"server left with partly-read message, closing and drop connection");
+		od_instance_reset_reason_inc(instance,
+					     OD_RESET_REASON_MSG_BROKEN);
+		goto drop;
+	}
+
+	if (server->xproto_mode) {
+		od_debug(
+			&instance->logger, server->client, server,
+			"server left in extended-query pipeline, closing and drop connection");
+		od_instance_reset_reason_inc(instance,
+					     OD_RESET_REASON_XPROTO_MODE);
 		goto drop;
 	}
 
 	/* support route rollback off */
-	if (! route->config->pool_rollback) {
+	if (!route->rule->pool->rollback) {
 		if (server->is_transaction) {
-			od_log(&instance->logger, "reset", server->client, server,
-			       "in active transaction, closing");
+			od_debug(&instance->logger, server->client, server,
+				 "in active transaction, closing");
+			od_instance_reset_reason_inc(
+				instance, OD_RESET_REASON_IN_TRANSACTION);
 			goto drop;
 		}
 	}
 
-	/* support route cancel off */
-	if (! route->config->pool_cancel) {
-		if (! od_server_sync_is(server)) {
-			od_log(&instance->logger, "reset", server->client, server,
-			       "not synchronized, closing");
-			goto drop;
-		}
+	uint32_t reset_timeout_ms = UINT32_MAX;
+	if (route->rule->pool->reset_timeout_ms > 0 &&
+	    route->rule->pool->reset_timeout_ms < UINT32_MAX) {
+		reset_timeout_ms =
+			(uint32_t)route->rule->pool->reset_timeout_ms;
 	}
 
-	/* Server is not synchronized.
+	/*
+	 * Server is not synchronized.
 	 *
 	 * Number of queries sent to server is not equal
-	 * to the number of received replies. Do the following
-	 * logic until server becomes synchronized:
-	 *
-	 * 1. Wait each ReadyForQuery until we receive all
-	 *    replies with 1 sec timeout.
-	 *
-	 * 2. Send Cancel in other connection.
-	 *
-	 *    It is possible that client could previously
-	 *    pipeline server with requests. Each request
-	 *    may stall database on its own way and may require
-	 *    additional Cancel request.
-	 *
-	 * 3. Continue with (1)
+	 * to the number of received replies.
+	 * Send cancel and try wait for synchronized state
 	 */
-	int wait_timeout = 1000;
-	int wait_try = 0;
-	int wait_try_cancel = 0;
-	int wait_cancel_limit = 1;
-	int rc = 0;
-	for (;;) {
-		while (! od_server_sync_is(server)) {
-			od_log(&instance->logger, "reset", server->client, server,
-			       "not synchronized, wait for %d msec (#%d)",
-			       wait_timeout,
-			       wait_try);
-			wait_try++;
-			rc = od_backend_ready_wait(server, stream, "reset", 1, wait_timeout);
-			if (rc == -1)
-				break;
+	if (!od_server_synchronized(server)) {
+		if (!route->rule->pool->cancel) {
+			od_debug(&instance->logger, server->client, server,
+				 "server left in query, closing");
+			od_instance_reset_reason_inc(
+				instance, OD_RESET_REASON_LEFT_IN_QUERY);
+			goto drop;
 		}
-		if (rc == -1) {
-			if (! machine_timedout())
-				goto error;
-			if (wait_try_cancel == wait_cancel_limit) {
-				od_error(&instance->logger, "reset", server->client, server,
-				         "server cancel limit reached, closing");
-				goto error;
-			}
-			od_log(&instance->logger, "reset", server->client, server,
-			       "not responded, cancel (#%d)",
-			       wait_try_cancel);
-			wait_try_cancel++;
-			rc = od_cancel(server->global,
-			               stream,
-			               route->config->storage, &server->key,
-			               &server->id);
-			if (rc == -1)
-				goto error;
-			continue;
+
+		/*
+		 * if query already completed on backend
+		 * then cancel will do nothing, so it is ok to send
+		 * cancel unconditionally
+		 */
+		int rc = od_cancel(server->global, server->endpoint->storage,
+				   od_server_pool_address(server), &server->key,
+				   &server->id);
+		if (rc == NOT_OK_RESPONSE) {
+			goto error;
 		}
-		assert(od_server_sync_is(server));
-		break;
+
+		od_frontend_status_t st = od_service_stream_server_until_rfq(
+			server, 1 /* ignore_errors */, reset_timeout_ms,
+			OD_WAIT_RESET_SERVER_READ);
+		if (st != OD_OK) {
+			od_debug(
+				&instance->logger, server->client, server,
+				"rfq waiting failed - closing, status = %d (%s)",
+				st, od_frontend_status_to_str(st));
+			od_instance_reset_reason_inc(
+				instance, OD_RESET_REASON_RFQ_WAIT_FAILED);
+			goto drop;
+		}
+
+		/* still not synchronized - give up */
+		if (!od_server_synchronized(server)) {
+			od_debug(
+				&instance->logger, server->client, server,
+				"sync failed, server left in query (sync_reply = %" PRIu64
+				", sync_request = %" PRIu64 ") - closing",
+				server->sync_reply, server->sync_request);
+			od_instance_reset_reason_inc(
+				instance, OD_RESET_REASON_SYNC_FAILED);
+			goto drop;
+		}
 	}
-	od_debug(&instance->logger, "reset", server->client, server,
-	         "synchronized");
+
+	int rc;
 
 	/* send rollback in case server has an active
 	 * transaction running */
-	if (route->config->pool_rollback) {
+	if (route->rule->pool->rollback) {
 		if (server->is_transaction) {
 			char query_rlb[] = "ROLLBACK";
-			rc = od_backend_query(server, stream, "reset rollback", query_rlb,
-			                      sizeof(query_rlb));
-			if (rc == -1)
+			rc = od_backend_query(server, query_rlb, NULL,
+					      sizeof(query_rlb),
+					      reset_timeout_ms);
+			if (rc == NOT_OK_RESPONSE) {
 				goto error;
-			assert(! server->is_transaction);
+			}
+			od_assert(!server->is_transaction);
 		}
 	}
 
+	/* send DISCARD ALL */
+	if (route->rule->pool->discard) {
+		char query_discard[] = "DISCARD ALL";
+		rc = od_backend_query(server, query_discard, NULL,
+				      sizeof(query_discard), reset_timeout_ms);
+		if (rc == NOT_OK_RESPONSE) {
+			goto error;
+		}
+	}
+
+	/* send smart discard */
+	if (route->rule->pool->smart_discard &&
+	    route->rule->pool->discard_query == NULL) {
+		char query_discard[] =
+			"SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;UNLISTEN *;SELECT pg_advisory_unlock_all();DISCARD PLANS;DISCARD SEQUENCES;DISCARD TEMP;";
+		rc = od_backend_query(server, query_discard, NULL,
+				      sizeof(query_discard), reset_timeout_ms);
+		if (rc == NOT_OK_RESPONSE) {
+			goto error;
+		}
+	}
+	if (route->rule->pool->discard_query != NULL) {
+		rc = od_backend_query(
+			server, route->rule->pool->discard_query, NULL,
+			strlen(route->rule->pool->discard_query) + 1,
+			reset_timeout_ms);
+		if (rc == NOT_OK_RESPONSE) {
+			goto error;
+		}
+	}
+
+	/* evict reserved prepared statements over the configured limit */
+	if (route->rule->pool->reserve_prepared_statement &&
+	    route->rule->pool->server_pstmt_cache_size > 0 &&
+	    od_server_pstmt_count(server) >
+		    (size_t)route->rule->pool->server_pstmt_cache_size) {
+		machine_msg_t *stream = machine_msg_create(0);
+		if (stream == NULL) {
+			goto error;
+		}
+
+		int evicted = od_server_pstmt_evict_overflow(
+			server,
+			(size_t)route->rule->pool->server_pstmt_cache_size,
+			stream);
+		if (evicted < 0) {
+			machine_msg_free(stream);
+			goto error;
+		}
+
+		if (evicted > 0) {
+			machine_msg_t *sync = kiwi_fe_write_sync(stream);
+			if (sync == NULL) {
+				machine_msg_free(stream);
+				goto error;
+			}
+
+			od_wait_event_start(OD_WAIT_RESET_SERVER_WRITE);
+			rc = od_io_write(&server->io, sync, reset_timeout_ms);
+			od_wait_event_end(OD_WAIT_RESET_SERVER_WRITE);
+			machine_msg_free(sync);
+			if (rc != 0) {
+				goto error;
+			}
+
+			od_server_sync_request(server, 1);
+
+			od_frontend_status_t st =
+				od_service_stream_server_until_rfq(
+					server, 1 /* ignore_errors */,
+					reset_timeout_ms,
+					OD_WAIT_RESET_SERVER_READ);
+			if (st != OD_OK) {
+				goto error;
+			}
+		} else {
+			machine_msg_free(stream);
+		}
+	}
+
+	if (od_readahead_unread(&server->io.readahead) > 0) {
+		od_error(
+			&instance->logger, server->client, server,
+			"server left with some bytes in readahead after reset, closing and drop connection");
+		goto error;
+	}
+
 	/* ready */
-	shapito_cache_push(&instance->stream_cache, stream);
-	return  1;
+	return 1;
 drop:
-	if (stream)
-		shapito_cache_push(&instance->stream_cache, stream);
-	return  0;
+	return 0;
 error:
-	if (stream)
-		shapito_cache_push(&instance->stream_cache, stream);
+	atomic_fetch_add_explicit(&instance->reset_errors, 1,
+				  memory_order_relaxed);
 	return -1;
 }

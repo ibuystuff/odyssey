@@ -1,0 +1,222 @@
+#include <odyssey.h>
+
+#include <unistd.h>
+#include <string.h>
+
+#include <machinarium/file.h>
+#include <machinarium/memory.h>
+
+#include <host_watcher.h>
+#include <logger.h>
+#include <util.h>
+
+#define PROC_MEMINFO_PATH "/proc/meminfo"
+#define PROC_STAT_PATH "/proc/stat"
+
+static inline uint64_t sub(uint64_t a, uint64_t b)
+{
+	return a > b ? a - b : 0;
+}
+
+static inline void hw_update_cpu_stat(od_host_watcher_t *hw,
+				      const od_cpu_stat_t *stat)
+{
+	hw->cpu_stat.idle_diff = sub(stat->idle, hw->cpu_stat.idle);
+	hw->cpu_stat.total_diff = sub(stat->total, hw->cpu_stat.total);
+	hw->cpu_stat.idle = stat->idle;
+	hw->cpu_stat.total = stat->total;
+}
+
+static inline void hw_update_mem_stat(od_host_watcher_t *hw,
+				      const od_mem_stat_t *stat)
+{
+	memcpy(&hw->mem_stat, stat, sizeof(od_mem_stat_t));
+}
+
+static inline void hw_update(od_host_watcher_t *hw, const od_cpu_stat_t *cpu,
+			     const od_mem_stat_t *mem)
+{
+	mm_spinlock_lock(&hw->lock);
+
+	hw_update_cpu_stat(hw, cpu);
+	hw_update_mem_stat(hw, mem);
+
+	mm_spinlock_unlock(&hw->lock);
+}
+
+static inline int get_cpu_stat(od_cpu_stat_t *out)
+{
+	/* https://www.kernel.org/doc/html/latest/filesystems/proc.html#miscellaneous-kernel-statistics-in-proc-stat */
+
+	char *buf;
+	size_t size;
+	if (mm_file_read_all(PROC_STAT_PATH, &buf, &size) != 0) {
+		od_gerror(NULL, NULL, "can't open '%s': %s", PROC_STAT_PATH,
+			  strerror(errno));
+		return -1;
+	}
+
+	char *cursor = buf;
+	char *cpu_stat_line = od_next_line(&cursor);
+	if (cpu_stat_line == NULL) {
+		od_gerror(NULL, NULL, "can't read '%s'", PROC_STAT_PATH);
+		mm_free(buf);
+		return -1;
+	}
+
+	uint64_t usertime, nicetime, systemtime, idletime;
+	uint64_t io_wait = 0, irq = 0, soft_irq = 0, steal = 0, guest = 0,
+		 guestnice = 0;
+
+	sscanf(cpu_stat_line,
+	       "cpu  %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+	       " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64,
+	       &usertime, &nicetime, &systemtime, &idletime, &io_wait, &irq,
+	       &soft_irq, &steal, &guest, &guestnice);
+
+	mm_free(buf);
+
+	usertime -= guest;
+	nicetime -= guestnice;
+
+	uint64_t idle_time = idletime + io_wait;
+	uint64_t system_time = systemtime + irq + soft_irq;
+	uint64_t vm_time = guest + guestnice;
+	uint64_t total_time =
+		usertime + nicetime + system_time + idle_time + steal + vm_time;
+
+	out->total = total_time;
+	out->idle = idle_time;
+
+	return 0;
+}
+
+static inline int get_memory_stat(od_mem_stat_t *out)
+{
+	/* https://www.kernel.org/doc/html/latest/filesystems/proc.html#meminfo */
+
+	char *buf;
+	size_t size;
+	if (mm_file_read_all(PROC_MEMINFO_PATH, &buf, &size) != 0) {
+		od_gerror(NULL, NULL, "can't open '%s': %s", PROC_MEMINFO_PATH,
+			  strerror(errno));
+		return -1;
+	}
+
+	int64_t mem_available = 0, mem_total = 0;
+
+	char *cursor = buf;
+	char *line;
+	while ((line = od_next_line(&cursor)) != NULL) {
+		if (sscanf(line, "MemAvailable: %" PRId64 " kB",
+			   &mem_available) == 1) {
+			continue;
+		}
+
+		if (sscanf(line, "MemTotal: %" PRId64 " kB", &mem_total) == 1) {
+			continue;
+		}
+	}
+
+	mm_free(buf);
+
+	out->total = mem_total;
+	out->available = mem_available;
+
+	return 0;
+}
+
+static inline void hw_watcher(void *arg)
+{
+	od_host_watcher_t *hw = arg;
+
+	od_glog(NULL, NULL, "host watcher started");
+
+	while (1) {
+		int rc = machine_wait_flag_wait(hw->stop_flag, 1000);
+		if (rc != -1 && machine_errno() != ETIMEDOUT) {
+			od_glog(NULL, NULL,
+				"stop flag is set, exiting host watcher");
+			break;
+		}
+
+		od_mem_stat_t mem;
+		if (get_memory_stat(&mem)) {
+			continue;
+		}
+
+		od_cpu_stat_t cpu;
+		if (get_cpu_stat(&cpu)) {
+			continue;
+		}
+
+		hw_update(hw, &cpu, &mem);
+
+		float ucpu, umem;
+		od_host_watcher_read(hw, &ucpu, &umem);
+
+		od_glog(NULL, NULL,
+			"update values to: %.2f%% cpu and %.2f%% mem", ucpu,
+			umem);
+	}
+
+	od_glog(NULL, NULL, "host watcher finished");
+}
+
+int od_host_watcher_init(od_host_watcher_t *hw)
+{
+	memset(&hw->cpu_stat, 0, sizeof(od_cpu_stat_t));
+	memset(&hw->mem_stat, 0, sizeof(od_mem_stat_t));
+
+	mm_spinlock_init(&hw->lock);
+
+	hw->hz = sysconf(_SC_CLK_TCK);
+	if (hw->hz == -1) {
+		return -1;
+	}
+
+	hw->stop_flag = machine_wait_flag_create();
+	if (hw->stop_flag == NULL) {
+		mm_spinlock_destroy(&hw->lock);
+		return -1;
+	}
+
+	hw->worker_id = machine_create("host-watcher", hw_watcher, hw);
+	if (hw->worker_id == -1) {
+		od_gerror(NULL, NULL, "can't start host watcher machine");
+		machine_wait_flag_destroy(hw->stop_flag);
+		mm_spinlock_destroy(&hw->lock);
+		return -1;
+	}
+
+	return 0;
+}
+
+void od_host_watcher_destroy(od_host_watcher_t *hw)
+{
+	machine_wait_flag_set(hw->stop_flag);
+	machine_wait(hw->worker_id);
+	machine_wait_flag_destroy(hw->stop_flag);
+
+	mm_spinlock_destroy(&hw->lock);
+}
+
+static inline float get_mem_util(const od_host_watcher_t *hw)
+{
+	return (float)(hw->mem_stat.total - hw->mem_stat.available) /
+	       hw->mem_stat.total * 100.0;
+}
+
+static inline float get_cpu_util(const od_host_watcher_t *hw)
+{
+	return (float)(hw->cpu_stat.total_diff - hw->cpu_stat.idle_diff) /
+	       hw->cpu_stat.total_diff * 100.0;
+}
+
+void od_host_watcher_read(od_host_watcher_t *hw, float *cpu, float *mem)
+{
+	mm_spinlock_lock(&hw->lock);
+	*cpu = get_cpu_util(hw);
+	*mem = get_mem_util(hw);
+	mm_spinlock_unlock(&hw->lock);
+}

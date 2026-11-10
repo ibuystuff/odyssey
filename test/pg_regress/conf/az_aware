@@ -1,0 +1,60 @@
+include "/home/postgres/regress/conf/_base"
+
+log_config no
+
+availability_zone "az1"
+
+storage "rr-az-aware" {
+	type "remote"
+	host "localhost:5432:az1,localhost:5433:az2,localhost:5434:az2"
+	endpoints_status_poll_interval 5000
+	balancing {
+		method "roundrobin" {
+			az_aware yes
+		}
+		show_notice_messages yes
+	}
+}
+
+storage "rr-az-unaware" {
+	type "remote"
+	host "localhost:5432:az1,localhost:5433:az2,localhost:5434:az2"
+	endpoints_status_poll_interval 5000
+	balancing {
+		method "roundrobin" {
+			az_aware no
+		}
+		show_notice_messages yes
+	}
+}
+
+database "postgres" {
+	user "az-aware-user" {
+		authentication "none"
+		storage "rr-az-aware"
+		storage_user "postgres"
+		pool "transaction"
+		pool_size 32
+		pool_timeout 1000
+		client_show_id no
+	}
+
+	user "az-unaware-user" {
+		authentication "none"
+		storage "rr-az-unaware"
+		storage_user "postgres"
+		pool "transaction"
+		pool_size 32
+		pool_timeout 1000
+		client_show_id no
+	}
+
+	user "postgres" {
+		authentication "none"
+		storage "rr-az-aware"
+		pool "transaction"
+		pool_size 32
+		pool_timeout 1000
+		client_show_id no
+	}
+}

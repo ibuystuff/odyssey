@@ -1,0 +1,28 @@
+name: Format
+on:
+  push:
+    branches: [ master, 'REL_*' ]
+    paths-ignore:
+      - "sources/machinarium/gdb/**"
+  pull_request:
+    branches: [ master ]
+    paths-ignore:
+      - "sources/machinarium/gdb/**"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Check format
+      shell: bash
+      run: make check-format 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs

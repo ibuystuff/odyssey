@@ -3,1055 +3,3880 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
+#include <odyssey.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <openssl/rand.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/frontend.h"
-#include "sources/backend.h"
-#include "sources/cancel.h"
-#include "sources/reset.h"
-#include "sources/deploy.h"
-#include "sources/tls.h"
-#include "sources/auth.h"
-#include "sources/console.h"
+#include <machinarium/machinarium.h>
 
-typedef enum {
-	OD_FE_UNDEF,
-	OD_FE_OK,
-	OD_FE_TERMINATE,
-	OD_FE_EATTACH,
-	OD_FE_ESERVER_CONNECT,
-	OD_FE_ESERVER_CONFIGURE,
-	OD_FE_ESERVER_READ,
-	OD_FE_ESERVER_WRITE,
-	OD_FE_ECLIENT_READ,
-	OD_FE_ECLIENT_WRITE,
-	OD_FE_ECLIENT_CONFIGURE
-} od_frontend_rc_t;
+#include <status.h>
+#include <types.h>
+#include <frontend.h>
+#include <client.h>
+#include <router.h>
+#include <server.h>
+#include <wait_event.h>
+#include <rules.h>
+#include <global.h>
+#include <balancing.h>
+#include <instance.h>
+#include <cron.h>
+#include <thread_global.h>
+#include <worker.h>
+#include <ejection.h>
+#include <stream.h>
+#include <module.h>
+#include <auth.h>
+#include <reset.h>
+#include <system.h>
+#include <hba.h>
+#include <dns.h>
+#include <backend.h>
+#include <tls.h>
+#include <console.h>
+#include <compression.h>
+#include <extension.h>
+#include <deploy.h>
+#include <misc.h>
+#include <log_sampling.h>
+#include <server.h>
 
-void od_frontend_close(od_client_t *client)
+static inline void od_frontend_close(od_client_t *client)
 {
-	od_instance_t *instance = client->global->instance;
-	assert(client->route == NULL);
-	assert(client->server == NULL);
-	if (client->stream) {
-		od_client_stream_detach(client, &instance->stream_cache);
+	od_assert(client->route == NULL);
+	od_assert(client->server == NULL);
+
+	od_router_t *router = client->global->router;
+	atomic_fetch_sub(&router->clients, 1);
+	if (client->source != NULL) {
+		atomic_fetch_sub(&client->source->clients, 1);
 	}
-	if (client->io) {
-		machine_close(client->io);
-		machine_io_free(client->io);
-		client->io = NULL;
-	}
+	od_io_close(&client->io);
 	od_client_free(client);
-}
-
-static inline int
-od_frontend_error_fwd(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
-	od_server_t *server = client->server;
-	assert(server != NULL);
-	assert(server->stats.count_error != 0);
-	(void)server;
-	shapito_fe_error_t error;
-	int rc;
-	rc = shapito_fe_read_error(&error, client->stream->start,
-	                           shapito_stream_used(client->stream));
-	if (rc == -1)
-		return -1;
-
-	shapito_stream_t *stream;
-	stream = shapito_cache_pop(&instance->stream_cache);
-	shapito_stream_reset(stream);
-	char msg[512];
-	int  msg_len;
-	msg_len = od_snprintf(msg, sizeof(msg), "odyssey: %s%.*s: %s",
-	                      client->id.id_prefix,
-	                      (signed)sizeof(client->id.id),
-	                      client->id.id,
-	                      error.message);
-	int detail_len = error.detail ? strlen(error.detail) : 0;
-	int hint_len   = error.hint ? strlen(error.hint) : 0;
-	rc = shapito_be_write_error_as(stream,
-	                               error.severity,
-	                               error.code,
-	                               error.detail, detail_len,
-	                               error.hint, hint_len,
-	                               msg, msg_len);
-	if (rc == -1) {
-		shapito_cache_push(&instance->stream_cache, stream);
-		return -1;
-	}
-	rc = od_write(client->io, stream);
-	shapito_cache_push(&instance->stream_cache, stream);
-	return rc;
-}
-
-static inline int
-od_frontend_verror(od_client_t *client, char *code, char *fmt, va_list args)
-{
-	char msg[512];
-	int  msg_len;
-	msg_len = od_snprintf(msg, sizeof(msg), "odyssey: %s%.*s: ",
-	                      client->id.id_prefix,
-	                      (signed)sizeof(client->id.id),
-	                      client->id.id);
-	msg_len += od_vsnprintf(msg + msg_len, sizeof(msg) - msg_len, fmt, args);
-	shapito_stream_t *stream = client->stream;
-	int rc;
-	rc = shapito_be_write_error(stream, code, msg, msg_len);
-	if (rc == -1)
-		return -1;
-	return 0;
-}
-
-int od_frontend_errorf(od_client_t *client, char *code, char *fmt, ...)
-{
-	va_list args;
-	va_start(args, fmt);
-	int rc;
-	rc = od_frontend_verror(client, code, fmt, args);
-	va_end(args);
-	return rc;
 }
 
 int od_frontend_error(od_client_t *client, char *code, char *fmt, ...)
 {
-	shapito_stream_t *stream = client->stream;
-	shapito_stream_reset(stream);
 	va_list args;
 	va_start(args, fmt);
-	int rc;
-	rc = od_frontend_verror(client, code, fmt, args);
+	machine_msg_t *msg;
+	msg = od_frontend_error_msg(client, NULL, code, 0, fmt, args);
 	va_end(args);
-	if (rc == -1)
+	if (msg == NULL) {
 		return -1;
-	rc = od_write(client->io, stream);
-	return rc;
+	}
+	return od_write(&client->io, msg);
 }
 
-static int
-od_frontend_startup_read(od_client_t *client)
+int od_frontend_fatal_no_startup(mm_io_t *io, char *code, char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	machine_msg_t *msg;
+	msg = od_frontend_error_msg(NULL, NULL, code, 0, fmt, args);
+	va_end(args);
+	if (msg == NULL) {
+		return -1;
+	}
+
+	return machine_write(io, msg, UINT32_MAX);
+}
+
+int od_frontend_fatal(od_client_t *client, char *code, char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	machine_msg_t *msg;
+	msg = od_frontend_fatal_msg(client, NULL, code, "", "", fmt, args);
+	va_end(args);
+	if (msg == NULL) {
+		return -1;
+	}
+	return od_write(&client->io, msg);
+}
+
+int od_frontend_fatal_detailed(od_client_t *client, const char *code,
+			       const char *detail, const char *hint,
+			       const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	machine_msg_t *msg;
+	msg = od_frontend_fatal_msg(client, NULL, code, detail, hint, fmt,
+				    args);
+	va_end(args);
+	if (msg == NULL) {
+		return -1;
+	}
+	return od_write(&client->io, msg);
+}
+
+static inline int od_frontend_error_fwd(od_client_t *client)
+{
+	od_server_t *server = client->server;
+	od_assert(server != NULL);
+	od_assert(server->error_connect != NULL);
+	kiwi_fe_error_t error;
+	int rc;
+	rc = kiwi_fe_read_error(machine_msg_data(server->error_connect),
+				machine_msg_size(server->error_connect),
+				&error);
+	if (rc == -1) {
+		return -1;
+	}
+	char text[512];
+	int text_len;
+	text_len =
+		od_snprintf(text, sizeof(text), "odyssey: %s%.*s: %s",
+			    client->id.id_prefix, (signed)sizeof(client->id.id),
+			    client->id.id, error.message);
+	int detail_len = error.detail ? strlen(error.detail) : 0;
+	int hint_len = error.hint ? strlen(error.hint) : 0;
+
+	machine_msg_t *msg;
+	msg = kiwi_be_write_error_as(NULL, error.severity, error.code,
+				     error.detail, detail_len, error.hint,
+				     hint_len, text, text_len, 0);
+	if (msg == NULL) {
+		return -1;
+	}
+	return od_write(&client->io, msg);
+}
+
+static inline bool
+od_frontend_error_is_too_many_connections(od_client_t *client)
+{
+	od_server_t *server = client->server;
+	od_assert(server != NULL);
+	if (server->error_connect == NULL) {
+		return false;
+	}
+	kiwi_fe_error_t error;
+	int rc;
+	rc = kiwi_fe_read_error(machine_msg_data(server->error_connect),
+				machine_msg_size(server->error_connect),
+				&error);
+	if (rc == -1) {
+		return false;
+	}
+	return strcmp(error.code, KIWI_TOO_MANY_CONNECTIONS) == 0;
+}
+
+static int read_and_parse_startup(od_client_t *client, int *parse_rc)
 {
 	od_instance_t *instance = client->global->instance;
 
-	shapito_stream_t *stream = client->stream;
-	shapito_stream_reset(stream);
-	for (;;) {
-		uint32_t pos_size = shapito_stream_used(stream);
-		char *pos_data = stream->start;
-		uint32_t len;
-		int to_read;
-		to_read = shapito_read_startup(&len, &pos_data, &pos_size);
-		if (to_read == 0)
-			break;
-		if (to_read == -1) {
-			od_error(&instance->logger, "startup", client, NULL,
-			         "failed to read startup packet, closing");
-			return -1;
+	od_wait_event_start(OD_WAIT_CONNECT_CLIENT_STARTUP);
+	machine_msg_t *msg = od_read_startup(
+		&client->io, client->source->config->client_login_timeout_ms);
+	od_wait_event_end(OD_WAIT_CONNECT_CLIENT_STARTUP);
+	if (msg == NULL) {
+		if (parse_rc) {
+			*parse_rc = KIWI_STARTUP_READ_LEN_ERROR;
 		}
-		int rc = shapito_stream_ensure(stream, to_read);
-		if (rc == -1)
-			return -1;
-		rc = machine_read(client->io, stream->pos, to_read, UINT32_MAX);
-		if (rc == -1) {
-			od_error(&instance->logger, "startup", client, NULL,
-			         "read error: %s",
-			         machine_error(client->io));
-			return -1;
-		}
-		shapito_stream_advance(stream, to_read);
+		return -1;
 	}
+
+	int rc = kiwi_be_read_startup(machine_msg_data(msg),
+				      machine_msg_size(msg) -
+					      1 /* extra 0-terminator */,
+				      &client->startup, &client->vars);
+
+	/*
+	 * keep the raw packet: in replication proxy mode it is
+	 * forwarded to the server as is
+	 *
+	 * the last parsed packet is the one to keep, the previous
+	 * one (e.g. an ssl request) is dropped
+	 */
+	int replication_proxy = 0;
+	if (client->startup.replication.value_len != 0) {
+		if (strcmp(client->startup.replication.value, "database") ==
+		    0) {
+			replication_proxy =
+				instance->config.replication_proxy_logic;
+		} else {
+			bool physical;
+			replication_proxy =
+				parse_bool(client->startup.replication.value,
+					   &physical) &&
+						physical ?
+					instance->config.replication_proxy_phys :
+					0;
+		}
+	}
+
+	if (replication_proxy) {
+		if (client->startup_raw != NULL) {
+			machine_msg_free(client->startup_raw);
+		}
+		client->startup_raw = msg;
+	} else {
+		machine_msg_free(msg);
+	}
+
+	if (parse_rc) {
+		*parse_rc = rc;
+	}
+
+	if (rc != KIWI_STARTUP_READ_OK) {
+		od_error(&instance->logger, client, NULL,
+			 "startup packet parse error, code = %d", rc);
+		return -1;
+	}
+
 	return 0;
 }
 
-static int
-od_frontend_startup(od_client_t *client)
+static void reject_unsupported_proto_version(od_client_t *client)
+{
+	od_frontend_fatal_detailed(
+		client, KIWI_FEATURE_NOT_SUPPORTED, "", "",
+		"unsupported frontend protocol %u.%u: server supports %u.0 to %u.%u",
+		PG_PROTOCOL_MAJOR(client->startup.proto_version),
+		PG_PROTOCOL_MINOR(client->startup.proto_version),
+		PG_PROTOCOL_MAJOR(PG_PROTOCOL_EARLIEST),
+		PG_PROTOCOL_MAJOR(PG_PROTOCOL_LATEST),
+		PG_PROTOCOL_MINOR(PG_PROTOCOL_LATEST));
+}
+
+static int has_unsupported_features(od_client_t *client)
+{
+	kiwi_var_t *pq_tpn = kiwi_vars_get(
+		&client->vars, KIWI_VAR_PQ_TEST_PROTOCOL_NEGOTIATION);
+
+	return pq_tpn != NULL;
+}
+
+static int send_negotiate(od_client_t *client)
+{
+	int has_pq_tpn =
+		kiwi_vars_get(&client->vars,
+			      KIWI_VAR_PQ_TEST_PROTOCOL_NEGOTIATION) != NULL;
+	kiwi_vars_unset(&client->vars, KIWI_VAR_PQ_TEST_PROTOCOL_NEGOTIATION);
+
+	const char **unsupported =
+		(const char *[]){ "_pq_.test_protocol_negotiation" };
+	size_t nunsupported;
+
+	if (has_pq_tpn) {
+		nunsupported = 1;
+	} else {
+		nunsupported = 0;
+	}
+
+	machine_msg_t *msg = kiwi_be_write_protocol_negotiation(
+		NULL, client->startup.proto_version, unsupported, nunsupported);
+	if (msg == NULL) {
+		return -1;
+	}
+
+	return od_write(&client->io, msg);
+}
+
+static int reject_unsupported_request(od_client_t *client)
 {
 	od_instance_t *instance = client->global->instance;
 
-	int rc;
-	rc = od_frontend_startup_read(client);
-	if (rc == -1)
+	machine_msg_t *msg = machine_msg_create(sizeof(uint8_t));
+	if (msg == NULL) {
 		return -1;
-	shapito_stream_t *stream = client->stream;
-	rc = shapito_be_read_startup(&client->startup, stream->start,
-	                             shapito_stream_used(stream));
-	if (rc == -1)
+	}
+
+	*(uint8_t *)machine_msg_data(msg) = 'N';
+
+	if (od_write(&client->io, msg) == -1) {
+		od_error(&instance->logger, client, NULL, "write error: %s",
+			 od_io_error(&client->io));
+		return -1;
+	}
+
+	od_debug(&instance->logger, client, NULL, "ignoring");
+	return 0;
+}
+
+static int od_frontend_startup(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+	int ssl_done = 0;
+	int gss_done = 0;
+
+	while (1) {
+		int rc;
+		int parse_rc;
+
+		rc = read_and_parse_startup(client, &parse_rc);
+		if (rc == -1) {
+			if (parse_rc == KIWI_STARTUP_INVALID_MAJOR_ERROR) {
+				reject_unsupported_proto_version(client);
+			}
+			goto error;
+		}
+
+		if (!client->startup.unsupported_request &&
+		    !client->startup.is_ssl_request) {
+			/* that was real startup/cancel packet - its ok */
+			break;
+		}
+
+		if (client->startup.is_ssl_request && !ssl_done) {
+			if (od_tls_frontend_accept(client, &instance->logger,
+						   client->source->config,
+						   client->tls) == -1) {
+				goto error;
+			}
+
+			client->startup.is_ssl_request = 0;
+			ssl_done = 1;
+			continue;
+		}
+
+		if (client->startup.unsupported_request && !gss_done) {
+			if (reject_unsupported_request(client) == -1) {
+				return -1;
+			}
+
+			gss_done = 1;
+			continue;
+		}
+
+		od_error(&instance->logger, client, NULL,
+			 "unexpected repeated %s negotiation request",
+			 client->startup.is_ssl_request ? "ssl" : "gss");
+
 		goto error;
+	}
 
-	/* client ssl request */
-	rc = od_tls_frontend_accept(client, &instance->logger,
-	                            client->config_listen,
-	                            client->tls);
-	if (rc == -1)
-		return -1;
+	client->startup.is_ssl_request = ssl_done;
 
-	if (! client->startup.is_ssl_request)
+	if (client->startup.is_cancel) {
+		/* no need to proceed any further */
 		return 0;
+	}
 
-	/* read startup-cancel message followed after ssl
-	 * negotiation */
-	assert(client->startup.is_ssl_request);
-	rc = od_frontend_startup_read(client);
-	if (rc == -1)
+	/* parse repl options */
+	if (client->startup.replication.value_len != 0) {
+		if (strcmp(client->startup.replication.value, "database") ==
+		    0) {
+			client->logical_rep = true;
+		} else if (!parse_bool(client->startup.replication.value,
+				       &client->physical_rep)) {
+			od_error(
+				&instance->logger, client, NULL,
+				"invalid value for parameter \"replication\" for client '%s'",
+				client->peer);
+			od_frontend_error(
+				client, KIWI_CONNECTION_FAILURE,
+				"invalid value for parameter \"replication\"");
+			goto error;
+		}
+	}
+
+	if (client->source->config->tls_opts->tls_mode >=
+		    OD_CONFIG_TLS_REQUIRE &&
+	    !ssl_done) {
+		od_log(&instance->logger, client, NULL, "required, closing");
+		od_frontend_error(client, KIWI_PROTOCOL_VIOLATION,
+				  "SSL is required");
 		return -1;
-	rc = shapito_be_read_startup(&client->startup, stream->start,
-	                             shapito_stream_used(stream));
-	if (rc == -1)
+	}
+
+	if ((client->physical_rep && instance->config.replication_proxy_phys) ||
+	    (client->logical_rep && instance->config.replication_proxy_logic)) {
+		/*
+		 * replication full proxy mode: nothing more is sent
+		 * to the client, the raw startup packet is forwarded
+		 * to the server as is and all further communication
+		 * (including authentication, protocol negotiation and
+		 * compression) is proxied byte to byte
+		 */
+		return 0;
+	}
+
+	uint32_t requested_version = client->startup.proto_version;
+	if (client->startup.proto_version > PG_PROTOCOL_LATEST) {
+		client->startup.proto_version = PG_PROTOCOL_LATEST;
+	}
+	if (requested_version > client->startup.proto_version ||
+	    has_unsupported_features(client)) {
+		int rc = send_negotiate(client);
+		if (rc != 0) {
+			od_error(&instance->logger, client, NULL,
+				 "negotiation sending failed, errno=%d (%s)",
+				 mm_errno_get(), strerror(mm_errno_get()));
+			goto error;
+		}
+	}
+
+	if (od_compression_frontend_setup(client, client->source->config,
+					  &instance->logger) == -1) {
+		od_error(&instance->logger, client, NULL,
+			 "can't setup compression, errno=%d (%s)",
+			 mm_errno_get(), strerror(mm_errno_get()));
 		goto error;
+	}
+
 	return 0;
 
 error:
-	od_error(&instance->logger, "startup", client, NULL,
-	         "incorrect startup packet");
-	od_frontend_error(client, SHAPITO_PROTOCOL_VIOLATION,
-	                  "bad startup packet");
+	od_debug(&instance->logger, client, NULL,
+		 "startup packet read error, errno = %d (%s)", machine_errno(),
+		 strerror(machine_errno()));
+	od_cron_t *cron = client->global->cron;
+	atomic_fetch_add(&cron->startup_errors, 1);
 	return -1;
 }
 
-static inline void
-od_frontend_key(od_client_t *client)
+static inline int candidate_cmp_desc(const void *v1, const void *v2)
 {
-	/* Generate backend key for the client.
-	 *
-	 * This key will be used to identify a server by
-	 * user cancel requests. The key must be regenerated
-	 * for each new client-server assignment, to avoid
-	 * possibility of cancelling requests by a previous
-	 * server owners.
+	const od_endpoint_attach_candidate_t *c1 = v1;
+	const od_endpoint_attach_candidate_t *c2 = v2;
+
+	return c2->priority - c1->priority;
+}
+
+static inline int od_frontend_attach_candidate_get_priority(
+	od_instance_t *instance, od_rule_storage_t *storage,
+	od_endpoint_attach_candidate_t *candidate,
+	od_target_session_attrs_t tsa, int prefer_localhost)
+{
+	/*
+	 * priority of endpoints is determined by (from highest to lowest):
+	 * - prefer_localhost: for serice accounts connections
+	 * - az: we should use same az as of odyssey instance if it is possible
+	 * - tsa match: even if it is outdated, rw state of endpoint doesn't change frequently
+	 * - random number: to select host randomly between several suitable hosts
+	 * 
+	 * so:
+	 * + 1000 priority by localhost address
+	 * + 500 priority by matched az
+	 * + 200 priority by matched tsa
+	 * + [0..100) shuffle coeff
+	 * 
+	 * also negative priority will mean endpoints, that is not suitable,
+	 * ex: endpoints which read-write status certanly doesn't fit tsa
 	 */
-	client->key.key_pid = client->id.id_a;
-	client->key.key     = client->id.id_b;
+
+	od_storage_endpoint_t *endpoint = candidate->endpoint;
+
+	int priority = 0;
+
+	priority += machine_lrand48() % 100;
+
+	od_storage_endpoint_status_t status;
+	od_storage_endpoint_status_init(&status);
+	od_storage_endpoint_status_get(&endpoint->status, &status);
+
+	int status_is_recent = !od_storage_endpoint_status_is_outdated(
+		&status, storage->endpoints_status_poll_interval_ms);
+	int tsa_match = od_tsa_match_rw_state(tsa, status.is_read_write);
+
+	if (status_is_recent && !tsa_match) {
+		return -1;
+	}
+
+	if (status_is_recent && !status.alive) {
+		return -1;
+	}
+
+	if (tsa_match) {
+		priority += 200;
+	}
+
+	if (strcmp(instance->config.availability_zone,
+		   candidate->endpoint->address.availability_zone) == 0) {
+		priority += 500;
+	}
+
+	if (prefer_localhost && od_address_is_localhost(&endpoint->address)) {
+		priority += 1000;
+	}
+
+	return priority;
 }
 
-static inline od_frontend_rc_t
-od_frontend_attach(od_client_t *client, char *context)
+void od_frontend_attach_init_candidates(
+	od_instance_t *instance, od_rule_storage_t *storage,
+	od_endpoint_attach_candidate_t *candidates,
+	od_target_session_attrs_t tsa, int prefer_localhost)
+{
+	size_t count = storage->endpoints_count;
+
+	for (size_t i = 0; i < count; ++i) {
+		candidates[i].endpoint = &storage->endpoints[i];
+		candidates[i].priority = 0;
+	}
+
+	if (count == 1) {
+		return;
+	}
+
+	for (size_t i = 0; i < count; ++i) {
+		candidates[i].priority =
+			od_frontend_attach_candidate_get_priority(
+				instance, storage, &candidates[i], tsa,
+				prefer_localhost);
+	}
+
+	qsort(candidates, count, sizeof(od_endpoint_attach_candidate_t),
+	      candidate_cmp_desc);
+}
+
+static inline od_frontend_status_t
+od_frontend_attach_to_endpoint(od_client_t *client, kiwi_params_t *route_params,
+			       od_storage_endpoint_t *endpoint,
+			       od_target_session_attrs_t tsa, int immediate,
+			       int is_deploy, od_rule_storage_t *storage)
 {
 	od_instance_t *instance = client->global->instance;
-
-	od_routerstatus_t status;
-	od_server_t *server;
-
-	for (;;)
-	{
-		status = od_router_attach(client);
-		if (status != OD_ROK)
-			return OD_FE_EATTACH;
-		server = client->server;
-
-		if (server->io && !machine_connected(server->io)) {
-			od_log(&instance->logger, context, client, server,
-			       "server disconnected, close connection and retry attach");
-			od_router_close(client);
-			server = NULL;
-			continue;
-		}
-
-		od_debug(&instance->logger, context, client, server,
-		         "attached to %s%.*s",
-		         server->id.id_prefix, sizeof(server->id.id),
-		         server->id.id);
-		break;
-	}
-
-	/* connect to server, if necessary */
-	int rc;
-	if (server->io == NULL) {
-		rc = od_backend_connect(server, client->stream, context);
-		if (rc == -1)
-			return OD_FE_ESERVER_CONNECT;
-	}
-
-	shapito_stream_reset(client->stream);
-
-	if (! od_idmgr_cmp(&server->last_client_id, &client->id))
-	{
-		rc = od_deploy_write(client->server, context, client->stream,
-		                     &client->params);
-		if (rc == -1) {
-			status = od_router_close(client);
-			if (status != OD_ROK)
-				return OD_FE_EATTACH;
-		}
-
-		client->server->deploy_sync = rc;
-
-	} else {
-		od_debug(&instance->logger, context, client, server,
-		         "previously owned, no need to reconfigure %s%.*s",
-		         server->id.id_prefix, sizeof(server->id.id),
-		         server->id.id);
-
-		client->server->deploy_sync = 0;
-	}
-
-	return OD_FE_OK;
-}
-
-static inline int
-od_frontend_setup_console(shapito_stream_t *stream)
-{
-	int rc;
-	/* console parameters */
-	rc = shapito_be_write_parameter_status(stream, "server_version", 15, "9.6.0", 6);
-	if (rc == -1)
-		return -1;
-	rc = shapito_be_write_parameter_status(stream, "server_encoding", 16, "UTF-8", 6);
-	if (rc == -1)
-		return -1;
-	rc = shapito_be_write_parameter_status(stream, "client_encoding", 16, "UTF-8", 6);
-	if (rc == -1)
-		return -1;
-	rc = shapito_be_write_parameter_status(stream, "DateStyle", 10, "ISO", 4);
-	if (rc == -1)
-		return -1;
-	rc = shapito_be_write_parameter_status(stream, "TimeZone", 9, "GMT", 4);
-	if (rc == -1)
-		return -1;
-	/* ready message */
-	rc = shapito_be_write_ready(stream, 'I');
-	if (rc == -1)
-		return -1;
-	return 0;
-}
-
-static inline od_frontend_rc_t
-od_frontend_setup(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
+	od_router_t *router = client->global->router;
 	od_route_t *route = client->route;
-	shapito_stream_t *stream = client->stream;
-	shapito_stream_reset(stream);
 
-	/* configure console client */
-	int rc;
-	if (route->config->storage->storage_type == OD_STORAGETYPE_LOCAL) {
-		rc = od_frontend_setup_console(stream);
-		if (rc == -1)
-			return OD_FE_EATTACH;
-		rc = od_write(client->io, stream);
-		if (rc == -1)
-			return OD_FE_ECLIENT_WRITE;
-		return OD_FE_OK;
-	}
+	char addr[256];
 
-	/* copy client startup parameters */
-	rc = shapito_parameters_copy(&client->params, &client->startup.params);
-	if (rc == -1)
-		return OD_FE_ECLIENT_CONFIGURE;
-
-	/* attach client to a server and configure it using client
-	 * startup parameters */
-	od_frontend_rc_t fe_rc;
-	fe_rc = od_frontend_attach(client, "setup");
-	if (fe_rc != OD_FE_OK)
-		return fe_rc;
-	od_server_t *server;
-	server = client->server;
-
-	/* send configuration to the server */
-	rc = od_write(server->io, stream);
-	if (rc == -1)
-		return OD_FE_ESERVER_WRITE;
-
-	od_server_stat_request(server, server->deploy_sync);
-
-	/* wait for completion */
-	rc = od_backend_deploy_wait(server, client->stream, "setup", UINT32_MAX);
-	if (rc == -1)
-		return OD_FE_ESERVER_CONFIGURE;
-
-	shapito_stream_reset(client->stream);
-
-	/* append paremeter status messages */
-	od_debug(&instance->logger, "setup", client, server,
-	         "sending params:");
-
-	shapito_parameter_t *param;
-	shapito_parameter_t *end;
-	param = (shapito_parameter_t*)server->params.buf.start;
-	end = (shapito_parameter_t*)server->params.buf.pos;
-	while (param < end) {
-		rc = shapito_be_write_parameter_status(stream,
-		                                       shapito_parameter_name(param),
-		                                       param->name_len,
-		                                       shapito_parameter_value(param),
-		                                       param->value_len);
-		if (rc == -1)
-			return OD_FE_ECLIENT_CONFIGURE;
-		od_debug(&instance->logger, "setup", client, server,
-		         " %.*s = %.*s",
-		         param->name_len,
-		         shapito_parameter_name(param),
-		         param->value_len,
-		         shapito_parameter_value(param));
-		param = shapito_parameter_next(param);
-	}
-
-	/* append key data message */
-	rc = shapito_be_write_backend_key_data(stream, client->key.key_pid,
-	                                       client->key.key);
-	if (rc == -1)
-		return OD_FE_ECLIENT_CONFIGURE;
-
-	/* append ready message */
-	rc = shapito_be_write_ready(stream, 'I');
-	if (rc == -1)
-		return OD_FE_ECLIENT_CONFIGURE;
-
-	/* send to client */
-	rc = od_write(client->io, stream);
-	if (rc == -1)
-		return OD_FE_ECLIENT_WRITE;
-
-	client->time_setup = machine_time();
-
-	if (instance->config.log_session) {
-		od_log(&instance->logger, "setup", client, NULL,
-		       "login time: %d microseconds",
-		       (client->time_setup - client->time_accept));
-	}
-
-	/* put server back to route queue */
-	od_router_detach(client);
-	return OD_FE_OK;
-}
-
-static inline int
-od_frontend_stream_hit_limit(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
-	return shapito_stream_used(client->stream) >= instance->config.pipeline;
-}
-
-static od_frontend_rc_t
-od_frontend_local(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
-	int rc;
-
-	shapito_stream_t *stream = client->stream;
-	for (;;)
-	{
-		/* read client request */
-		shapito_stream_reset(stream);
-		rc = od_read(client->io, stream, UINT32_MAX);
-		if (rc == -1)
-			return OD_FE_ECLIENT_READ;
-
-		shapito_fe_msg_t type = *stream->start;
-		od_debug(&instance->logger, "local", client, NULL, "%s",
-		         shapito_fe_msg_to_string(type));
-
-		if (type == SHAPITO_FE_TERMINATE)
-			break;
-
-		if (type == SHAPITO_FE_QUERY) {
-			od_consolestatus_t cs;
-			cs = od_console_request(client, stream->start,
-			                        shapito_stream_used(stream));
-			if (cs == OD_CERROR) {
-			}
-			rc = od_write(client->io, stream);
-			if (rc == -1)
-				return OD_FE_ECLIENT_WRITE;
-			continue;
-		}
-
-		/* unsupported */
-		od_error(&instance->logger, "local", client, NULL,
-		         "unsupported request '%s'",
-		         shapito_fe_msg_to_string(type));
-		od_frontend_error(client, SHAPITO_FEATURE_NOT_SUPPORTED,
-		                  "unsupported request '%s'",
-		                  shapito_fe_msg_to_string(type));
-		shapito_stream_reset(stream);
-		rc = shapito_be_write_ready(stream, 'I');
-		if (rc == -1)
-			return OD_FE_ECLIENT_WRITE;
-		rc = od_write(client->io, stream);
-		if (rc == -1)
-			return OD_FE_ECLIENT_WRITE;
-	}
-	return OD_FE_OK;
-}
-
-static inline od_frontend_rc_t
-od_frontend_remote_client(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
-	od_server_t *server = client->server;
-	shapito_stream_t *stream = client->stream;
-	shapito_stream_reset(stream);
-
-	int request_count = 0;
-	int terminate = 0;
-
-	/* get server connection from the route pool, write configuration
-	 * requests before client request */
-	if (server == NULL) {
-		od_frontend_rc_t fe_rc;
-		fe_rc = od_frontend_attach(client, "main");
-		if (fe_rc != OD_FE_OK)
-			return fe_rc;
-		server = client->server;
-		request_count = server->deploy_sync;
-	}
-
-	int rc;
-	for (;;)
-	{
-		int request_start = shapito_stream_used(stream);
-		rc = od_read(client->io, stream, UINT32_MAX);
-		if (rc == -1)
-			return OD_FE_ECLIENT_READ;
-		char *request = stream->start + request_start;
-		int   request_size = shapito_stream_used(stream) - request_start;
-
-		/* update client recv stat */
-		od_server_stat_recv_client(server, request_size);
-
-		shapito_fe_msg_t type = *request;
-		od_debug(&instance->logger, "main", client, server, "%s",
-		         shapito_fe_msg_to_string(type));
-
-		if (type == SHAPITO_FE_TERMINATE) {
-			/* discard terminate request */
-			stream->pos = stream->start + request_start;
-			terminate = 1;
-			if (request_count == server->deploy_sync) {
-				shapito_stream_reset(stream);
-				server->deploy_sync = 0;
-			}
-			break;
-		}
-
-		switch (type) {
-		case SHAPITO_FE_COPY_DONE:
-		case SHAPITO_FE_COPY_FAIL:
-			server->is_copy = 0;
-			break;
-		case SHAPITO_FE_QUERY:
-			if (instance->config.log_query) {
-				uint32_t query_len;
-				char *query;
-				rc = shapito_be_read_query(&query, &query_len, request, request_size);
-				if (rc == 0) {
-					od_log(&instance->logger, "main", client, server,
-					       "%.*s", query_len, query);
-				} else {
-					od_error(&instance->logger, "main", client, server,
-					         "%s", "failed to parse Query");
-				}
-			}
-			break;
-		default:
-			break;
-		}
-
-		if (type == SHAPITO_FE_QUERY ||
-		    type == SHAPITO_FE_FUNCTION_CALL ||
-		    type == SHAPITO_FE_SYNC)
-		{
-			request_count++;
-		}
-
-		rc = od_frontend_stream_hit_limit(client);
-		if (rc)
-			break;
-
-		rc = machine_read_pending(client->io);
-		if (rc < 0 || rc > 0)
-			continue;
-		break;
-	}
-
-	/* forward to server */
-	if (shapito_stream_used(stream) > 0)
-	{
-		rc = od_write(server->io, stream);
-		if (rc == -1)
-			return OD_FE_ESERVER_WRITE;
-
-		/* update server sync state */
-		od_server_stat_request(server, request_count);
-	}
-
-	if (terminate)
-		return OD_FE_TERMINATE;
-
-	return OD_FE_OK;
-}
-
-static inline od_frontend_rc_t
-od_frontend_remote_server(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
-	od_route_t *route = client->route;
-	od_server_t *server = client->server;
-	shapito_stream_t *stream = client->stream;
-	shapito_stream_reset(stream);
-
-	int rc;
-	for (;;)
-	{
-		int request_start = shapito_stream_used(stream);
-		rc = od_read(server->io, stream, UINT32_MAX);
-		if (rc == -1)
-			return OD_FE_ESERVER_READ;
-		char *request = stream->start + request_start;
-		int   request_size = shapito_stream_used(stream) - request_start;
-
-		/* update server recv stats */
-		od_server_stat_recv_server(server, request_size);
-
-		shapito_be_msg_t type = *request;
-		od_debug(&instance->logger, "main", client, server, "%s",
-		         shapito_be_msg_to_string(type));
-
-		/* discard replies during configuration deploy */
-		if (server->deploy_sync > 0) {
-			rc = od_backend_deploy(server, "main-deploy", request, request_size);
-			if (rc == -1)
-				return OD_FE_ESERVER_CONFIGURE;
-			shapito_stream_reset(stream);
-			continue;
-		}
-
-		if (type == SHAPITO_BE_READY_FOR_QUERY) {
-			rc = od_backend_ready(server, "main", request, request_size);
-			if (rc == -1)
-				return OD_FE_ECLIENT_READ;
-
-			/* handle transaction pooling */
-			if (route->config->pool == OD_POOLING_TRANSACTION) {
-				if (! server->is_transaction) {
-					/* cleanup server */
-					rc = od_reset(server);
-					if (rc == -1)
-						return OD_FE_ESERVER_WRITE;
-					/* push server connection back to route pool */
-					od_router_detach(client);
-					server = NULL;
-				}
-				break;
-			}
-		}
-
-		switch (type) {
-		case SHAPITO_BE_ERROR_RESPONSE:
-			od_backend_error(server, "main", request, request_size);
-			break;
-		case SHAPITO_BE_PARAMETER_STATUS: {
-			char *name;
-			uint32_t name_len;
-			char *value;
-			uint32_t value_len;
-			rc = shapito_fe_read_parameter(request, request_size, &name, &name_len,
-			                               &value, &value_len);
-			if (rc == -1) {
-				od_error(&instance->logger, "main", client, server,
-				         "failed to parse ParameterStatus message");
-				return OD_FE_ESERVER_READ;
+	bool wait_for_idle = false;
+	for (;;) {
+		od_router_status_t status;
+		status = od_router_attach(router, client, wait_for_idle,
+					  endpoint, immediate);
+		if (status != OD_ROUTER_OK) {
+			if (immediate && status == OD_ROUTER_ERROR_TIMEDOUT) {
+				return OD_EATTACH_TOO_MANY_CONNECTIONS;
 			}
 
-			/* update server and current client parameter state */
-			rc = shapito_parameters_update(&server->params, name, name_len,
-			                               value, value_len);
-			if (rc == -1)
-				return OD_FE_ESERVER_CONFIGURE;
-
-			rc = shapito_parameters_update(&client->params, name, name_len,
-			                               value, value_len);
-			if (rc == -1)
-				return OD_FE_ESERVER_CONFIGURE;
-
-			od_debug(&instance->logger, "main", client, server,
-			         "%.*s = %.*s",
-			         name_len, name, value_len, value);
-			break;
+			if (status == OD_ROUTER_ERROR_TIMEDOUT) {
+				od_error(&instance->logger, client, NULL,
+					 "server pool wait timed out, closing");
+				return OD_EATTACH_TOO_MANY_CONNECTIONS;
+			}
+			return OD_EATTACH;
 		}
 
-		case SHAPITO_BE_COPY_IN_RESPONSE:
-		case SHAPITO_BE_COPY_OUT_RESPONSE:
-			server->is_copy = 1;
-			break;
-		case SHAPITO_BE_COPY_DONE:
-			server->is_copy = 0;
-			break;
-		default:
-			break;
-		}
-
-		rc = od_frontend_stream_hit_limit(client);
-		if (rc)
-			break;
-
-		rc = machine_read_pending(server->io);
-		if (rc < 0 || rc > 0)
-			continue;
-		break;
-	}
-
-	/* forward to client */
-	if (shapito_stream_used(stream) > 0) {
-		rc = od_write(client->io, stream);
-		if (rc == -1)
-			return OD_FE_ECLIENT_WRITE;
-	}
-
-	return OD_FE_OK;
-}
-
-static od_frontend_rc_t
-od_frontend_remote(od_client_t *client)
-{
-	od_instance_t *instance = client->global->instance;
-	assert(client->stream != NULL);
-
-	machine_io_t *io_ready[2];
-	machine_io_t *io_set[2];
-	int           io_count = 1;
-	int           io_pos;
-	io_set[0] = client->io;
-	io_set[1] = NULL;
-
-	for (;;)
-	{
-		od_client_stream_detach(client, &instance->stream_cache);
-
-		int ready;
-		ready = machine_read_poll(io_set, io_ready, io_count, UINT32_MAX);
-
-		od_client_stream_attach(client, &instance->stream_cache);
-
-		for (io_pos = 0; io_pos < ready; io_pos++)
-		{
-			machine_io_t *io = io_ready[io_pos];
-			od_frontend_rc_t fe_rc;
-			if (io == client->io) {
-				fe_rc = od_frontend_remote_client(client);
-				if (fe_rc != OD_FE_OK)
-					return fe_rc;
-				assert(client->server != NULL);
-				io_count  = 2;
-				io_set[1] = client->server->io;
+		od_server_t *server = client->server;
+		if (server->io.io && server->route->rule->pool->attach_check) {
+			int events = od_io_poll(&server->io);
+			if (events < 0) {
+				od_error(&instance->logger, client, server,
+					 "server fd poll failed, errno=%d (%s)",
+					 machine_errno(),
+					 strerror(machine_errno()));
+			} else if ((events & MM_R) ||
+				   !od_io_connected(&server->io)) {
+				od_debug(
+					&instance->logger, client, server,
+					"server disconnected or has pending data (%s), close connection and retry attach",
+					od_io_error(&server->io));
+				od_router_close(router, client);
 				continue;
 			}
-			fe_rc = od_frontend_remote_server(client);
-			if (fe_rc != OD_FE_OK)
-				return fe_rc;
-			if (client->server == NULL) {
-				io_count  = 1;
-				io_set[1] = NULL;
+		}
+		od_debug(&instance->logger, client, server,
+			 "client %s%.*s attached to %s%.*s",
+			 client->id.id_prefix, (int)sizeof(client->id.id),
+			 client->id.id, server->id.id_prefix,
+			 (int)sizeof(server->id.id), server->id.id);
+
+		od_assert(od_server_synchronized(server));
+
+		/* connect to server, if necessary */
+		if (od_backend_not_connected(server)) {
+			int rc;
+			atomic_fetch_add(&router->servers_routing, 1);
+
+			od_assert(client->source != NULL);
+			rc = od_backend_connect(server, route_params, client,
+						storage);
+
+			atomic_fetch_sub(&router->servers_routing, 1);
+			if (rc == NOT_OK_RESPONSE) {
+				/* In case of 'too many connections' error, retry attach attempt by
+				* waiting for a idle server connection for pool_timeout ms
+				*/
+				wait_for_idle =
+					route->rule->pool->timeout_ms > 0 &&
+					od_frontend_error_is_too_many_connections(
+						client);
+				if (wait_for_idle) {
+					od_router_close(router, client);
+					if (instance->config
+						    .server_login_retry_ms) {
+						machine_sleep(
+							(uint32_t)instance
+								->config
+								.server_login_retry_ms);
+					}
+					continue;
+				}
+
+				od_storage_endpoint_status_set_dead(
+					&endpoint->status);
+				return OD_ESERVER_CONNECT;
+			}
+		}
+
+		int rc = od_backend_startup_preallocated(server, route_params,
+							 client);
+		if (rc != OK_RESPONSE) {
+			od_storage_endpoint_status_set_dead(&endpoint->status);
+			return OD_ESERVER_CONNECT;
+		}
+
+		od_tsa_check_result_t trc = od_backend_check_tsa(
+			storage, endpoint, server, client, tsa);
+		if (trc != OD_TSA_CHECK_OK) {
+			od_address_to_str(&endpoint->address, addr,
+					  sizeof(addr) - 1);
+			od_debug(
+				&instance->logger, client, server,
+				"read-write status of '%s' is mismatched with expected '%s' or failed to update",
+				addr, od_target_session_attrs_to_str(tsa));
+
+			/* Setup may discard the collected startup parameters on
+			 * failure. Do not pool a connection that cannot send them
+			 * again when the next client initializes the route. */
+			if (trc == OD_TSA_CHECK_BACKEND_ERROR ||
+			    route_params != NULL) {
+				od_router_close(router, client);
+			} else {
+				od_router_detach(router, client);
+			}
+
+			/* try another host */
+			return OD_EATTACH_TARGET_SESSION_ATTRS_MISMATCH;
+		}
+
+		if (is_deploy && client->rule->maintain_params) {
+			int rc = od_deploy(client);
+			if (rc == -1) {
+				od_gerror(client, client->server,
+					  "deploy failed, errno=%d (%s)",
+					  mm_errno_get(),
+					  strerror(mm_errno_get()));
+				return OD_ESERVER_WRITE;
+			}
+		}
+
+		if (is_deploy && storage->balancing.debug_notice &&
+		    storage->endpoints_count > 1) {
+			od_address_to_str(&client->server->endpoint->address,
+					  addr, sizeof(addr) - 1);
+
+			char msg[256];
+			od_snprintf(msg, sizeof(msg), "select host %s", addr);
+
+			char buf[256];
+			int n = kiwi_be_format_notice(buf, sizeof(buf), 'M',
+						      msg);
+			if (n != -1) {
+				size_t unused;
+				if (od_io_write_raw(&client->io, buf, n,
+						    &unused, 1000, 0) != 0) {
+					return OD_ECLIENT_WRITE;
+				}
+			}
+		}
+
+		return OD_OK;
+	}
+}
+
+static uint32_t get_effective_catchup_timeout(od_client_t *client)
+{
+	uint32_t effective_timeout = 0;
+
+	/*
+	 * next priorities to get the catchup timeout:
+	 *
+	 * var from pgoption > value from rule > value from listen
+	 */
+
+	od_config_listen_t *listen = client->source->config;
+
+	int default_timeout = 0;
+	if (listen != NULL) {
+		default_timeout = listen->catchup_timeout;
+	}
+
+	if (client->rule->catchup_timeout != 0) {
+		default_timeout = client->rule->catchup_timeout;
+	}
+
+	effective_timeout = (uint32_t)default_timeout;
+
+	kiwi_var_t *timeout_var =
+		kiwi_vars_get(&client->vars, KIWI_VAR_ODYSSEY_CATCHUP_TIMEOUT);
+
+	if (timeout_var != NULL) {
+		/* if there is catchup pgoption variable in startup packet */
+		char *end;
+		uint32_t user_catchup_timeout =
+			strtol(timeout_var->value, &end, 10);
+		if (end == timeout_var->value + timeout_var->value_len) {
+			/* if where is no junk after number, thats ok */
+			effective_timeout = user_catchup_timeout;
+		} else {
+			od_gerror(client, NULL,
+				  "junk after catchup timeout, ignore value");
+		}
+	}
+
+	return effective_timeout;
+}
+
+typedef struct {
+	od_rule_storage_t *storage;
+	od_target_session_attrs_t tsa;
+	uint32_t lag_timeout;
+	/*
+	 * For prefer-standby: when set, the primary (RW host) is filtered
+	 * out so that round-robin rotates over standbys only. Cleared on
+	 * the fallback pass to allow connecting to the primary.
+	 */
+	int standby_only;
+} host_select_arg_t;
+
+static int check_lag(uint32_t timeout, int64_t lag)
+{
+	if (timeout == 0) {
+		return 1;
+	}
+
+	if (lag < 0) {
+		lag = 0;
+	}
+
+	return lag <= (int64_t)timeout;
+}
+
+static int host_filter(od_storage_endpoint_t *endpoint, void *a)
+{
+	host_select_arg_t *arg = a;
+	od_rule_storage_t *storage = arg->storage;
+	od_target_session_attrs_t tsa = arg->tsa;
+
+	od_storage_endpoint_status_t status;
+	od_storage_endpoint_status_init(&status);
+	od_storage_endpoint_status_get(&endpoint->status, &status);
+
+	int status_is_recent = !od_storage_endpoint_status_is_outdated(
+		&status, storage->endpoints_status_poll_interval_ms);
+
+	if (status_is_recent) {
+		int tsa_match =
+			od_tsa_match_rw_state(tsa, status.is_read_write);
+		int lag_match =
+			check_lag(arg->lag_timeout, status.repl_lag_sec);
+
+		if (!status.alive || !lag_match || !tsa_match) {
+			return 0;
+		}
+
+		/*
+		 * For prefer-standby we want round-robin to rotate over
+		 * standbys (RO hosts) only, so that the balancing counter
+		 * advances by the number of standbys, not by the total
+		 * number of hosts (which would skew distribution towards
+		 * the standby preceding the primary in the list).
+		 *
+		 * The primary is kept as a fallback and is tried later via
+		 * a separate balancing_select pass without this filter.
+		 */
+		if (arg->standby_only && status.is_read_write) {
+			return 0;
+		}
+	}
+
+	/* lets try the host */
+	return 1;
+}
+
+static od_frontend_status_t
+attach_to_first(od_client_t *client, kiwi_params_t *route_params,
+		od_storage_endpoint_t **endpoints, size_t count,
+		od_target_session_attrs_t tsa, int fail_fast, int is_deploy,
+		od_rule_storage_t *storage)
+{
+	od_instance_t *instance = client->global->instance;
+	od_frontend_status_t status = OD_EATTACH;
+
+	for (size_t i = 0; i < count; ++i) {
+		od_storage_endpoint_t *endpoint = endpoints[i];
+
+		if (od_logger_debug_enabled(&instance->logger, client, NULL)) {
+			char addr[256];
+			od_address_to_str(&endpoint->address, addr,
+					  sizeof(addr) - 1);
+
+			od_debug(&instance->logger, client, NULL,
+				 "trying to attach to %s...", addr);
+		}
+
+		/*
+		 * if client is attached now - previous attach failed
+		 * but the server is still in active state and attached to client
+		 *
+		 * so now need to detach the server from the client,
+		 * servers stays attached to client in case of error
+		 * to have an ability to perform error forwarding
+		 *
+		 * TODO: fix this way of forwarding the error
+		 */
+		if (client->server != NULL) {
+			od_router_close(client->global->router, client);
+		}
+
+		status =
+			od_frontend_attach_to_endpoint(client, route_params,
+						       endpoint, tsa, fail_fast,
+						       is_deploy, storage);
+
+		if (status == OD_OK) {
+			return status;
+		}
+
+		if (od_logger_debug_enabled(&instance->logger, client, NULL)) {
+			char addr[256];
+			od_address_to_str(&endpoint->address, addr,
+					  sizeof(addr) - 1);
+
+			od_debug(&instance->logger, client, NULL,
+				 "attach to %s failed with status: %s", addr,
+				 od_frontend_status_to_str(status));
+		}
+	}
+
+	return status;
+}
+
+static od_frontend_status_t
+attach_to_first_with_fail_fast(od_client_t *client, kiwi_params_t *route_params,
+			       od_storage_endpoint_t **endpoints, size_t count,
+			       od_target_session_attrs_t tsa, int is_deploy,
+			       od_rule_storage_t *storage)
+{
+	int acquire_fail_fast =
+		client->route->rule->pool->acquire_fail_fast && count > 1;
+
+	/*
+	 * Per-client override: when set via SET odyssey.opportunistic_acquire,
+	 * never wait for a free connection — fail immediately with
+	 * "too many connections", even for a single host, and do not retry.
+	 */
+	int client_opportunistic = client->opportunistic_acquire;
+	if (client_opportunistic) {
+		acquire_fail_fast = 1;
+	}
+
+	od_frontend_status_t status =
+		attach_to_first(client, route_params, endpoints, count, tsa,
+				acquire_fail_fast, is_deploy, storage);
+	if (status != OD_OK && acquire_fail_fast && !client_opportunistic) {
+		/*
+		 * attach failed
+		 *
+		 * if this was an attempt to do it without awaiting - retry with awaiting
+		 * for connections from pool
+		 */
+		status = attach_to_first(client, route_params, endpoints, count,
+					 tsa,
+					 0 /* wait for connection from pool */,
+					 is_deploy, storage);
+	}
+
+	return status;
+}
+
+static od_target_session_attrs_t attach_effective_tsa(od_client_t *client)
+{
+	od_target_session_attrs_t tsa = od_tsa_get_effective(client);
+
+	if (!od_tsa_auto_route_ro_enabled(client)) {
+		return tsa;
+	}
+
+	if (kiwi_vars_get(&client->vars,
+			  KIWI_VAR_ODYSSEY_TARGET_SESSION_ATTRS) != NULL) {
+		return tsa;
+	}
+
+	od_instance_t *instance = client->global->instance;
+
+	const od_query_ctx_t *qctx = &client->query_ctx;
+	if (!od_query_ctx_standby_friendly(qctx)) {
+		od_debug(
+			&instance->logger, client, NULL,
+			"auto_route_ro_on_standby: read-write query, route to master");
+		return OD_TARGET_SESSION_ATTRS_RW;
+	}
+
+	od_debug(&instance->logger, client, NULL,
+		 "auto_route_ro_on_standby: read-only query, prefer-standby");
+
+	return OD_TARGET_SESSION_ATTRS_PREFER_STANDBY;
+}
+
+static od_frontend_status_t attach_with_storage(od_client_t *client,
+						kiwi_params_t *route_params,
+						od_rule_storage_t *storage,
+						int is_deploy)
+{
+	od_instance_t *instance = client->global->instance;
+	od_route_t *route = client->route;
+
+	od_target_session_attrs_t tsa = attach_effective_tsa(client);
+
+	if (client->execute_on_host.host != NULL) {
+		/*
+		 * explicit host was requested with SET odyssey.execute_on_host:
+		 * skip balancing and attach to this host only (tsa still checked)
+		 */
+		od_storage_endpoint_t *endpoint =
+			od_storage_find_endpoint_by_host(
+				storage, &client->execute_on_host);
+		if (endpoint == NULL) {
+			char addr[256];
+			od_address_to_str(&client->execute_on_host, addr,
+					  sizeof(addr) - 1);
+			od_debug(&instance->logger, client, NULL,
+				 "execute_on_host %s is not in storage '%s'",
+				 addr, storage->name);
+			return OD_EATTACH;
+		}
+
+		return attach_to_first_with_fail_fast(client, route_params,
+						      &endpoint, 1, tsa,
+						      is_deploy, storage);
+	}
+
+	uint32_t lag_timeout = get_effective_catchup_timeout(client);
+
+	host_select_arg_t arg;
+	arg.storage = storage;
+	arg.tsa = tsa;
+	arg.lag_timeout = lag_timeout;
+	arg.standby_only = 0;
+
+	od_storage_endpoint_t *endpoints[OD_STORAGE_MAX_ENDPOINTS];
+	od_storage_balancing_t *balancing =
+		od_balancing_get_effective(client, storage);
+
+	od_frontend_status_t status = OD_EATTACH;
+
+	if (tsa == OD_TARGET_SESSION_ATTRS_PREFER_STANDBY) {
+		/*
+		 * First pass: balance over standbys only so that the
+		 * round-robin counter advances by the number of
+		 * standbys (not by the total number of hosts), keeping
+		 * distribution even across replicas.
+		 */
+		arg.standby_only = 1;
+		size_t count = od_storage_balancing_select(
+			balancing, storage, route, endpoints,
+			sizeof(endpoints) / sizeof(endpoints[0]), host_filter,
+			&arg);
+
+		if (count > 0) {
+			status = attach_to_first_with_fail_fast(
+				client, route_params, endpoints, count, tsa,
+				is_deploy, storage);
+			if (status == OD_OK) {
+				return status;
+			}
+		}
+
+		/*
+		 * Fallback: no standbys available or all standby
+		 * attempts failed — retry over all hosts (including the
+		 * primary) without the standby-only filter.
+		 */
+		arg.standby_only = 0;
+	}
+
+	size_t count = od_storage_balancing_select(
+		balancing, storage, route, endpoints,
+		sizeof(endpoints) / sizeof(endpoints[0]), host_filter, &arg);
+
+	status = attach_to_first_with_fail_fast(client, route_params, endpoints,
+						count, tsa, is_deploy, storage);
+
+	return status;
+}
+
+static od_frontend_status_t
+attach_impl(od_client_t *client, kiwi_params_t *route_params, int is_deploy)
+{
+	od_instance_t *instance = client->global->instance;
+	od_config_listen_t *listen = client->source->config;
+
+	if (listen != NULL && listen->storage_count > 0) {
+		od_router_t *router = client->global->router;
+		od_frontend_status_t status = OD_EATTACH;
+
+		for (size_t i = 0; i < listen->storage_count; ++i) {
+			const char *name = listen->storage_names[i];
+
+			od_router_lock(router);
+			od_rule_storage_t *storage =
+				od_rules_storage_match(&router->rules, name);
+			if (storage != NULL) {
+				od_rules_storage_ref(storage);
+			}
+			od_router_unlock(router);
+
+			if (storage == NULL) {
+				od_error(&instance->logger, client, NULL,
+					 "storage '%s' not found, skipping",
+					 name);
+				continue;
+			}
+
+			if (storage->storage_type !=
+			    client->route->rule->storage->storage_type) {
+				od_debug(
+					&instance->logger, client, NULL,
+					"storage '%s' has mismatched storage_type, skipping",
+					name);
+				od_rules_storage_unref(storage);
+				continue;
+			}
+
+			od_debug(&instance->logger, client, NULL,
+				 "trying storage '%s' (%zu/%zu)", name, i + 1,
+				 listen->storage_count);
+
+			status = attach_with_storage(client, route_params,
+						     storage, is_deploy);
+
+			od_rules_storage_unref(storage);
+
+			if (status == OD_OK) {
+				return OD_OK;
+			}
+
+			od_debug(&instance->logger, client, NULL,
+				 "storage '%s' failed with status: %s", name,
+				 od_frontend_status_to_str(status));
+		}
+
+		return status;
+	}
+
+	return attach_with_storage(client, route_params,
+				   client->route->rule->storage, is_deploy);
+}
+
+int od_frontend_host_is_known(od_client_t *client, const od_address_t *address)
+{
+	od_config_listen_t *listen = client->source->config;
+
+	if (listen == NULL || listen->storage_count == 0) {
+		return od_storage_find_endpoint_by_host(
+			       client->route->rule->storage, address) != NULL;
+	}
+
+	od_router_t *router = client->global->router;
+	int found = 0;
+
+	od_router_lock(router);
+	for (size_t i = 0; i < listen->storage_count && !found; ++i) {
+		od_rule_storage_t *storage = od_rules_storage_match(
+			&router->rules, listen->storage_names[i]);
+		if (storage == NULL) {
+			continue;
+		}
+		found = od_storage_find_endpoint_by_host(storage, address) !=
+			NULL;
+	}
+	od_router_unlock(router);
+
+	return found;
+}
+
+od_frontend_status_t od_frontend_attach(od_client_t *client,
+					kiwi_params_t *route_params)
+{
+	return attach_impl(client, route_params, 0 /* is_deploy */);
+}
+
+od_frontend_status_t od_frontend_attach_and_deploy(od_client_t *client)
+{
+	/* attach and maybe connect server, then deploy params */
+	return attach_impl(client, NULL, 1 /* is_deploy */);
+}
+
+static inline od_frontend_status_t od_frontend_setup_params(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+	od_router_t *router = client->global->router;
+	od_route_t *route = client->route;
+
+	/* ensure route has cached server parameters */
+	int rc;
+	rc = kiwi_params_lock_count(&route->params);
+	if (rc == 0) {
+		kiwi_params_t route_params;
+		kiwi_params_init(&route_params);
+
+		od_frontend_status_t status;
+		status = od_frontend_attach(client, &route_params);
+		if (status != OD_OK) {
+			kiwi_params_free(&route_params);
+			return status;
+		}
+
+		od_router_detach(router, client);
+
+		/* There is possible race here, so we will discard our
+		 * attempt if params are already set */
+		rc = kiwi_params_lock_set_once(&route->params, &route_params);
+		if (!rc) {
+			kiwi_params_free(&route_params);
+		}
+	}
+
+	od_debug(&instance->logger, client, NULL, "sending params:");
+
+	/* send parameters set by client or cached by the route */
+	kiwi_param_t *param = route->params.params.list;
+
+	machine_msg_t *stream = machine_msg_create(0);
+	if (stream == NULL) {
+		return OD_EOOM;
+	}
+
+	while (param) {
+		kiwi_var_type_t type;
+		type = kiwi_vars_find(&client->vars, kiwi_param_name(param),
+				      param->name_len);
+		kiwi_var_t *var;
+		var = kiwi_vars_get(&client->vars, type);
+
+		machine_msg_t *msg;
+		if (var) {
+			msg = kiwi_be_write_parameter_status(stream, var->name,
+							     var->name_len,
+							     var->value,
+							     var->value_len);
+
+			od_debug(&instance->logger, client, NULL,
+				 " %.*s = %.*s", var->name_len, var->name,
+				 var->value_len, var->value);
+		} else {
+			msg = kiwi_be_write_parameter_status(
+				stream, kiwi_param_name(param), param->name_len,
+				kiwi_param_value(param), param->value_len);
+
+			od_debug(&instance->logger, client, NULL,
+				 " %.*s = %.*s", param->name_len,
+				 kiwi_param_name(param), param->value_len,
+				 kiwi_param_value(param));
+		}
+		if (msg == NULL) {
+			machine_msg_free(stream);
+			return OD_EOOM;
+		}
+
+		param = param->next;
+	}
+
+	od_wait_event_start(OD_WAIT_DEPLOY_CLIENT_WRITE);
+	rc = od_write(&client->io, stream);
+	od_wait_event_end(OD_WAIT_DEPLOY_CLIENT_WRITE);
+	if (rc == -1) {
+		return OD_ECLIENT_WRITE;
+	}
+
+	return OD_OK;
+}
+
+static inline od_frontend_status_t od_frontend_setup(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+	od_route_t *route = client->route;
+
+	/* set parameters */
+	od_frontend_status_t status;
+	status = od_frontend_setup_params(client);
+	if (status != OD_OK) {
+		return status;
+	}
+
+	if (route->rule->pool->reserve_prepared_statement) {
+		if (od_client_init_hm(client) != OK_RESPONSE) {
+			od_log(&instance->logger, client, NULL,
+			       "failed to initialize hash map for prepared statements");
+			return OD_EOOM;
+		}
+	}
+
+	/* write key data message */
+	machine_msg_t *stream;
+	machine_msg_t *msg;
+	msg = kiwi_be_write_backend_key_data(NULL, &client->key);
+	if (msg == NULL) {
+		return OD_EOOM;
+	}
+	stream = msg;
+
+	/* write ready message */
+	msg = kiwi_be_write_ready(stream, 'I');
+	if (msg == NULL) {
+		machine_msg_free(stream);
+		return OD_EOOM;
+	}
+
+	int rc;
+	od_wait_event_start(OD_WAIT_DEPLOY_CLIENT_WRITE);
+	rc = od_write(&client->io, stream);
+	od_wait_event_end(OD_WAIT_DEPLOY_CLIENT_WRITE);
+	if (rc == -1) {
+		return OD_ECLIENT_WRITE;
+	}
+
+	if (instance->config.log_session) {
+		client->time_setup = machine_time_us();
+		od_log(&instance->logger, client, NULL,
+		       "client '%s.%s' from '%s' to route %s.%s accepted"
+		       " login time: %" PRIu64 " microseconds",
+		       client->startup.database.value,
+		       client->startup.user.value, client->peer,
+		       route->rule->db_name, route->rule->user_name,
+		       client->time_setup - client->time_accept);
+	}
+
+	return OD_OK;
+}
+
+static inline od_frontend_status_t od_frontend_local_setup(od_client_t *client)
+{
+	machine_msg_t *stream;
+	stream = machine_msg_create(0);
+
+	if (stream == NULL) {
+		goto error;
+	}
+	/* client parameters */
+	machine_msg_t *msg;
+	char data[128];
+	int data_len;
+	/* current version and build */
+#ifdef ODYSSEY_VERSION_GIT
+	data_len = od_snprintf(data, sizeof(data), "%s (git %s)",
+			       ODYSSEY_VERSION_NUMBER, ODYSSEY_VERSION_GIT);
+#else
+	data_len =
+		od_snprintf(data, sizeof(data), "%s", ODYSSEY_VERSION_NUMBER);
+#endif
+	msg = kiwi_be_write_parameter_status(stream, "server_version", 15, data,
+					     data_len + 1);
+	if (msg == NULL) {
+		goto error;
+	}
+	msg = kiwi_be_write_parameter_status(stream, "server_encoding", 16,
+					     "UTF-8", 6);
+	if (msg == NULL) {
+		goto error;
+	}
+	msg = kiwi_be_write_parameter_status(stream, "client_encoding", 16,
+					     "UTF-8", 6);
+	if (msg == NULL) {
+		goto error;
+	}
+	msg = kiwi_be_write_parameter_status(stream, "DateStyle", 10, "ISO", 4);
+	if (msg == NULL) {
+		goto error;
+	}
+	msg = kiwi_be_write_parameter_status(stream, "TimeZone", 9, "GMT", 4);
+	if (msg == NULL) {
+		goto error;
+	}
+	/* ready message */
+	msg = kiwi_be_write_ready(stream, 'I');
+	if (msg == NULL) {
+		goto error;
+	}
+	int rc;
+	od_wait_event_start(OD_WAIT_QUERY_CLIENT_WRITE);
+	rc = od_write(&client->io, stream);
+	od_wait_event_end(OD_WAIT_QUERY_CLIENT_WRITE);
+	if (rc == -1) {
+		return OD_ECLIENT_WRITE;
+	}
+	return OD_OK;
+error:
+	if (stream) {
+		machine_msg_free(stream);
+	}
+	return OD_EOOM;
+}
+
+static inline bool od_eject_conn_with_rate(od_client_t *client,
+					   od_server_t *server,
+					   od_instance_t *instance)
+{
+	od_config_t *config = &instance->config;
+
+	if (!config->conn_drop_options.drop_enabled) {
+		return false;
+	}
+
+	if (server == NULL && client->rule != NULL &&
+	    client->rule->pool->pool_type == OD_RULE_POOL_SESSION) {
+		od_log(&instance->logger, client, server,
+		       "drop client because it was never attached to server");
+		return true;
+	}
+	od_thread_global **gl = od_thread_global_get();
+	if (gl == NULL) {
+		od_log(&instance->logger, client, server,
+		       "drop client connection on graceful shutdown, unable to throttle (wid %d)",
+		       (*gl)->wid);
+		/* this is clearly something bad, TODO: handle properly */
+		return true;
+	}
+
+	od_conn_eject_info *info = (*gl)->info;
+
+	uint64_t now_ms = machine_time_ms();
+	bool res = false;
+
+	if (od_conn_eject_info_try(info, now_ms)) {
+		res = true;
+
+		od_log(&instance->logger, client, server,
+		       "drop client connection on graceful shutdown");
+	} else {
+		od_debug(
+			&instance->logger, client, server,
+			"delay drop client connection on graceful shutdown, rate limited");
+	}
+
+	return res;
+}
+
+static inline bool od_eject_conn_with_timeout(od_client_t *client,
+					      __attribute__((unused))
+					      od_server_t *server,
+					      uint64_t timeout)
+{
+	od_assert(server != NULL);
+
+	if (client->time_last_active + timeout < machine_time_us()) {
+		return true;
+	}
+
+	return false;
+}
+
+static od_frontend_status_t od_frontend_ctl(od_client_t *client)
+{
+	if (atomic_load(&client->killed) == 1) {
+		return OD_ECLIENT_KILLED;
+	}
+
+	return OD_OK;
+}
+
+static inline od_frontend_status_t
+od_process_drop_on_restart(od_client_t *client)
+{
+	/* TODO:: drop no more than X connection per sec/min/whatever */
+	od_instance_t *instance = client->global->instance;
+	od_server_t *server = client->server;
+
+	if (od_likely(!od_worker_is_shutting_down())) {
+		return OD_OK;
+	}
+
+	if (od_unlikely(client->rule != NULL &&
+			client->rule->storage->storage_type ==
+				OD_RULE_STORAGE_LOCAL)) {
+		/* local server is not very important (db like console, pgbouncer used for stats) */
+		return OD_EGRACEFUL_SHUTDOWN;
+	}
+
+	if (od_unlikely(server == NULL)) {
+		if (od_eject_conn_with_rate(client, server, instance)) {
+			return OD_EGRACEFUL_SHUTDOWN;
+		}
+		return OD_OK;
+	}
+
+	if (server->state ==
+		    OD_SERVER_ACTIVE /* we can drop client that are just connected and do not perform any queries */
+	    && !od_server_synchronized(server)) {
+		/* most probably we are not in transaction, but still executing some stmt */
+		return OD_OK;
+	}
+
+	if (od_unlikely(!server->is_transaction)) {
+		if (od_eject_conn_with_rate(client, server, instance)) {
+			return OD_EGRACEFUL_SHUTDOWN;
+		}
+		return OD_OK;
+	}
+
+	return OD_OK;
+}
+
+static inline od_frontend_status_t
+od_process_drop_on_idle_in_transaction(od_client_t *client, od_server_t *server)
+{
+	od_instance_t *instance = client->global->instance;
+
+	/* the same as above but we are going to drop client inside transaction block */
+	if (server != NULL && server->is_transaction &&
+	    /*server is sync - that means client executed some stmts and got get result, and now just... do nothing */
+	    od_server_synchronized(server)) {
+		if (od_eject_conn_with_timeout(
+			    client, server,
+			    client->rule->pool->idle_in_transaction_timeout)) {
+			od_log(&instance->logger, client, server,
+			       "drop idle in transaction connection on due timeout %" PRIu64
+			       " sec",
+			       client->rule->pool->idle_in_transaction_timeout);
+
+			return OD_EIDLE_IN_TRANSACTION_TIMEOUT;
+		}
+	}
+
+	return OD_OK;
+}
+
+static inline od_frontend_status_t
+od_process_drop_transaction_pool(od_client_t *client)
+{
+	if (client->server != NULL &&
+	    client->rule->pool->idle_in_transaction_timeout > 0) {
+		od_frontend_status_t status =
+			od_process_drop_on_idle_in_transaction(client,
+							       client->server);
+		if (status != OD_OK) {
+			return status;
+		}
+	}
+
+	return od_process_drop_on_restart(client);
+}
+
+static inline od_frontend_status_t
+od_process_drop_on_client_idle_timeout(od_client_t *client, od_server_t *server)
+{
+	od_instance_t *instance = client->global->instance;
+
+	/*
+	 * as we do not unroute client in session pooling after transaction block etc
+	 * we should consider this case separately
+	 * general logic is: if client do nothing long enough we can assume this is just a stale connection
+	 * but we need to ensure this connection was initialized etc
+	 */
+	if (od_unlikely(
+		    server != NULL && !server->is_transaction &&
+		    /* case when we are out of any transactional block ut perform some stmt */
+		    od_server_synchronized(server))) {
+		if (od_eject_conn_with_timeout(
+			    client, server,
+			    client->rule->pool->client_idle_timeout)) {
+			od_log(&instance->logger, client, server,
+			       "drop idle client connection on due timeout %" PRIu64
+			       " sec",
+			       client->rule->pool->client_idle_timeout);
+
+			return OD_EIDLE_TIMEOUT;
+		}
+	}
+
+	return OD_OK;
+}
+
+static inline bool od_process_should_drop_session_on_pause(od_client_t *client,
+							   od_server_t *server)
+{
+	if (!od_global_is_paused(client->global)) {
+		return false;
+	}
+
+	od_route_t *route = client->route;
+
+	/* do not drop console clients */
+	if (route->rule->storage->storage_type == OD_RULE_STORAGE_LOCAL) {
+		return false;
+	}
+
+	if (server == NULL) {
+		return true;
+	}
+
+	if (!od_server_synchronized(server)) {
+		return false;
+	}
+
+	if (server->offline || !server->is_transaction) {
+		return true;
+	}
+
+	return false;
+}
+
+static inline od_frontend_status_t
+od_process_drop_session_pool(od_client_t *client)
+{
+	od_frontend_status_t status;
+	od_server_t *server = client->server;
+
+	if (od_process_should_drop_session_on_pause(client, server)) {
+		od_instance_t *instance = client->global->instance;
+		od_log(&instance->logger, client, server,
+		       "drop client connection on pause");
+
+		return OD_ECLIENT_READ;
+	}
+
+	if (od_unlikely(client->rule->pool->client_idle_timeout)) {
+		status = od_process_drop_on_client_idle_timeout(client, server);
+		if (status != OD_OK) {
+			return status;
+		}
+	}
+
+	if (od_unlikely(client->rule->pool->idle_in_transaction_timeout)) {
+		status = od_process_drop_on_idle_in_transaction(client, server);
+		if (status != OD_OK) {
+			return status;
+		}
+	}
+
+	status = od_process_drop_on_restart(client);
+
+	return status;
+}
+
+static inline od_frontend_status_t
+od_process_connection_drop(od_client_t *client)
+{
+	od_frontend_status_t status = od_frontend_ctl(client);
+	if (status != OD_OK) {
+		return status;
+	}
+
+	switch (client->rule->pool->pool_type) {
+	case OD_RULE_POOL_SESSION:
+		return od_process_drop_session_pool(client);
+	case OD_RULE_POOL_STATEMENT:
+	case OD_RULE_POOL_TRANSACTION:
+		return od_process_drop_transaction_pool(client);
+	default:
+		abort();
+	}
+
+	return OD_OK;
+}
+
+static od_frontend_status_t od_frontend_local(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+
+	od_frontend_status_t status;
+
+	for (;;) {
+		machine_msg_t *msg = NULL;
+		for (;;) {
+			/* local server is always null */
+			od_assert(client->server == NULL);
+			status = od_process_connection_drop(client);
+			if (status != OD_OK) {
+				/* Odyssey is in a state of completion, we done
+				 * the last client's request and now we can drop the connection
+				 */
+				return status;
+			}
+			/* one minute */
+			od_wait_event_start(OD_WAIT_QUERY_CLIENT_READ);
+			msg = od_read(&client->io, 60000, OD_READ_FE);
+			od_wait_event_end(OD_WAIT_QUERY_CLIENT_READ);
+
+			if (machine_timedout()) {
+				/* retry wait to recheck exit condition */
+				od_assert(msg == NULL);
+				continue;
+			}
+
+			if (msg == NULL) {
+				return OD_ECLIENT_READ;
+			} else {
 				break;
+			}
+		}
+
+		kiwi_fe_type_t type;
+		type = *(char *)machine_msg_data(msg);
+
+		od_debug(&instance->logger, client, NULL, "%s",
+			 kiwi_fe_type_to_string(type));
+
+		if (type == KIWI_FE_TERMINATE) {
+			machine_msg_free(msg);
+			break;
+		}
+
+		od_tuple_table_slot_t *tts = od_tuple_table_slot_create();
+		if (tts == NULL) {
+			machine_msg_free(msg);
+			return OD_EOOM;
+		}
+
+		machine_msg_t *stream = tts->data_rows;
+
+		int rc;
+		if (type == KIWI_FE_QUERY) {
+			rc = od_console_query(client, tts,
+					      machine_msg_data(msg),
+					      machine_msg_size(msg));
+			machine_msg_free(msg);
+			if (rc == -1) {
+				od_tuple_table_slot_free(tts);
+				return OD_EOOM;
+			}
+		} else {
+			/* unsupported */
+			machine_msg_free(msg);
+
+			od_error(&instance->logger, client, NULL,
+				 "unsupported request '%s'",
+				 kiwi_fe_type_to_string(type));
+
+			msg = od_frontend_errorf(client, stream,
+						 KIWI_FEATURE_NOT_SUPPORTED,
+						 "unsupported request '%s'",
+						 kiwi_fe_type_to_string(type));
+			if (msg == NULL) {
+				od_tuple_table_slot_free(tts);
+				return OD_EOOM;
+			}
+		}
+
+		/* write row description first, if any */
+		if (machine_msg_size(tts->row_description) > 0) {
+			rc = od_write(&client->io, tts->row_description);
+			tts->row_description = NULL;
+			if (rc == -1) {
+				od_tuple_table_slot_free(tts);
+				return OD_ECLIENT_WRITE;
+			}
+		}
+
+		/* ready */
+		msg = kiwi_be_write_ready(stream, 'I');
+		if (msg == NULL) {
+			od_tuple_table_slot_free(tts);
+			return OD_EOOM;
+		}
+
+		od_wait_event_start(OD_WAIT_QUERY_CLIENT_WRITE);
+		rc = od_write(&client->io, stream);
+		od_wait_event_end(OD_WAIT_QUERY_CLIENT_WRITE);
+		tts->data_rows = NULL;
+		if (rc == -1) {
+			od_tuple_table_slot_free(tts);
+			return OD_ECLIENT_WRITE;
+		}
+
+		od_tuple_table_slot_free(tts);
+	}
+
+	return OD_OK;
+}
+
+static inline bool od_frontend_should_detach_transaction(od_server_t *server)
+{
+	return !server->is_transaction;
+}
+
+static inline bool od_frontend_should_detach_session(od_server_t *server)
+{
+	return (server->offline || od_global_is_paused(server->global)) &&
+	       !server->is_transaction;
+}
+
+static inline bool od_frontend_should_detach(od_route_t *route,
+					     od_server_t *server)
+{
+	switch (route->rule->pool->pool_type) {
+	case OD_RULE_POOL_STATEMENT:
+		return true;
+	case OD_RULE_POOL_TRANSACTION:
+		return od_frontend_should_detach_transaction(server);
+	case OD_RULE_POOL_SESSION:
+		return od_frontend_should_detach_session(server);
+	default:
+		abort();
+	}
+}
+
+static inline od_retcode_t od_frontend_log_describe(od_instance_t *instance,
+						    od_client_t *client,
+						    char *data, int size)
+{
+	uint32_t name_len;
+	char *name;
+	int rc;
+	kiwi_fe_describe_type_t t;
+	rc = kiwi_be_read_describe(data, size, &name, &name_len, &t);
+	if (rc == -1) {
+		return NOT_OK_RESPONSE;
+	}
+
+	od_log(&instance->logger, client, client->server, "(%s) name: %.*s",
+	       t == KIWI_FE_DESCRIBE_PORTAL ? "portal" : "statement", name_len,
+	       name);
+	return OK_RESPONSE;
+}
+
+static inline od_retcode_t od_frontend_log_execute(od_instance_t *instance,
+						   od_client_t *client,
+						   char *data, int size)
+{
+	uint32_t name_len;
+	char *name;
+	int rc;
+	rc = kiwi_be_read_execute(data, size, &name, &name_len);
+	if (rc == -1) {
+		return NOT_OK_RESPONSE;
+	}
+
+	od_log(&instance->logger, client, client->server, "name: %.*s",
+	       name_len, name);
+	return OK_RESPONSE;
+}
+
+static inline od_retcode_t od_frontend_parse_close(char *data, int size,
+						   char **name,
+						   uint32_t *name_len,
+						   kiwi_fe_close_type_t *type)
+{
+	int rc;
+	rc = kiwi_be_read_close(data, size, name, name_len, type);
+	if (rc == -1) {
+		return NOT_OK_RESPONSE;
+	}
+	return OK_RESPONSE;
+}
+
+static inline od_retcode_t od_frontend_log_close(od_instance_t *instance,
+						 od_client_t *client,
+						 char *name, uint32_t name_len,
+						 kiwi_fe_close_type_t type)
+{
+	switch (type) {
+	case KIWI_FE_CLOSE_PORTAL:
+		od_log(&instance->logger, client, client->server,
+		       "portal, name: %.*s", name_len, name);
+		return OK_RESPONSE;
+	case KIWI_FE_CLOSE_PREPARED_STATEMENT:
+		od_log(&instance->logger, client, client->server,
+		       "prepared statement, name: %.*s", name_len, name);
+		return OK_RESPONSE;
+	default:
+		od_log(&instance->logger, client, client->server,
+		       "unknown close type, name: %.*s", name_len, name);
+		return NOT_OK_RESPONSE;
+	}
+}
+
+static inline od_retcode_t od_frontend_log_parse(od_instance_t *instance,
+						 od_client_t *client,
+						 char *data, int size)
+{
+	uint32_t query_len;
+	char *query;
+	uint32_t name_len;
+	char *name;
+	int rc;
+	rc = kiwi_be_read_parse(data, size, &name, &name_len, &query,
+				&query_len);
+	if (rc == -1) {
+		return NOT_OK_RESPONSE;
+	}
+
+	od_log(&instance->logger, client, client->server, "%.*s %.*s", name_len,
+	       name, query_len, query);
+	return OK_RESPONSE;
+}
+
+static inline od_retcode_t od_frontend_log_bind(od_instance_t *instance,
+						od_client_t *client, char *data,
+						int size)
+{
+	char *portal_name;
+	uint32_t portal_name_len;
+	char *stmt_name;
+	uint32_t stmt_name_len;
+	int rc;
+	rc = kiwi_be_read_bind_names(data, size, &portal_name, &portal_name_len,
+				     &stmt_name, &stmt_name_len);
+	if (rc == -1) {
+		return NOT_OK_RESPONSE;
+	}
+
+	/*
+	 * kiwi_be_read_bind_names returns lengths including the NUL
+	 */
+	od_log(&instance->logger, client, client->server,
+	       "bind stmt '%.*s' to portal '%.*s'", (int)(stmt_name_len - 1),
+	       stmt_name, (int)(portal_name_len - 1), portal_name);
+	return OK_RESPONSE;
+}
+
+static inline int od_frontend_poll_catchup(od_client_t *client,
+					   od_route_t *route, uint32_t timeout,
+					   int64_t *lag_out)
+{
+	od_instance_t *instance = client->global->instance;
+	od_rule_storage_t *storage = route->rule->storage;
+	od_server_t *server = client->server;
+	int64_t lag = 0;
+
+	if (server != NULL) {
+		/*
+		 * check the replication lag only for host
+		 * that we are currently connected
+		 */
+
+		od_storage_endpoint_status_t status;
+		od_storage_endpoint_status_get(&server->endpoint->status,
+					       &status);
+
+		if (instance->config.log_debug) {
+			char addr[256];
+			od_address_to_str(&server->endpoint->address, addr,
+					  sizeof(addr));
+			od_debug(
+				&instance->logger, client, NULL,
+				"checking against %s, repl lag time sec = %" PRId64,
+				addr, status.repl_lag_sec);
+		}
+
+		lag = status.repl_lag_sec;
+		if (lag < 0) {
+			lag = 0;
+		}
+
+		if (lag < (int64_t)timeout) {
+			return OD_OK;
+		}
+	} else {
+		/*
+		 * need to disallow new connections
+		 * when all hosts has too big replication lag
+		 */
+
+		for (size_t i = 0; i < storage->endpoints_count; ++i) {
+			od_storage_endpoint_t *endp = &storage->endpoints[i];
+			od_storage_endpoint_status_t status;
+			od_storage_endpoint_status_get(&endp->status, &status);
+
+			if (instance->config.log_debug) {
+				char addr[256];
+				od_address_to_str(&endp->address, addr,
+						  sizeof(addr));
+				od_debug(
+					&instance->logger, client, NULL,
+					"checking against %s, repl lag sec = %" PRId64,
+					addr, status.repl_lag_sec);
+			}
+
+			lag = status.repl_lag_sec;
+			if (lag < 0) {
+				lag = 0;
+			}
+
+			if (lag < (int64_t)timeout) {
+				return OD_OK;
 			}
 		}
 	}
 
-	/* unreach */
-	abort();
-	return OD_FE_UNDEF;
+	*lag_out = lag;
+
+	od_debug(&instance->logger, client, NULL,
+		 "client %s%.*s replication %" PRId64
+		 " lag is over catchup timeout %d\n",
+		 client->id.id_prefix, OD_ID_LEN, client->id.id, lag, timeout);
+
+	return OD_ECATCHUP_TIMEOUT;
 }
 
-static void
-od_frontend_cleanup(od_client_t *client, char *context,
-                    od_frontend_rc_t status)
+static od_frontend_status_t
+od_frontend_check_replica_catchup(od_instance_t *instance, od_client_t *client)
+{
+	od_route_t *route = client->route;
+
+	od_assert(route);
+
+	uint32_t catchup_timeout = get_effective_catchup_timeout(client);
+
+	if (catchup_timeout == 0) {
+		return OD_OK;
+	}
+
+	od_debug(&instance->logger, client, NULL,
+		 "checking for lag before doing any actual work");
+
+	return od_frontend_poll_catchup(client, route, catchup_timeout,
+					&client->last_catchup_lag);
+}
+
+static int wait_resume_transactional_step(od_client_t *client)
 {
 	od_instance_t *instance = client->global->instance;
+	od_server_t *server = client->server;
+
+	/* client must be detached to start waiting for resume */
+	if (server != NULL) {
+		return 0;
+	}
+
+	int rc = od_global_wait_resumed(client->global, 1000 /* 1 sec */);
+	if (rc == 0) {
+		od_log(&instance->logger, client, server,
+		       "waiting for global resume finished");
+	} else {
+		od_log(&instance->logger, client, server,
+		       "client is waiting for global resume...");
+	}
+
+	return rc;
+}
+
+static int wait_resume_step(od_client_t *client)
+{
+	od_route_t *route = client->route;
+
+	/* do not wait resume for console clients */
+	if (route->rule->storage->storage_type == OD_RULE_STORAGE_LOCAL) {
+		return 0;
+	}
+
+	if (!od_global_is_paused(client->global)) {
+		return 0;
+	}
+
+	switch (route->rule->pool->pool_type) {
+	case OD_RULE_POOL_SESSION:
+		return 0;
+	case OD_RULE_POOL_STATEMENT:
+		/* fall through */
+	case OD_RULE_POOL_TRANSACTION:
+		return wait_resume_transactional_step(client);
+	default:
+		abort();
+	}
+}
+
+static od_frontend_status_t
+client_read_full_msg(od_client_t *client, const kiwi_header_t *header,
+		     size_t size, machine_msg_t **out, uint32_t timeout_ms)
+{
+	*out = NULL;
+
+	machine_msg_t *msg = client->read_msg;
+	if (msg != NULL) {
+		machine_msg_reset(msg);
+	}
+
+	msg = machine_msg_create_or_advance(msg, sizeof(kiwi_header_t) + size);
+	if (msg == NULL) {
+		return OD_EOOM;
+	}
+	client->read_msg = msg;
+
+	char *dest;
+	dest = machine_msg_data(msg);
+	memcpy(dest, header, sizeof(kiwi_header_t));
+	dest += sizeof(kiwi_header_t);
+
+	od_wait_event_start(OD_WAIT_QUERY_CLIENT_READ);
+	int rc = od_io_read(&client->io, dest, size, timeout_ms);
+	od_wait_event_end(OD_WAIT_QUERY_CLIENT_READ);
+	if (rc == -1) {
+		return OD_ECLIENT_READ;
+	}
+
+	od_stat_t *stats = &client->route->stats;
+	od_stat_recv_client(stats, size + sizeof(kiwi_header_t));
+
+	*out = msg;
+	return OD_OK;
+}
+
+static inline int od_log_query_enabled(od_instance_t *instance,
+				       od_route_t *route)
+{
+	if (!(instance->config.log_query || route->rule->log_query)) {
+		return 0;
+	}
+
+	return od_log_sampling_hit(route->rule->log_query_sampling_set ?
+					   route->rule->log_query_sampling :
+					   instance->config.log_query_sampling);
+}
+
+static od_frontend_status_t client_process_message_full(od_client_t *client,
+							machine_msg_t *msg,
+							uint32_t timeout_ms)
+{
+	od_frontend_status_t status;
 	int rc;
+	od_instance_t *instance = client->global->instance;
+	od_route_t *route = client->route;
+	od_server_t *server = client->server;
+	machine_msg_t *xflush = NULL;
+	od_assert(route != NULL);
+
+	char *data = machine_msg_data(msg);
+	int size = machine_msg_size(msg);
+
+	kiwi_fe_type_t type = *data;
+
+	if (instance->config.log_debug) {
+		od_debug(&instance->logger, client, server, "%s",
+			 kiwi_fe_type_to_string(type));
+	}
+
+	switch (type) {
+	case KIWI_FE_TERMINATE:
+		status = OD_STOP;
+		break;
+	case KIWI_FE_QUERY:
+		if (!mm_vector_empty(&client->relay.xbuf.msgs)) {
+			xflush = kiwi_fe_write_flush(NULL);
+			if (xflush == NULL) {
+				status = OD_EOOM;
+				break;
+			}
+
+			status = od_relay_process_xflush(&client->relay, xflush,
+							 timeout_ms);
+			machine_msg_free(xflush);
+			if (status != OD_OK) {
+				break;
+			}
+		}
+
+		if (od_log_query_enabled(instance, route)) {
+			char *query;
+			uint32_t query_len;
+			rc = kiwi_be_read_query(data, size, &query, &query_len);
+			if (rc == 0) {
+				od_log(&instance->logger, client,
+				       client->server, "%.*s", query_len,
+				       query);
+			} else {
+				od_error(&instance->logger, client,
+					 client->server, "invalid query msg");
+			}
+		}
+
+		status =
+			od_relay_process_query(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_FUNCTION_CALL:
+		status =
+			od_relay_process_fcall(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_FLUSH:
+		if (od_log_query_enabled(instance, route)) {
+			od_log(&instance->logger, client, client->server,
+			       "flush");
+		}
+		status = od_relay_process_xflush(&client->relay, msg,
+						 timeout_ms);
+		break;
+	case KIWI_FE_SYNC:
+		if (od_log_query_enabled(instance, route)) {
+			od_log(&instance->logger, client, client->server,
+			       "sync");
+		}
+		status =
+			od_relay_process_xsync(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_PARSE:
+		if (od_log_query_enabled(instance, route)) {
+			od_frontend_log_parse(instance, client, data, size);
+		}
+		status = od_relay_process_xmsg(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_BIND:
+		if (od_log_query_enabled(instance, route)) {
+			od_frontend_log_bind(instance, client, data, size);
+		}
+		status = od_relay_process_xmsg(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_DESCRIBE:
+		if (od_log_query_enabled(instance, route)) {
+			od_frontend_log_describe(instance, client, data, size);
+		}
+		status = od_relay_process_xmsg(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_EXECUTE:
+		if (od_log_query_enabled(instance, route)) {
+			od_frontend_log_execute(instance, client, data, size);
+		}
+		status = od_relay_process_xmsg(&client->relay, msg, timeout_ms);
+		break;
+	case KIWI_FE_CLOSE:
+		if (od_log_query_enabled(instance, route)) {
+			char *name;
+			uint32_t name_len;
+			kiwi_fe_close_type_t type;
+
+			rc = od_frontend_parse_close(data, size, &name,
+						     &name_len, &type);
+			if (rc != OK_RESPONSE) {
+				od_gerror(client, server,
+					  "can't parse close message");
+				return OD_ESERVER_READ;
+			}
+
+			od_frontend_log_close(instance, client, name, name_len,
+					      type);
+		}
+		status = od_relay_process_xmsg(&client->relay, msg, timeout_ms);
+		break;
+
+	case KIWI_FE_COPY_DONE:
+	case KIWI_FE_COPY_FAIL:
+	case KIWI_FE_COPY_DATA:
+		/*
+		 * normally copy is initiated from some query, executed
+		 * by Query or Execute
+		 *
+		 * in first case, the Copy subprotocol messages will be
+		 * handled inside od_relay_process_query, so lets think
+		 * this is impossible situation
+		 *
+		 * in second case, we need to start copy explicitly
+		 * so lets add Flush message,
+		 * all other work will be done by relay
+		 */
+
+		if (mm_vector_empty(&client->relay.xbuf.msgs)) {
+			/*
+			 * simply ignore this messages, see:
+			 * https://github.com/postgres/postgres/blob/REL_18_6/src/backend/tcop/postgres.c#L5013
+			 */
+			status = OD_OK;
+			break;
+		}
+
+		xflush = kiwi_fe_write_flush(NULL);
+		if (xflush == NULL) {
+			status = OD_EOOM;
+			break;
+		}
+
+		/* ler the copy stream to handle this message */
+		od_relay_set_copy_additional(&client->relay, msg);
+
+		status = od_relay_process_xflush(&client->relay, xflush,
+						 timeout_ms);
+
+		od_relay_set_copy_additional(&client->relay, NULL);
+		machine_msg_free(xflush);
+
+		break;
+
+	default:
+		od_gerror(client, server,
+			  "unexpected message type '%c' from client", type);
+		return OD_ECLIENT_PROTOCOL_ERROR;
+	}
+
+	return status;
+}
+
+static od_frontend_status_t process_possible_detach(od_client_t *client)
+{
+	od_route_t *route = client->route;
+	od_router_t *router = client->global->router;
+	od_instance_t *instance = client->global->instance;
+	od_server_t *server = client->server;
+
+	if (server == NULL) {
+		return OD_OK;
+	}
+
+	if (!od_server_synchronized(server)) {
+		return OD_OK;
+	}
+
+	if (client->backend_pin) {
+		return OD_OK;
+	}
+
+	if (!od_frontend_should_detach(route, server)) {
+		return OD_OK;
+	}
+
+	/* should detach */
+
+	/* cleanup server */
+	int rc = od_reset(server);
+	if (rc != 1) {
+		od_debug(&instance->logger, client, server,
+			 "client %s%.*s detached from %s%.*s, server closed",
+			 client->id.id_prefix,
+			 (int)sizeof(client->id.id_prefix), client->id.id,
+			 server->id.id_prefix,
+			 (int)sizeof(server->id.id_prefix), server->id.id);
+
+		od_router_close(router, client);
+	} else {
+		od_debug(&instance->logger, client, server,
+			 "client %s%.*s detached from %s%.*s",
+			 client->id.id_prefix,
+			 (int)sizeof(client->id.id_prefix), client->id.id,
+			 server->id.id_prefix,
+			 (int)sizeof(server->id.id_prefix), server->id.id);
+
+		od_router_detach(router, client);
+	}
+
+	return OD_OK;
+}
+
+static od_frontend_status_t client_process_message(od_client_t *client,
+						   kiwi_header_t *header,
+						   uint32_t timeout_ms)
+{
+	od_frontend_status_t status;
+
+	uint32_t size;
+	int rc = kiwi_validate_fe_header((char *)header, sizeof(kiwi_header_t),
+					 &size);
+	if (rc == -1) {
+		od_gerror(
+			client, client->server,
+			"client msg header validation failed (type=%d, size=%u)",
+			header->type, header->len);
+		return OD_ECLIENT_READ;
+	}
+	size -= sizeof(uint32_t);
+
+	machine_msg_t *msg = NULL;
+	status = client_read_full_msg(client, header, size, &msg, timeout_ms);
+	if (status != OD_OK) {
+		return status;
+	}
+
+	status = client_process_message_full(client, msg, timeout_ms);
+
+	if (client->read_msg != NULL) {
+		machine_msg_shrink(client->read_msg, PQ_SMALL_MESSAGE_LIMIT);
+	}
+
+	if (status != OD_OK) {
+		return status;
+	}
+
+	if (client->server != NULL && client->server->oom &&
+	    client->route != NULL && client->route->rule->server_drop_on_oom) {
+		od_gerror(client, client->server,
+			  "drop connection due to OOM error");
+		return OD_ESERVER_OOM;
+	}
+
+	status = process_possible_detach(client);
+
+	return status;
+}
+
+static od_frontend_status_t client_read_header(od_client_t *client,
+					       kiwi_header_t *header)
+{
+	while (od_readahead_unread(&client->io.readahead) <
+	       (int)sizeof(kiwi_header_t)) {
+		od_wait_event_start(OD_WAIT_QUERY_CLIENT_READ);
+		int rc = od_io_read_some(&client->io, 1000);
+		od_wait_event_end(OD_WAIT_QUERY_CLIENT_READ);
+		if (rc != 0) {
+			int err = machine_errno();
+			if (err == ETIMEDOUT) {
+				return OD_ECLIENT_TIMEOUT;
+			}
+			if (err == EAGAIN) {
+				/* interrupted by event on server io */
+				od_server_t *server = client->server;
+				od_assert(server != NULL);
+				int ev = od_io_last_event(&server->io);
+				if (ev & MM_R || ev & MM_ERR || ev & MM_CLOSE) {
+					return OD_ASYNC_MSG_AVAILABLE;
+				}
+				continue;
+			}
+			return OD_ECLIENT_READ;
+		}
+	}
+
+	int rc = od_io_read(&client->io, (char *)header, sizeof(kiwi_header_t),
+			    1000);
+	if (rc != 0) {
+		/*
+		 * impossible - readahead already contains enough
+		 * bytes to read header
+		 */
+		return OD_ECLIENT_READ;
+	}
+
+	return OD_OK;
+}
+
+typedef struct {
+	od_client_t *client;
+	od_server_t *server;
+	int is_client_to_server;
+	atomic_uint_fast64_t *stop;
+	od_frontend_status_t retstatus;
+	int errno_;
+} replication_pipe_arg_t;
+
+static void od_frontend_replication_pipe(void *arg_)
+{
+	replication_pipe_arg_t *arg = arg_;
+	od_client_t *client = arg->client;
+	od_server_t *server = arg->server;
+	int is_client_to_server = arg->is_client_to_server;
+	/*
+	 * replication proxy clients are not routed, so there is
+	 * no route stats to update for them
+	 */
+	od_stat_t *stats = client->route != NULL ? &client->route->stats : NULL;
+	od_instance_t *instance = client->global->instance;
+
+	od_io_t *src = NULL;
+	od_io_t *dst = NULL;
+	od_wait_event_t read_event;
+	od_wait_event_t write_event;
+	od_frontend_status_t read_err = OD_UNDEF;
+	od_frontend_status_t write_err = OD_UNDEF;
+	od_readahead_t *readahead = NULL;
+	od_frontend_status_t status;
+
+	int rc, errno_ = 0;
+
+	if (is_client_to_server) {
+		src = &client->io;
+		dst = &server->io;
+		read_event = OD_WAIT_STREAM_CLIENT_READ;
+		write_event = OD_WAIT_STREAM_SERVER_WRITE;
+		read_err = OD_ECLIENT_READ;
+		write_err = OD_ESERVER_WRITE;
+	} else {
+		src = &server->io;
+		dst = &client->io;
+		read_event = OD_WAIT_STREAM_SERVER_READ;
+		write_event = OD_WAIT_STREAM_CLIENT_WRITE;
+		read_err = OD_ESERVER_READ;
+		write_err = OD_ECLIENT_WRITE;
+	}
+
+	readahead = &src->readahead;
+
+	while (1) {
+		status = od_frontend_ctl(client);
+		if (status != OD_OK) {
+			break;
+		}
+
+		status = od_process_drop_on_restart(client);
+		if (status != OD_OK) {
+			break;
+		}
+
+		if (!od_io_connected(dst)) {
+			if (is_client_to_server) {
+				status = OD_ESERVER_READ;
+			} else {
+				status = OD_ECLIENT_READ;
+			}
+			break;
+		}
+
+		if (atomic_load(arg->stop) == 1) {
+			break;
+		}
+
+		struct iovec rvec = od_readahead_read_begin(readahead);
+		if (rvec.iov_len == 0) {
+			od_wait_event_start(read_event);
+			rc = od_io_read_some(src, 1000);
+			od_wait_event_end(read_event);
+			errno_ = machine_errno();
+			if (rc == 0) {
+				if (stats != NULL) {
+					if (is_client_to_server) {
+						od_stat_recv_client(
+							stats,
+							od_readahead_unread(
+								readahead));
+					} else {
+						od_stat_recv_server(
+							stats,
+							od_readahead_unread(
+								readahead));
+					}
+				}
+			} else if (errno_ != EAGAIN && errno_ != ETIMEDOUT) {
+				status = read_err;
+				break;
+			}
+
+			continue;
+		}
+
+		size_t written;
+		od_wait_event_start(write_event);
+		rc = od_io_write_raw(dst, rvec.iov_base, rvec.iov_len, &written,
+				     1000, 0);
+		od_wait_event_end(write_event);
+		errno_ = machine_errno();
+		od_readahead_read_commit(readahead, written);
+		if (rc < 0 && errno_ != EAGAIN && errno_ != ETIMEDOUT) {
+			status = write_err;
+			break;
+		}
+	}
+
+	arg->retstatus = status;
+	arg->errno_ = errno_;
+
+	if (is_client_to_server) {
+		od_log(&instance->logger, client, client->server,
+		       "client->server replication finished with status %d (%s), errno=%d (%s)",
+		       status, od_frontend_status_to_str(status), errno_,
+		       strerror(errno_));
+	} else {
+		od_log(&instance->logger, client, client->server,
+		       "server->client replication finished with status %d (%s), errno=%d (%s)",
+		       status, od_frontend_status_to_str(status), errno_,
+		       strerror(errno_));
+	}
+
+	atomic_store(arg->stop, 1);
+}
+
+static od_frontend_status_t replication_impl(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+
+	od_assert(client->server != NULL);
 
 	od_server_t *server = client->server;
+
+	atomic_uint_fast64_t stop;
+	atomic_init(&stop, 0);
+
+	replication_pipe_arg_t cl_srv_arg;
+	memset(&cl_srv_arg, 0, sizeof(replication_pipe_arg_t));
+	cl_srv_arg.client = client;
+	cl_srv_arg.server = client->server;
+	cl_srv_arg.is_client_to_server = 1;
+	cl_srv_arg.stop = &stop;
+
+	replication_pipe_arg_t srv_cl_arg;
+	memset(&srv_cl_arg, 0, sizeof(replication_pipe_arg_t));
+	srv_cl_arg.client = client;
+	srv_cl_arg.server = client->server;
+	srv_cl_arg.is_client_to_server = 0;
+	srv_cl_arg.stop = &stop;
+
+	od_io_set_peer(&client->io, &server->io);
+	od_io_set_peer(&server->io, &client->io);
+
+	char coro_name[OD_ID_LEN + 16 /* '>s' or '<s' */];
+	memset(coro_name, 0, sizeof(coro_name));
+	od_id_write_to_string(&client->id, coro_name, sizeof(coro_name));
+	int idlen = strlen(coro_name);
+	memcpy(coro_name + idlen, ">s", 2);
+	int64_t cl_srv = machine_coroutine_create_named(
+		od_frontend_replication_pipe, &cl_srv_arg, coro_name);
+	if (cl_srv == -1) {
+		od_error(
+			&instance->logger, client, client->server,
+			"can't start client->server pipe coroutine, errno=%d (%s)",
+			machine_errno(), strerror(machine_errno()));
+		return OD_UNDEF;
+	}
+
+	memcpy(coro_name + idlen, "<s", 2);
+	int64_t srv_cl = machine_coroutine_create_named(
+		od_frontend_replication_pipe, &srv_cl_arg, coro_name);
+	if (srv_cl == -1) {
+		machine_cancel(cl_srv);
+		machine_join(cl_srv);
+		od_error(
+			&instance->logger, client, client->server,
+			"can't start server->client pipe coroutine, errno=%d (%s)",
+			machine_errno(), strerror(machine_errno()));
+		return OD_UNDEF;
+	}
+
+	machine_join(srv_cl);
+	machine_join(cl_srv);
+
+	od_io_remove_peer(&client->io, &server->io);
+	od_io_remove_peer(&server->io, &client->io);
+
+	/* force returning the OK status to not trigger the cleanup */
+
+	return OD_STOP;
+}
+
+static od_frontend_status_t od_frontend_remote_replication(od_client_t *client)
+{
+	/*
+	 * we do not want to return replication backends to pool
+	 *
+	 * we do not want to have any features like catchup_timeout
+	 * to work with replication connection
+	 *
+	 * we do not want to count any statistics for them
+	 *
+	 * so lets just create two pipe coroutines that proxy
+	 * all bytes for both directions
+	 */
+
+	od_frontend_status_t status;
+	od_instance_t *instance = client->global->instance;
+
+	if (instance->config.log_session) {
+		od_log(&instance->logger, client, NULL,
+		       "replication connection");
+	}
+
+	od_assert(client->server == NULL);
+
+	if (client->server == NULL) {
+		status = od_frontend_attach_and_deploy(client);
+		if (status != OD_OK) {
+			return status;
+		}
+	}
+
+	status = replication_impl(client);
+
+	/* force closing replication server connection */
+	od_router_close(client->global->router, client);
+
+	return status;
+}
+
+static void od_frontend_on_client_disconnect(od_frontend_status_t status,
+					     od_client_t *client,
+					     int force_server_close);
+
+static void od_frontend_replication_proxy_server_close(od_client_t *client)
+{
+	od_server_t *server = client->server;
+	od_assert(server != NULL);
+	od_assert(server->client == client);
+	od_assert(server->route == NULL);
+	od_assert(server->pool_element == NULL);
+
+	/*
+	 * the server is not a part of the route pool,
+	 * so it is detached manually
+	 */
+	client->server = NULL;
+	server->client = NULL;
+
+	od_backend_close_connection(server);
+
+	server->is_transaction = 0;
+	server->idle_time = 0;
+	kiwi_key_init(&server->key);
+	kiwi_key_init(&server->key_client);
+
+	od_server_free(server);
+}
+
+static od_frontend_status_t
+od_frontend_replication_proxy_attach(od_client_t *client,
+				     od_rule_storage_t *storage,
+				     od_storage_endpoint_t *endpoint)
+{
+	od_instance_t *instance = client->global->instance;
+
+	char addr[256];
+	od_address_to_str(&endpoint->address, addr, sizeof(addr) - 1);
+
+	od_debug(&instance->logger, client, NULL,
+		 "replication proxy: trying to connect to %s...", addr);
+
+	od_server_t *server = od_server_allocate(0 /* reserve_prep_stmts */);
+	if (server == NULL) {
+		return OD_EOOM;
+	}
+	od_id_generate(&server->id, "s");
+	server->global = client->global;
+	server->endpoint = endpoint;
+	od_rules_storage_ref(endpoint->storage);
+
+	/*
+	 * the server is dedicated to this client and is never returned
+	 * to the pool, so it is attached manually, without any pool
+	 * manipulations
+	 */
+	server->client = client;
+	client->server = server;
+	server->key_client = client->key;
+
+	int rc;
+	rc = od_backend_connect_to(server, &endpoint->address,
+				   storage->tls_opts, OD_BACKEND_TLS_DEFAULT);
+	if (rc == NOT_OK_RESPONSE) {
+		od_error(&instance->logger, client, NULL,
+			 "replication proxy: failed to connect to %s", addr);
+		goto error;
+	}
+
+	/* forward the original client startup packet to the server as is */
+	machine_msg_t *raw = client->startup_raw;
+	od_assert(raw != NULL);
+	size_t size = machine_msg_size(raw) - 1 /* extra 0-terminator */;
+	size_t written = 0;
+	rc = od_io_write_raw(&server->io, machine_msg_data(raw), size, &written,
+			     1000, 0);
+	machine_msg_free(raw);
+	client->startup_raw = NULL;
+	if (rc != 0 || written != size) {
+		od_error(
+			&instance->logger, client, server,
+			"replication proxy: failed to forward startup packet: %s",
+			od_io_error(&server->io));
+		goto error;
+	}
+
+	od_debug(&instance->logger, client, server,
+		 "replication proxy: connected to %s, start proxying", addr);
+
+	return OD_OK;
+
+error:
+	client->server = NULL;
+	server->client = NULL;
+	od_backend_close_connection(server);
+	od_server_free(server);
+	return OD_ESERVER_CONNECT;
+}
+
+typedef struct {
+	od_client_t *client;
+	od_server_t *server;
+	int is_client_to_server;
+	atomic_uint_fast64_t *stop;
+	uint64_t transferred;
+} replication_proxy_pipe_arg_t;
+
+static void od_frontend_replication_proxy_pipe(void *arg_)
+{
+	replication_proxy_pipe_arg_t *arg = arg_;
+	od_client_t *client = arg->client;
+	od_server_t *server = arg->server;
+	int is_client_to_server = arg->is_client_to_server;
+	od_instance_t *instance = client->global->instance;
+
+	/*
+	 * the pipe does a single thing: read raw bytes from one side
+	 * and write them to the other side as is, until any of the
+	 * sides is gone
+	 */
+	mm_io_t *src = is_client_to_server ? client->io.io : server->io.io;
+	mm_io_t *dst = is_client_to_server ? server->io.io : client->io.io;
+
+	od_frontend_status_t status = OD_OK;
+	char buf[8192];
+
+	while (!atomic_load(arg->stop)) {
+		if (od_frontend_ctl(client) != OD_OK) {
+			status = OD_ECLIENT_KILLED;
+			break;
+		}
+
+		ssize_t rc = machine_read_raw(src, buf, sizeof(buf));
+		if (rc == 0) {
+			/* eof */
+			status = is_client_to_server ? OD_ECLIENT_READ :
+						       OD_ESERVER_READ;
+			break;
+		}
+		if (rc < 0) {
+			int errno_ = machine_errno();
+			if (!machine_errno_retryable(errno_)) {
+				status = is_client_to_server ? OD_ECLIENT_READ :
+							       OD_ESERVER_READ;
+				break;
+			}
+			/* nothing to read yet, wait for the readability
+			 * or for the peer io activity */
+			mm_io_set_deadline(src, 1000);
+			if (mm_io_wait_deadline(src) == MM_COND_WAIT_FAIL) {
+				/*
+				 * timeout or cancellation, the loop
+				 * will recheck the stop flag and retry
+				 */
+			}
+			continue;
+		}
+
+		size_t left = (size_t)rc;
+		char *pos = buf;
+		while (left > 0) {
+			rc = machine_write_raw(dst, pos, left, NULL);
+			if (rc > 0) {
+				pos += rc;
+				left -= (size_t)rc;
+				arg->transferred += (uint64_t)rc;
+				continue;
+			}
+			int errno_ = machine_errno();
+			if (!machine_errno_retryable(errno_)) {
+				status = is_client_to_server ?
+						 OD_ESERVER_WRITE :
+						 OD_ECLIENT_WRITE;
+				goto done;
+			}
+			mm_io_set_deadline(dst, 1000);
+			if (mm_io_wait_deadline(dst) == MM_COND_WAIT_FAIL) {
+				;
+			}
+		}
+	}
+
+done:
+	atomic_store(arg->stop, 1);
+
+	od_log(&instance->logger, client, server,
+	       "%s replication proxy pipe finished with status %d (%s), "
+	       "%" PRIu64 " bytes transferred",
+	       is_client_to_server ? "client->server" : "server->client",
+	       status, od_frontend_status_to_str(status), arg->transferred);
+}
+
+static void od_frontend_replication_proxy_pump(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+	od_server_t *server = client->server;
+
+	od_assert(server != NULL);
+
+	atomic_uint_fast64_t stop;
+	atomic_init(&stop, 0);
+
+	replication_proxy_pipe_arg_t cl_srv_arg;
+	memset(&cl_srv_arg, 0, sizeof(replication_proxy_pipe_arg_t));
+	cl_srv_arg.client = client;
+	cl_srv_arg.server = server;
+	cl_srv_arg.is_client_to_server = 1;
+	cl_srv_arg.stop = &stop;
+
+	replication_proxy_pipe_arg_t srv_cl_arg;
+	memset(&srv_cl_arg, 0, sizeof(replication_proxy_pipe_arg_t));
+	srv_cl_arg.client = client;
+	srv_cl_arg.server = server;
+	srv_cl_arg.is_client_to_server = 0;
+	srv_cl_arg.stop = &stop;
+
+	/*
+	 * link the ios, so a blocked read on one side is woken up
+	 * by the activity on the other one
+	 */
+	od_io_set_peer(&client->io, &server->io);
+	od_io_set_peer(&server->io, &client->io);
+
+	char coro_name[OD_ID_LEN + 16 /* '>s' or '<s' */];
+	memset(coro_name, 0, sizeof(coro_name));
+	od_id_write_to_string(&client->id, coro_name, sizeof(coro_name));
+	int idlen = strlen(coro_name);
+	memcpy(coro_name + idlen, ">s", 2);
+	int64_t cl_srv = machine_coroutine_create_named(
+		od_frontend_replication_proxy_pipe, &cl_srv_arg, coro_name);
+	if (cl_srv == -1) {
+		od_error(
+			&instance->logger, client, server,
+			"can't start client->server replication proxy pipe, errno=%d (%s)",
+			machine_errno(), strerror(machine_errno()));
+		goto out;
+	}
+
+	memcpy(coro_name + idlen, "<s", 2);
+	int64_t srv_cl = machine_coroutine_create_named(
+		od_frontend_replication_proxy_pipe, &srv_cl_arg, coro_name);
+	if (srv_cl == -1) {
+		machine_cancel(cl_srv);
+		machine_join(cl_srv);
+		od_error(
+			&instance->logger, client, server,
+			"can't start server->client replication proxy pipe, errno=%d (%s)",
+			machine_errno(), strerror(machine_errno()));
+		goto out;
+	}
+
+	machine_join(srv_cl);
+	machine_join(cl_srv);
+
+out:
+	od_io_remove_peer(&client->io, &server->io);
+	od_io_remove_peer(&server->io, &client->io);
+}
+
+static od_rule_storage_t *
+od_frontend_replication_proxy_storage(od_client_t *client)
+{
+	/*
+	 * the first remote storage of the configuration is used as
+	 * the target for all replication connections
+	 */
+	od_router_t *router = client->global->router;
+	od_instance_t *instance = client->global->instance;
+
+	od_router_lock(router);
+
+	od_rule_storage_t *storage = NULL;
+	od_list_t *i;
+	od_list_foreach (&router->rules.storages, i) {
+		od_rule_storage_t *s;
+		s = od_container_of(i, od_rule_storage_t, link);
+		if (s->storage_type != OD_RULE_STORAGE_REMOTE) {
+			continue;
+		}
+		storage = od_rules_storage_ref(s);
+		break;
+	}
+
+	od_router_unlock(router);
+
+	if (storage == NULL) {
+		od_error(&instance->logger, client, NULL,
+			 "replication proxy: no remote storage found");
+	}
+
+	return storage;
+}
+
+static void od_frontend_replication_proxy(od_client_t *client)
+{
+	/*
+	 * replication_proxy_phys or replication_proxy_logic is on:
+	 * replication connections of the corresponding type are
+	 * forwarded to the server as is, bypassing all of the odyssey
+	 * logic
+	 *
+	 * no rules matching, authentication, hba, pooling, deploy and
+	 * catchup checks is done: the first remote storage of the
+	 * configuration is the target, the client and the server just
+	 * talk to each other through two raw byte pipes
+	 */
+
+	od_instance_t *instance = client->global->instance;
+	od_extension_t *extensions = client->global->extensions;
+	od_module_t *modules = extensions->modules;
+
+	if (instance->config.log_session) {
+		od_log(&instance->logger, client, NULL,
+		       "replication connection, full proxy mode");
+	}
+
+	od_frontend_status_t status = OD_OK;
+
+	od_rule_storage_t *storage =
+		od_frontend_replication_proxy_storage(client);
+	if (storage == NULL) {
+		od_frontend_fatal(
+			client, KIWI_CONNECTION_FAILURE,
+			"no remote storage found for replication connection");
+		status = OD_EATTACH;
+		goto done;
+	}
+
+	if (storage->endpoints_count == 0) {
+		od_error(&instance->logger, client, NULL,
+			 "replication proxy: storage '%s' has no endpoints",
+			 storage->name);
+		od_frontend_fatal(
+			client, KIWI_CONNECTION_FAILURE,
+			"storage for replication connection has no endpoints");
+		od_rules_storage_unref(storage);
+		status = OD_EATTACH;
+		goto done;
+	}
+
+	/* the first endpoint only, no fallbacks */
+	status = od_frontend_replication_proxy_attach(client, storage,
+						      &storage->endpoints[0]);
+
+	od_rules_storage_unref(storage);
+
+	if (status != OD_OK) {
+		od_frontend_fatal(
+			client, KIWI_CONNECTION_FAILURE,
+			"failed to connect to remote server for replication connection");
+		goto done;
+	}
+
+	/* proxy all the bytes in both directions */
+	od_frontend_replication_proxy_pump(client);
+
+	/*
+	 * the replication server connection is never returned
+	 * to the pool, it is force closed
+	 */
+	od_frontend_replication_proxy_server_close(client);
+
+	status = OD_STOP;
+
+done:
+	od_frontend_on_client_disconnect(status, client,
+					 0 /* force server close */);
+
+	od_list_t *i;
+	od_list_foreach (&modules->link, i) {
+		od_module_t *module;
+		module = od_container_of(i, od_module_t, link);
+		module->disconnect_cb(client, status);
+	}
+
+	od_frontend_close(client);
+}
+
+static od_frontend_status_t process_server_async_msg(od_client_t *client,
+						     od_server_t *server)
+{
+	int rc;
+	machine_msg_t *msg = od_read(&server->io, UINT32_MAX, OD_READ_BE);
+	if (msg == NULL) {
+		return OD_ESERVER_READ;
+	}
+
+	char *data = machine_msg_data(msg);
+	int size = machine_msg_size(msg);
+	kiwi_be_type_t type = *data;
+	od_instance_t *instance = client->global->instance;
+
+	if (instance->config.log_debug) {
+		if (type == KIWI_BE_COMMAND_COMPLETE) {
+			const char *command_tag = data + sizeof(kiwi_header_t);
+			od_debug(&instance->logger, client, server, "%s - %s",
+				 kiwi_be_type_to_string(type), command_tag);
+		} else {
+			od_debug(&instance->logger, client, server, "%s",
+				 kiwi_be_type_to_string(type));
+		}
+	}
+
+	if (type == KIWI_BE_PARAMETER_STATUS) {
+		rc = od_backend_update_parameter(server, data, size, 0);
+		if (rc == -1) {
+			machine_msg_free(msg);
+			od_gerror(client, server, "can't update parameter");
+			return OD_ESERVER_READ;
+		}
+	}
+
+	rc = od_write(&client->io, msg);
+	if (rc != 0) {
+		return OD_ECLIENT_READ;
+	}
+
+	return OD_OK;
+}
+
+static od_frontend_status_t process_server_async(od_client_t *client,
+						 od_server_t *server)
+{
+	/*
+	 * https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-ASYNC
+	 */
+
+	od_frontend_status_t status = OD_OK;
+
+	while (od_readahead_unread(&server->io.readahead) > 0) {
+		status = process_server_async_msg(client, server);
+		if (status != OD_OK) {
+			return status;
+		}
+	}
+
+	int rc = od_io_try_read_some(&server->io);
+	if (rc == 0) {
+		status = process_server_async_msg(client, server);
+	} else {
+		int err = machine_errno();
+		if (err == EWOULDBLOCK) {
+			return OD_OK;
+		}
+
+		od_assert(err != ENOBUFS);
+
+		/* disconnect or other error */
+		return OD_ESERVER_READ;
+	}
+
+	return status;
+}
+
+static od_frontend_status_t od_frontend_remote(od_client_t *client)
+{
+	if (client->logical_rep || client->physical_rep) {
+		return od_frontend_remote_replication(client);
+	}
+
+	od_instance_t *instance = client->global->instance;
+
+	while (1) {
+		od_frontend_status_t status =
+			od_frontend_check_replica_catchup(instance, client);
+		if (od_frontend_status_is_err(status)) {
+			return status;
+		}
+
+		status = od_frontend_ctl(client);
+		if (status != OD_OK) {
+			return status;
+		}
+
+		status = od_process_connection_drop(client);
+		if (status != OD_OK) {
+			return status;
+		}
+
+		if (wait_resume_step(client)) {
+			/* need to wait for resume, but also must check for conn drop */
+			continue;
+		}
+
+		od_server_t *server = client->server;
+		if (server != NULL) {
+			/* try to handle possible server's event */
+			status = process_server_async(client, server);
+			if (status != OD_OK) {
+				return status;
+			}
+
+			/*
+			 * interrupt client header reading when smth occurs on server
+			 * smth == async messages
+			 */
+			od_io_set_peer(&client->io, &server->io);
+		}
+		kiwi_header_t header;
+		status = client_read_header(client, &header);
+		if (server != NULL) {
+			od_io_remove_peer(&client->io, &server->io);
+		}
+		if (status == OD_ASYNC_MSG_AVAILABLE) {
+			/*
+			 * something readable happened on server
+			 * will be handled on next iteration
+			 */
+			continue;
+		}
+		if (status == OD_ECLIENT_TIMEOUT) {
+			continue;
+		}
+		if (status != OD_OK) {
+			return status;
+		}
+
+		status = client_process_message(client, &header,
+						/* TODO */ UINT32_MAX);
+		if (status != OD_OK) {
+			return status;
+		}
+
+		client->time_last_active = machine_time_us();
+	}
+}
+
+static void od_frontend_report_drop(od_client_t *client,
+				    od_frontend_status_t status)
+{
+	od_server_t *server = client->server;
+	od_instance_t *instance = client->global->instance;
+
 	switch (status) {
-	case OD_FE_EATTACH:
-		assert(server == NULL);
-		assert(client->route != NULL);
-		od_frontend_error(client, SHAPITO_CONNECTION_FAILURE,
-		                  "failed to get remote server connection");
-		/* detach client from route */
-		od_unroute(client);
+	case OD_EIDLE_TIMEOUT:
+		od_log(&instance->logger, client, server,
+		       "client dropped by idle timeout");
+		od_frontend_fatal_detailed(
+			client, KIWI_ADMIN_SHUTDOWN,
+			"Connection was dropped by Odyssey due to idle timeout",
+			"", "Odyssey has dropped the connection");
+		break;
+	case OD_EIDLE_IN_TRANSACTION_TIMEOUT:
+		od_log(&instance->logger, client, server,
+		       "client dropped by idle in transaction timeout");
+		od_frontend_fatal_detailed(
+			client, KIWI_ADMIN_SHUTDOWN,
+			"Connection was dropped by Odyssey due to idle in transaction timeout",
+			"", "Odyssey has dropped the connection");
+		break;
+	case OD_ECLIENT_KILLED:
+		od_log(&instance->logger, client, server,
+		       "client killed by reload or console command");
+		od_frontend_fatal_detailed(
+			client, KIWI_ADMIN_SHUTDOWN,
+			"Connection was killed by Odyssey configuration reloading or console command",
+			"Try to reconnect",
+			"Odyssey has dropped the connection");
+		break;
+	default:
+		od_log(&instance->logger, client, server,
+		       "unexpected reason for client drop: %d (%s)", status,
+		       od_frontend_status_to_str(status));
+		od_frontend_fatal_detailed(
+			client, KIWI_ADMIN_SHUTDOWN,
+			"Connection was dropped by unexpected reason", "",
+			"Odyssey has dropped the connection");
+		break;
+	}
+}
+
+static void od_frontend_on_client_disconnect(od_frontend_status_t status,
+					     od_client_t *client,
+					     int force_server_close)
+{
+	int rc;
+	od_instance_t *instance = client->global->instance;
+	od_router_t *router = client->global->router;
+	od_server_t *server = client->server;
+	od_route_t *route = client->route;
+	uint64_t working_time_us = machine_time_us() - client->time_accept;
+	if (instance->config.log_session) {
+		if (route != NULL) {
+			od_log(&instance->logger, client, server,
+			       "client disconnected route %s.%s, addr '%s', io error = %s, status %s, working time: %" PRIu64
+			       "us",
+			       route->rule->db_name, route->rule->user_name,
+			       client->peer, od_io_error(&client->io),
+			       od_frontend_status_to_str(status),
+			       working_time_us);
+		} else {
+			od_log(&instance->logger, client, server,
+			       "client disconnected addr '%s', io error = %s, status %s, working time: %" PRIu64
+			       "us",
+			       client->peer, od_io_error(&client->io),
+			       od_frontend_status_to_str(status),
+			       working_time_us);
+		}
+	}
+
+	if (server == NULL) {
+		return;
+	}
+
+	if (force_server_close) {
+		od_router_close(router, client);
+		return;
+	}
+
+	rc = od_reset(server);
+	if (rc != 1) {
+		/* close backend connection */
+		od_router_close(router, client);
+		return;
+	}
+
+	/* push server to router server pool */
+	od_router_detach(router, client);
+}
+
+static void od_frontend_cleanup(od_client_t *client,
+				od_frontend_status_t status,
+				od_error_logger_t *l)
+{
+	od_instance_t *instance = client->global->instance;
+	od_router_t *router = client->global->router;
+	od_route_t *route = client->route;
+	od_server_t *server = client->server;
+	char ra_desc[256];
+
+	if (route != NULL) {
+		od_stat_client_lifetime(
+			&route->stats, machine_time_us() - client->time_accept);
+	}
+
+	if (od_frontend_status_is_err(status)) {
+		od_error_logger_store_err(l, status);
+
+		if (route != NULL && route->extra_logging_enabled &&
+		    !od_route_is_dynamic(route)) {
+			od_error_logger_store_err(route->err_logger, status);
+		}
+	}
+
+	switch (status) {
+	case OD_EIDLE_TIMEOUT:
+		/* fallthrough */
+	case OD_EIDLE_IN_TRANSACTION_TIMEOUT:
+		/* fallthrough */
+	case OD_ECLIENT_KILLED:
+		od_frontend_report_drop(client, status);
+		/* fallthrough */
+	case OD_STOP:
+	/* fallthrough */
+	case OD_OK:
+		od_frontend_on_client_disconnect(status, client,
+						 0 /* force server close */);
 		break;
 
-	case OD_FE_TERMINATE:
-	case OD_FE_OK:
-		/* graceful disconnect */
-		if (instance->config.log_session) {
-			od_log(&instance->logger, context, client, server,
-			       "client disconnected");
+	case OD_EOOM:
+		od_error(&instance->logger, client, server, "%s",
+			 "memory allocation error");
+		if (client->server) {
+			od_router_close(router, client);
 		}
-		if (! client->server) {
-			od_unroute(client);
-			break;
-		}
-		rc = od_reset(server);
-		if (rc != 1) {
-			/* close backend connection */
-			od_router_close_and_unroute(client);
-			break;
-		}
-		/* push server to router server pool */
-		od_router_detach_and_unroute(client);
 		break;
 
-	case OD_FE_ECLIENT_READ:
-	case OD_FE_ECLIENT_WRITE:
+	case OD_ESERVER_OOM:
+		od_frontend_fatal(
+			client, KIWI_OUT_OF_MEMORY,
+			"OOMed server connection was forcibly dropped");
+		od_frontend_on_client_disconnect(status, client,
+						 1 /* force server close */);
+		break;
+
+	case OD_EATTACH:
+		od_assert(server == NULL);
+		od_assert(client->route != NULL);
+		od_frontend_fatal(client, KIWI_CONNECTION_FAILURE,
+				  "failed to get remote server connection");
+		break;
+
+	case OD_EATTACH_TOO_MANY_CONNECTIONS:
+		od_assert(server == NULL);
+		od_assert(client->route != NULL);
+		od_frontend_fatal(
+			client, KIWI_TOO_MANY_CONNECTIONS,
+			"too many active clients for user (pool_size for "
+			"user %s.%s reached %d)",
+			client->startup.database.value,
+			client->startup.user.value,
+			client->rule != NULL ? client->rule->pool->size : -1);
+		od_frontend_on_client_disconnect(status, client,
+						 0 /* force server close */);
+		break;
+
+	case OD_EATTACH_TARGET_SESSION_ATTRS_MISMATCH:
+		od_assert(server == NULL);
+		od_assert(client->route != NULL);
+
+		od_target_session_attrs_t attrs = attach_effective_tsa(client);
+
+		od_frontend_fatal(
+			client, KIWI_CONNECTION_FAILURE,
+			"can't find suitable host for tsa '%s' of user %s.%s",
+			od_target_session_attrs_to_str(attrs),
+			client->startup.database.value,
+			client->startup.user.value);
+		break;
+
+	case OD_EGRACEFUL_SHUTDOWN:
+		if (od_global_get_instance()->pid.restart_new_pid != -1) {
+			od_frontend_fatal_detailed(
+				client, KIWI_ADMIN_SHUTDOWN,
+				"The Odyssey instance is performing online restart to update configuration or binary, and the connections are being drained",
+				"Try to reconnect",
+				"Odyssey is gracefully shutting down");
+		} else {
+			od_frontend_fatal_detailed(
+				client, KIWI_ADMIN_SHUTDOWN,
+				"The Odyssey instance is gracefully shutting down, and the connections are being drained",
+				"", "Odyssey is gracefully shutting down");
+		}
+		/* fallthrough */
+	case OD_ECLIENT_READ:
+		/*fallthrough*/
+	case OD_ECLIENT_WRITE:
 		/* close client connection and reuse server
-		 * link in case of client errors */
-		od_log(&instance->logger, context, client, server,
-		       "client disconnected (read/write error): %s",
-		       machine_error(client->io));
-		if (! client->server) {
-			od_unroute(client);
-			break;
-		}
-		rc = od_reset(server);
-		if (rc != 1) {
-			/* close backend connection */
-			od_router_close_and_unroute(client);
-			break;
-		}
-		/* push server to router server pool */
-		od_router_detach_and_unroute(client);
+			 * link in case of client errors */
+		od_frontend_on_client_disconnect(status, client,
+						 0 /* force server close */);
 		break;
 
-	case OD_FE_ECLIENT_CONFIGURE:
-		/* close client connection and reuse server
-		 * link in case of client errors during setup */
-		od_log(&instance->logger, context, client, server,
-		       "client disconnected (read/write error): %s",
-		       machine_error(client->io));
-		if (! client->server) {
-			od_unroute(client);
-			break;
-		}
-		od_frontend_error(client, SHAPITO_CONNECTION_FAILURE,
-		                  "client %s%.*s configuration error",
-		                  client->id.id_prefix,
-		                  sizeof(client->id.id), client->id.id);
-		/* push server to router server pool */
-		od_router_detach_and_unroute(client);
+	case OD_ECLIENT_PROTOCOL_ERROR:
+		od_frontend_fatal(
+			client, KIWI_PROTOCOL_VIOLATION,
+			"unexpected message type from client or other protocol violation");
+		od_frontend_on_client_disconnect(status, client,
+						 0 /* force server close */);
 		break;
 
-	case OD_FE_ESERVER_CONNECT:
-	{
+	case OD_ESERVER_CONNECT:
 		/* server attached to client and connection failed */
-		od_route_t *route = client->route;
-		if (route->config->client_fwd_error && server->stats.count_error) {
+		if (server->error_connect && route != NULL &&
+		    route->rule->client_fwd_error) {
 			/* forward server error to client */
 			od_frontend_error_fwd(client);
 		} else {
-			od_frontend_error(client, SHAPITO_CONNECTION_FAILURE,
-			                  "failed to connect to remote server %s%.*s",
-			                  server->id.id_prefix,
-			                  sizeof(server->id.id), server->id.id);
+			od_frontend_fatal(
+				client, KIWI_CONNECTION_FAILURE,
+				"failed to connect to remote server %s%.*s",
+				server->id.id_prefix,
+				(int)sizeof(server->id.id), server->id.id);
 		}
-		/* close backend connection */
-		od_router_close_and_unroute(client);
+		od_frontend_on_client_disconnect(status, client,
+						 1 /* force server close */);
 		break;
-	}
-
-	case OD_FE_ESERVER_CONFIGURE:
-		od_log(&instance->logger, context, client, server,
-		       "server disconnected (server configure error)");
-		od_frontend_error(client, SHAPITO_CONNECTION_FAILURE,
-		                  "failed to configure remote server %s%.*s",
-		                  server->id.id_prefix,
-		                  sizeof(server->id.id), server->id.id);
-		/* close backend connection */
-		od_router_close_and_unroute(client);
-		break;
-
-	case OD_FE_ESERVER_READ:
-	case OD_FE_ESERVER_WRITE:
+	case OD_ECATCHUP_TIMEOUT:
 		/* close client connection and close server
-		 * connection in case of server errors */
-		od_log(&instance->logger, context, client, server,
-		       "server disconnected (read/write error): %s",
-		       machine_error(server->io));
-		od_frontend_error(client, SHAPITO_CONNECTION_FAILURE,
-		                  "remote server read/write error %s%.*s",
-		                  server->id.id_prefix,
-		                  sizeof(server->id.id), server->id.id);
-		/* close backend connection */
-		od_router_close_and_unroute(client);
-		break;
+			 * connection in case of server errors */
+		od_log(&instance->logger, client, server,
+		       "replication lag is too big (%" PRId64
+		       " sec), failed to wait replica for catchup: status %s",
+		       client->last_catchup_lag,
+		       od_frontend_status_to_str(status));
 
-	case OD_FE_UNDEF:
-		assert(0);
+		od_frontend_fatal_detailed(
+			client, KIWI_CONNECTION_FAILURE,
+			"replication lag of the node you are trying to connect is too big, connection rejected",
+			"wait until the replica catches up with the primary",
+			"replication lag too big (%" PRId64
+			" seconds), connection rejected: %s %s",
+			client->last_catchup_lag,
+			client->startup.database.value,
+			client->startup.user.value);
+
+		if (client->server != NULL) {
+			od_router_close(router, client);
+		}
+		break;
+	case OD_ECLIENT_READAHEAD_FULL: {
+		od_readahead_describe(&client->io.readahead, ra_desc,
+				      sizeof(ra_desc));
+		od_error(&instance->logger, client, server,
+			 "client readahead buffer full during write: %s",
+			 ra_desc);
+		/* no sending FATAL to client - it's write might already stuck */
+		od_frontend_on_client_disconnect(status, client,
+						 1 /* force server close */);
 		break;
 	}
+
+	case OD_ESERVER_READAHEAD_FULL: {
+		od_readahead_describe(&server->io.readahead, ra_desc,
+				      sizeof(ra_desc));
+		od_error(&instance->logger, client, server,
+			 "server readahead buffer full during write: %s, "
+			 "server %s%.*s",
+			 ra_desc, server->id.id_prefix,
+			 (int)sizeof(server->id.id), server->id.id);
+		od_frontend_fatal(
+			client, KIWI_CONNECTION_FAILURE,
+			"remote server %s%.*s: readahead buffer full, "
+			"cannot resolve write deadlock",
+			server->id.id_prefix, (int)sizeof(server->id.id),
+			server->id.id);
+		od_frontend_on_client_disconnect(status, client,
+						 1 /* force server close */);
+		break;
+	}
+
+	case OD_ESERVER_READ:
+	case OD_ESERVER_WRITE:
+		/* close client connection and close server
+			 * connection in case of server errors */
+		if (server == NULL) {
+			/*
+			 * The failure happened before a server connection
+			 * was attached (e.g. a malformed client message
+			 * processed by the relay): there is no server
+			 * to describe or to close.
+			 */
+			od_frontend_error(client, KIWI_CONNECTION_FAILURE,
+					  "remote server read/write error");
+			od_frontend_on_client_disconnect(status, client, 0);
+			break;
+		}
+		od_log(&instance->logger, client, server,
+		       "server disconnected (read/write error): %s, status %s",
+		       od_io_error(&server->io),
+		       od_frontend_status_to_str(status));
+		od_frontend_error(client, KIWI_CONNECTION_FAILURE,
+				  "remote server read/write error %s%.*s: %s",
+				  server->id.id_prefix,
+				  (int)sizeof(server->id.id), server->id.id,
+				  od_io_error(&server->io));
+		od_frontend_on_client_disconnect(status, client,
+						 1 /* force server close */);
+		break;
+	case OD_UNDEF:
+	case OD_SKIP:
+	case OD_ATTACH:
+	/* fallthrough */
+	case OD_ESYNC_BROKEN:
+	default:
+		od_error(&instance->logger, client, server,
+			 "unexpected error status %s (%d)",
+			 od_frontend_status_to_str(status), (uint32_t)status);
+		od_router_close(router, client);
+		break;
+	}
+}
+
+static void od_application_name_add_host(od_client_t *client)
+{
+	if (client == NULL || client->io.io == NULL) {
+		return;
+	}
+	char app_name_with_host[KIWI_MAX_VAR_SIZE];
+	char peer_name[KIWI_MAX_VAR_SIZE];
+	int app_name_len = 7;
+	char *app_name = "unknown";
+	kiwi_var_t *app_name_var =
+		kiwi_vars_get(&client->vars, KIWI_VAR_APPLICATION_NAME);
+	if (app_name_var != NULL) {
+		app_name_len = app_name_var->value_len;
+		app_name = app_name_var->value;
+	}
+	od_getpeername(client->io.io, peer_name, sizeof(peer_name), 1,
+		       1); /* include both address and port */
+
+	int length =
+		od_snprintf(app_name_with_host, KIWI_MAX_VAR_SIZE, "%.*s - %s",
+			    app_name_len, app_name, peer_name);
+	if (length >= KIWI_MAX_VAR_SIZE) {
+		length = KIWI_MAX_VAR_SIZE - 1;
+	}
+	kiwi_vars_set(&client->vars, KIWI_VAR_APPLICATION_NAME,
+		      app_name_with_host, length + 1); /* return code ignored */
+}
+
+static inline int wait_cancel_allowed(od_global_t *global,
+				      od_instance_t *instance,
+				      uint32_t timeout_ms)
+{
+	int rc;
+	if (instance->config.cancel_rate_limit != 0) {
+		od_wait_event_start(OD_WAIT_RATELIMIT_CANCEL);
+		rc = od_rate_limiter_waitn(&global->cancel_rate_limiter, 1,
+					   timeout_ms);
+		od_wait_event_end(OD_WAIT_RATELIMIT_CANCEL);
+	} else {
+		od_wait_event_start(OD_WAIT_RATELIMIT_CANCEL);
+		rc = mm_sem_timedwait(&global->cancel_sem, timeout_ms);
+		od_wait_event_end(OD_WAIT_RATELIMIT_CANCEL);
+	}
+	return rc;
+}
+
+static inline void cancel_finished(od_global_t *global, od_instance_t *instance)
+{
+	if (instance->config.cancel_rate_limit == 0) {
+		mm_sem_post(&global->cancel_sem);
+	}
+}
+
+static void od_frontend_cancel_close(od_client_t *client)
+{
+	od_instance_t *instance = client->global->instance;
+	uint32_t timeout =
+		instance->config.cancel_timeout_ms > 0 ?
+			(uint32_t)instance->config.cancel_timeout_ms :
+			UINT32_MAX;
+	if (mm_tls_shutdown(client->io.io, timeout) == -1) {
+		od_debug(&instance->logger, client, NULL,
+			 "TLS shutdown failed: %s", od_io_error(&client->io));
+	}
+	od_frontend_close(client);
 }
 
 void od_frontend(void *arg)
 {
 	od_client_t *client = arg;
-	od_instance_t *instance = client->global->instance;
+	od_global_t *global = client->global;
+	od_instance_t *instance = global->instance;
+	od_router_t *router = global->router;
+	od_extension_t *extensions = global->extensions;
+	od_module_t *modules = extensions->modules;
+
+	od_getpeername(client->io.io, client->peer, OD_CLIENT_MAX_PEERLEN, 1,
+		       1);
 
 	/* log client connection */
-	if (instance->config.log_session) {
-		char peer[128];
-		od_getpeername(client->io, peer, sizeof(peer), 1, 1);
-		od_log(&instance->logger, "startup", client, NULL,
-		       "new client connection %s",
-		       peer);
+	if (instance->config.log_session && instance->config.log_debug) {
+		od_debug(&instance->logger, client, NULL,
+			 "new client connection %s", client->peer);
 	}
 
 	/* attach client io to worker machine event loop */
 	int rc;
-	rc = machine_io_attach(client->io);
+	rc = od_io_attach(&client->io);
 	if (rc == -1) {
-		od_error(&instance->logger, "startup", client, NULL,
-		         "failed to transfer client io");
-		machine_close(client->io);
+		od_error(&instance->logger, client, NULL,
+			 "failed to transfer client io");
+		od_io_close(&client->io);
 		od_client_free(client);
+		od_routing_slot_release(global);
 		return;
 	}
-
-	/* attach stream to the client */
-	od_client_stream_attach(client, &instance->stream_cache);
 
 	/* handle startup */
 	rc = od_frontend_startup(client);
 	if (rc == -1) {
 		od_frontend_close(client);
+		od_routing_slot_release(global);
 		return;
 	}
 
 	/* handle cancel request */
 	if (client->startup.is_cancel) {
-		od_log(&instance->logger, "startup", client, NULL,
-		       "cancel request");
-		od_routercancel_t cancel;
-		od_routercancel_init(&cancel);
-		rc = od_router_cancel(client, &cancel);
-		if (rc == 0) {
-			od_cancel(client->global, client->stream, cancel.config,
-			          &cancel.key, &cancel.id);
-			od_routercancel_free(&cancel);
+		od_debug(&instance->logger, client, NULL, "cancel request");
+
+		od_routing_slot_release(global);
+		/* libpq's PQcancelPoll requires EOF rather than a TCP reset. */
+		if (mm_io_set_nolinger(client->io.io, 0) == -1) {
+			od_error(&instance->logger, client, NULL,
+				 "failed to disable reset on close: %s",
+				 strerror(machine_errno()));
+			od_frontend_close(client);
+			return;
 		}
-		od_frontend_close(client);
+
+		if (instance->config.ignore_cancel) {
+			od_debug(
+				&instance->logger, client, NULL,
+				"cancel request ignored (ignore_cancel is on)");
+			od_frontend_close(client);
+			return;
+		}
+
+		uint32_t queue_timeout =
+			instance->config.cancel_queue_timeout_ms >= 0 ?
+				(uint32_t)instance->config
+					.cancel_queue_timeout_ms :
+				2 * (uint32_t)instance->config.cancel_timeout_ms;
+
+		rc = wait_cancel_allowed(global, instance, queue_timeout);
+		if (rc != 0) {
+			od_error(
+				&instance->logger, client, NULL,
+				"dropping cancel request due to queue timeout %u ms",
+				queue_timeout);
+			od_frontend_cancel_close(client);
+			return;
+		}
+
+		od_router_cancel(router, &client->startup.key);
+
+		cancel_finished(global, instance);
+
+		od_frontend_cancel_close(client);
 		return;
 	}
 
-	/* set client backend key */
-	od_frontend_key(client);
+	/*
+	 * replication full proxy mode: when the global replication_proxy
+	 * options are enabled, replication connections are forwarded
+	 * to the server as is, bypassing all of the odyssey logic -
+	 * no rules matching, authentication, hba, pooling, deploy etc.
+	 *
+	 * the first remote storage of the configuration is used as the
+	 * target, its first endpoint in particular
+	 */
+	if ((client->physical_rep && instance->config.replication_proxy_phys) ||
+	    (client->logical_rep && instance->config.replication_proxy_logic)) {
+		od_routing_slot_release(global);
+
+		od_frontend_replication_proxy(client);
+
+		return;
+	}
+
+	/* The client-visible key identifies this connection. The router resolves
+	 * cancellation to its currently assigned backend, which has its own key.
+	 */
+	kiwi_key_set32(&client->key, client->id.id_a, client->id.id_b);
+	if (client->startup.proto_version >= PG_PROTOCOL(3, 2)) {
+		client->key.key_len = KIWI_CANCEL_KEY_DEFAULT_LEN;
+		if (RAND_bytes((unsigned char *)client->key.key,
+			       client->key.key_len) != 1) {
+			od_error(&instance->logger, client, NULL,
+				 "could not generate random cancel key");
+			od_frontend_error(
+				client, KIWI_INTERNAL_ERROR,
+				"could not generate random cancel key");
+			od_frontend_close(client);
+			od_routing_slot_release(global);
+			return;
+		}
+	}
+
+	rc = od_global_clients_map_add(instance->clients_by_key, client);
+	if (rc == -1) {
+		od_frontend_close(client);
+		od_routing_slot_release(global);
+		return;
+	}
 
 	/* route client */
-	od_routerstatus_t status;
-	status = od_route(client);
-	switch (status) {
-	case OD_RERROR:
-		od_error(&instance->logger, "startup", client, NULL,
-		         "routing failed, closing");
-		od_frontend_error(client, SHAPITO_SYSTEM_ERROR,
-		                  "client routing failed");
-		od_frontend_close(client);
-		return;
-	case OD_RERROR_NOT_FOUND:
-		od_error(&instance->logger, "startup", client, NULL,
-		         "route '%s.%s' not matched, closing",
-		         shapito_parameter_value(client->startup.database),
-		         shapito_parameter_value(client->startup.user));
-		od_frontend_error(client, SHAPITO_UNDEFINED_DATABASE,
-		                  "route is not matched");
-		od_frontend_close(client);
-		return;
-	case OD_RERROR_LIMIT:
-		od_error(&instance->logger, "startup", client, NULL,
-		         "route connection limit reached, closing");
-		od_frontend_error(client, SHAPITO_TOO_MANY_CONNECTIONS,
-		                  "too many connections");
-		od_frontend_close(client);
-		return;
-	case OD_ROK:
-	{
+	od_router_status_t router_status;
+	router_status = od_router_route(router, client);
+
+	/* routing is over */
+	od_routing_slot_release(global);
+
+	if (od_likely(router_status == OD_ROUTER_OK)) {
 		od_route_t *route = client->route;
-		if (instance->config.log_session) {
-			od_log(&instance->logger, "startup", client, NULL,
-			       "route '%s.%s' to '%s.%s'",
-			       shapito_parameter_value(client->startup.database),
-			       shapito_parameter_value(client->startup.user),
-			       route->config->db_name,
-			       route->config->user_name);
+		if (route->rule->application_name_add_host) {
+			od_application_name_add_host(client);
 		}
-		break;
+
+		/* override clients pg options if configured */
+		rc = kiwi_vars_override(&client->vars, &route->rule->vars);
+		if (rc == -1) {
+			goto cleanup;
+		}
+
+		/* set network options */
+		od_rule_t *rule = route->rule;
+		if (rule->keepalive > 0) {
+			mm_io_set_keepalive(client->io.io, 1, rule->keepalive,
+					    rule->keepalive_keep_interval,
+					    rule->keepalive_probes,
+					    rule->keepalive_usr_timeout);
+		}
+	} else {
+		if (od_router_status_is_err(router_status)) {
+			od_error_logger_store_err(router->router_err_logger,
+						  router_status);
+		}
+
+		switch (router_status) {
+		case OD_ROUTER_ERROR:
+			od_error(&instance->logger, client, NULL,
+				 "routing failed for '%s' client, closing",
+				 client->peer);
+			od_frontend_error(client, KIWI_SYSTEM_ERROR,
+					  "client routing failed");
+			break;
+		case OD_ROUTER_INSUFFICIENT_ACCESS:
+			/*
+			 * disabling blind ldapsearch via odyssey error messages
+			 * to collect user account attributes
+			 */
+			od_error(
+				&instance->logger, client, NULL,
+				"route for '%s.%s' is not found by ldapsearch for '%s' client, closing",
+				client->startup.database.value,
+				client->startup.user.value, client->peer);
+			od_frontend_fatal(
+				client, KIWI_SYSTEM_ERROR,
+				"ldap authentication failed for user \"%s\": insufficient access",
+				client->startup.user.value);
+			break;
+		case OD_ROUTER_ERROR_NOT_FOUND:
+			od_error(
+				&instance->logger, client, NULL,
+				"route for '%s.%s' is not found for '%s' client, closing",
+				client->startup.database.value,
+				client->startup.user.value, client->peer);
+			od_frontend_error(client, KIWI_UNDEFINED_DATABASE,
+					  "route for '%s.%s' is not found",
+					  client->startup.database.value,
+					  client->startup.user.value);
+			break;
+		case OD_ROUTER_ERROR_LIMIT:
+			od_error(
+				&instance->logger, client, NULL,
+				"global connection limit reached for '%s' client, closing",
+				client->peer);
+
+			od_frontend_error(
+				client, KIWI_TOO_MANY_CONNECTIONS,
+				"too many client tcp connections (global client_max)");
+			break;
+		case OD_ROUTER_ERROR_LIMIT_ROUTE:
+			od_error(
+				&instance->logger, client, NULL,
+				"route connection limit reached for client '%s', closing",
+				client->peer);
+			od_frontend_error(
+				client, KIWI_TOO_MANY_CONNECTIONS,
+				"too many client tcp connections (client_max for user %s.%s "
+				"%d)",
+				client->startup.database.value,
+				client->startup.user.value,
+				client->rule != NULL ?
+					client->rule->client_max :
+					-1);
+			break;
+		case OD_ROUTER_ERROR_REPLICATION:
+			od_error(
+				&instance->logger, client, NULL,
+				"invalid value for parameter \"replication\" for client '%s'",
+				client->peer);
+
+			od_frontend_error(
+				client, KIWI_CONNECTION_FAILURE,
+				"invalid value for parameter \"replication\"");
+			break;
+		default:
+			od_assert(0);
+			break;
+		}
+
+		od_global_clients_map_remove(instance->clients_by_key, client);
+		od_frontend_close(client);
+		return;
 	}
-	default:
-		assert(0);
-		break;
+
+	/* pre-auth callback */
+	od_list_t *i;
+	od_list_foreach (&modules->link, i) {
+		od_module_t *module;
+		module = od_container_of(i, od_module_t, link);
+		if (module->auth_attempt_cb(client) ==
+		    OD_MODULE_CB_FAIL_RETCODE) {
+			goto cleanup;
+		}
 	}
+
+	/* HBA check */
+	rc = od_hba_process(client);
+
+	char client_ip[64];
+	od_getpeername(client->io.io, client_ip, sizeof(client_ip), 1, 0);
 
 	/* client authentication */
-	rc = od_auth_frontend(client);
-	if (rc == -1) {
-		od_unroute(client);
-		od_frontend_close(client);
-		return;
+	if (rc == OK_RESPONSE) {
+		/* Check for replication lag and reject query if too big before auth */
+		od_frontend_status_t catchup_status =
+			od_frontend_check_replica_catchup(instance, client);
+		if (od_frontend_status_is_err(catchup_status)) {
+			od_error(&instance->logger, client, NULL,
+				 "replication lag too big (%" PRId64
+				 "), connection rejected: %s %s",
+				 client->last_catchup_lag,
+				 client->startup.database.value,
+				 client->startup.user.value);
+
+			od_frontend_fatal_detailed(
+				client, KIWI_CONNECTION_FAILURE,
+				"replication lag of the node you are trying to connect is too big, connection rejected",
+				"wait until the replica catches up with the primary",
+				"replication lag too big (%" PRId64
+				" seconds), connection rejected: %s %s",
+				client->last_catchup_lag,
+				client->startup.database.value,
+				client->startup.user.value);
+			rc = NOT_OK_RESPONSE;
+		} else {
+			rc = od_auth_frontend(client);
+
+			if (instance->config.log_session &&
+			    instance->config.hba_file) {
+				od_log(&instance->logger, client, NULL,
+				       "ip '%s' user '%s.%s': host based authentication allowed",
+				       client_ip,
+				       client->startup.database.value,
+				       client->startup.user.value);
+			}
+		}
+	} else {
+		od_error(
+			&instance->logger, client, NULL,
+			"ip '%s' user '%s.%s': host based authentication rejected",
+			client_ip, client->startup.database.value,
+			client->startup.user.value);
+
+		od_frontend_error(client, KIWI_INVALID_PASSWORD,
+				  "host based authentication rejected");
 	}
 
-	/* configure client parameters and send ready */
-	od_frontend_rc_t frontend_rc;
-	frontend_rc = od_frontend_setup(client);
-	if (frontend_rc != OD_FE_OK) {
-		od_frontend_cleanup(client, "setup", frontend_rc);
-		od_frontend_close(client);
-		return;
+	uint64_t used_memory = 0;
+	od_rule_storage_type_t storage_type =
+		client->route->rule->storage->storage_type;
+	if (storage_type == OD_RULE_STORAGE_REMOTE &&
+	    od_global_is_in_soft_oom(global, &used_memory)) {
+		od_frontend_fatal(client, KIWI_OUT_OF_MEMORY,
+				  "soft out of memory");
+		od_error(&instance->logger, client, NULL,
+			 "drop connection due to soft oom (usage is %" PRIu64
+			 " KB)",
+			 used_memory / 1024);
+		rc = NOT_OK_RESPONSE;
 	}
 
-	/* main */
+	if (rc != OK_RESPONSE) {
+		/* rc == -1
+		 * here we ignore module retcode because auth already failed
+		 * we just inform side modules that usr was trying to log in
+		 */
+		od_list_foreach (&modules->link, i) {
+			od_module_t *module;
+			module = od_container_of(i, od_module_t, link);
+			module->auth_complete_cb(client, rc);
+		}
+		goto cleanup;
+	}
+
+	/* auth result callback */
+	od_list_foreach (&modules->link, i) {
+		od_module_t *module;
+		module = od_container_of(i, od_module_t, link);
+		rc = module->auth_complete_cb(client, rc);
+		if (rc != OD_MODULE_CB_OK_RETCODE) {
+			/* user blocked from module callback */
+			goto cleanup;
+		}
+	}
+
+	/* setup client and run main loop */
 	od_route_t *route = client->route;
-	switch (route->config->storage->storage_type) {
-	case OD_STORAGETYPE_REMOTE:
-		frontend_rc = od_frontend_remote(client);
-		break;
-	case OD_STORAGETYPE_LOCAL:
-		frontend_rc = od_frontend_local(client);
+
+	od_frontend_status_t status;
+	status = OD_UNDEF;
+	switch (route->rule->storage->storage_type) {
+	case OD_RULE_STORAGE_LOCAL: {
+		status = od_frontend_local_setup(client);
+		if (status != OD_OK) {
+			break;
+		}
+
+		status = od_frontend_local(client);
 		break;
 	}
+	case OD_RULE_STORAGE_REMOTE: {
+		status = od_frontend_setup(client);
+		if (status != OD_OK) {
+			break;
+		}
 
-	/* reset client and server state */
-	if (client->stream == NULL)
-		od_client_stream_attach(client, &instance->stream_cache);
+		status = od_frontend_remote(client);
+		break;
+	}
+	}
+	od_error_logger_t *l;
+	l = router->route_pool.err_logger;
 
-	od_frontend_cleanup(client, "main", frontend_rc);
+	od_frontend_cleanup(client, status, l);
+
+	od_list_foreach (&modules->link, i) {
+		od_module_t *module;
+		module = od_container_of(i, od_module_t, link);
+		module->disconnect_cb(client, status);
+	}
+
+	/* cleanup */
+
+cleanup:
+	od_global_clients_map_remove(instance->clients_by_key, client);
+
+	/* detach client from its route */
+	od_router_unroute(router, client);
 
 	/* close frontend connection */
 	od_frontend_close(client);

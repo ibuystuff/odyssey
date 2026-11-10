@@ -1,0 +1,44 @@
+FROM ubuntu:noble
+
+ARG build_type=build_release
+
+RUN apt update && apt install -y ca-certificates
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirror.yandex.ru/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirror.yandex.ru/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources
+
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --no-install-recommends --allow-unauthenticated \
+    git \
+    libssl-dev \
+    libldap-common \
+    openssl \
+    libpam0g-dev \
+    libldap-dev \
+    build-essential \
+    cmake \
+    clang \
+    bison flex \
+    postgresql-client \
+    procps \
+    python3 \
+    libpthread-stubs0-dev libclang-rt-dev
+
+RUN mkdir /odyssey
+WORKDIR /odyssey
+
+COPY . ./
+COPY ./test/bin/ody-start ./test/bin/ody-stop /usr/bin/
+
+ARG odyssey_cc
+ENV CC=${odyssey_cc}
+
+ARG odyssey_cmake_extra=""
+ENV ODYSSEY_CMAKE_EXTRA=${odyssey_cmake_extra}
+
+RUN make clean
+RUN make ${build_type}
+
+WORKDIR /odyssey/build/sources
+
+ENTRYPOINT [ "/odyssey/test/unit/entrypoint.sh" ]

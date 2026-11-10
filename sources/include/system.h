@@ -1,0 +1,73 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <machinarium/machinarium.h>
+#include <machinarium/eventfd.h>
+#include <machinarium/dns.h>
+#include <machinarium/ds/vector.h>
+
+#include <sys/types.h>
+
+#include <types.h>
+#include <id.h>
+#include <config.h>
+
+struct od_system_server {
+	mm_io_t *io;
+	mm_eventfd_t shutdown_efd;
+	machine_tls_t *tls;
+	/* tls handles replaced by a reload, still referenced by live clients */
+	mm_vector_t tls_retired;
+	od_config_listen_t *config;
+	mm_addrinfo_t *addr;
+	od_global_t *global;
+	/* Unix listener ownership, protected by a lock held until cleanup. */
+	char *unix_socket_path;
+	int unix_socket_lock_fd;
+	dev_t unix_socket_dev;
+	ino_t unix_socket_ino;
+	bool unix_socket_owned;
+	od_list_t link;
+	od_id_t sid;
+
+	atomic_bool closed;
+
+	int64_t coro_id;
+
+	atomic_uint_fast64_t clients;
+};
+
+void od_system_server_free(od_system_server_t *server);
+od_system_server_t *od_system_server_init(void);
+
+void od_system_server_shutdown(od_system_server_t *server);
+
+struct od_system {
+	int64_t machine;
+	int64_t sighandler_machine;
+	machine_channel_t *system_channel;
+	od_global_t *global;
+};
+
+od_system_t *od_system_create(void);
+void od_system_init(od_system_t *);
+int od_system_start(od_system_t *, od_global_t *);
+void od_system_config_reload(od_system_t *);
+void od_system_free(od_system_t *system);
+
+int od_system_send_msg(od_system_t *system, int msg_type, void *arg);
+
+/*
+ * Applies one ALTER SYSTEM change with od_autoconf_update() and waits for
+ * it with machine_wait_nb(). Each change runs on its own machine, keeping
+ * file I/O off the accepting system thread and giving the configuration
+ * parser a system-size stack. A mutex serializes autoconf updates.
+ * Returns 0 on success, -1 on error with a message in err.
+ */
+int od_system_alter_system(od_global_t *global, const char *key,
+			   const char *line, char *err, size_t err_size);

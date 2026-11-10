@@ -3,80 +3,63 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
+#include <odyssey.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <openssl/err.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/tls.h"
-#include "sources/frontend.h"
+#include <machinarium/machinarium.h>
+#include <machinarium/io.h>
 
-machine_tls_t*
-od_tls_frontend(od_configlisten_t *config)
+#include <status.h>
+#include <tls.h>
+#include <wait_event.h>
+#include <client.h>
+#include <server.h>
+#include <frontend.h>
+
+machine_tls_t *od_tls_frontend(od_config_listen_t *config)
 {
 	int rc;
 	machine_tls_t *tls;
 	tls = machine_tls_create();
-	if (tls == NULL)
+	if (tls == NULL) {
 		return NULL;
-	if (config->tls_mode == OD_TLS_ALLOW)
+	}
+
+	switch (config->tls_opts->tls_mode) {
+	case OD_CONFIG_TLS_ALLOW:
+	case OD_CONFIG_TLS_PREFER:
 		machine_tls_set_verify(tls, "none");
-	else
-	if (config->tls_mode == OD_TLS_REQUIRE)
+		break;
+	case OD_CONFIG_TLS_REQUIRE:
 		machine_tls_set_verify(tls, "peer");
-	else
+		break;
+	default:
 		machine_tls_set_verify(tls, "peer_strict");
-	if (config->tls_ca_file) {
-		rc = machine_tls_set_ca_file(tls, config->tls_ca_file);
+		break;
+	}
+
+	if (config->tls_opts->tls_ca_file) {
+		rc = machine_tls_set_ca_file(tls,
+					     config->tls_opts->tls_ca_file);
 		if (rc == -1) {
 			machine_tls_free(tls);
 			return NULL;
 		}
 	}
-	if (config->tls_cert_file) {
-		rc = machine_tls_set_cert_file(tls, config->tls_cert_file);
+	if (config->tls_opts->tls_cert_file) {
+		rc = machine_tls_set_cert_file(tls,
+					       config->tls_opts->tls_cert_file);
 		if (rc == -1) {
 			machine_tls_free(tls);
 			return NULL;
 		}
 	}
-	if (config->tls_key_file) {
-		rc = machine_tls_set_key_file(tls, config->tls_key_file);
+	if (config->tls_opts->tls_key_file) {
+		rc = machine_tls_set_key_file(tls,
+					      config->tls_opts->tls_key_file);
 		if (rc == -1) {
 			machine_tls_free(tls);
 			return NULL;
@@ -85,92 +68,160 @@ od_tls_frontend(od_configlisten_t *config)
 	return tls;
 }
 
-int
-od_tls_frontend_accept(od_client_t *client,
-                       od_logger_t *logger,
-                       od_configlisten_t *config,
-                       machine_tls_t *tls)
+/*
+ * Load the configured certificate material the same way the TLS handshake
+ * does. Runs before machinarium is initialized, so it must not use any
+ * machine_* call.
+ */
+od_retcode_t od_tls_frontend_validate(od_config_listen_t *config, char *error,
+				      int error_len)
 {
-	shapito_stream_t *stream = client->stream;
+	od_tls_opts_t *opts = config->tls_opts;
+	const char *failed = NULL;
+	od_retcode_t rc = NOT_OK_RESPONSE;
 
-	if (client->startup.is_ssl_request)
-	{
-		od_debug(logger, "tls", client, NULL, "ssl request");
-		shapito_stream_reset(stream);
-		int rc;
-		if (config->tls_mode == OD_TLS_DISABLE) {
-			/* not supported 'N' */
-			shapito_stream_write8(stream, 'N');
-			rc = od_write(client->io, stream);
-			if (rc == -1) {
-				od_error(logger, "tls", client, NULL, "write error: %s",
-				         machine_error(client->io));
-				return -1;
-			}
-			od_debug(logger, "tls", client, NULL, "is disabled, ignoring");
-			return 0;
-		}
-		/* supported 'S' */
-		shapito_stream_write8(stream, 'S');
-		rc = od_write(client->io, stream);
-		if (rc == -1) {
-			od_error(logger, "tls", client, NULL, "write error: %s",
-			         machine_error(client->io));
+	SSL_CTX *ctx = SSL_CTX_new(SSLv23_server_method());
+	if (ctx == NULL) {
+		failed = "SSL_CTX_new()";
+		goto done;
+	}
+
+	if (opts->tls_cert_file &&
+	    !SSL_CTX_use_certificate_chain_file(ctx, opts->tls_cert_file)) {
+		failed = "SSL_CTX_use_certificate_chain_file()";
+		goto done;
+	}
+	if (opts->tls_key_file &&
+	    SSL_CTX_use_PrivateKey_file(ctx, opts->tls_key_file,
+					SSL_FILETYPE_PEM) != 1) {
+		failed = "SSL_CTX_use_PrivateKey_file()";
+		goto done;
+	}
+	if (opts->tls_cert_file && opts->tls_key_file &&
+	    SSL_CTX_check_private_key(ctx) != 1) {
+		failed = "SSL_CTX_check_private_key()";
+		goto done;
+	}
+	if (opts->tls_ca_file &&
+	    SSL_CTX_load_verify_locations(ctx, opts->tls_ca_file, NULL) != 1) {
+		failed = "SSL_CTX_load_verify_locations()";
+		goto done;
+	}
+
+	rc = OK_RESPONSE;
+
+done:
+	if (rc != OK_RESPONSE && error != NULL && error_len > 0) {
+		unsigned long err = ERR_get_error();
+		od_snprintf(error, error_len, "%s: %s", failed,
+			    err ? ERR_error_string(err, NULL) :
+				  "unknown error");
+	}
+	if (ctx != NULL) {
+		SSL_CTX_free(ctx);
+	}
+	return rc;
+}
+
+int od_tls_frontend_accept(od_client_t *client, od_logger_t *logger,
+			   od_config_listen_t *config, machine_tls_t *tls)
+{
+	od_debug(logger, client, NULL, "ssl request");
+
+	int rc;
+	if (config->tls_opts->tls_mode == OD_CONFIG_TLS_DISABLE) {
+		/* not supported 'N' */
+		machine_msg_t *msg;
+		msg = machine_msg_create(sizeof(uint8_t));
+		if (msg == NULL) {
 			return -1;
 		}
-		rc = machine_set_tls(client->io, tls);
+		uint8_t *type = machine_msg_data(msg);
+		*type = 'N';
+		rc = od_write(&client->io, msg);
 		if (rc == -1) {
-			od_error(logger, "tls", client, NULL, "error: %s",
-			         machine_error(client->io));
+			od_error(logger, client, NULL, "write error: %s",
+				 od_io_error(&client->io));
 			return -1;
 		}
-		od_debug(logger, "tls", client, NULL, "ok");
+		od_debug(logger, client, NULL, "is disabled, ignoring");
 		return 0;
 	}
-	switch (config->tls_mode) {
-	case OD_TLS_DISABLE:
-	case OD_TLS_ALLOW:
-		break;
-	default:
-		od_log(logger, "tls", client, NULL, "required, closing");
-		od_frontend_error(client, SHAPITO_PROTOCOL_VIOLATION,
-		                  "SSL is required");
+
+	/* supported 'S' */
+	machine_msg_t *msg;
+	msg = machine_msg_create(sizeof(uint8_t));
+	if (msg == NULL) {
 		return -1;
 	}
+	uint8_t *type = machine_msg_data(msg);
+	*type = 'S';
+	rc = od_write(&client->io, msg);
+	if (rc == -1) {
+		od_error(logger, client, NULL, "write error: %s",
+			 od_io_error(&client->io));
+		return -1;
+	}
+
+	if (od_readahead_unread(&client->io.readahead) > 0) {
+		od_error(logger, client, NULL, "extraneous data from client");
+		return -1; /* prevent possible buffer, protecting against CVE-2021-23214-like attacks */
+	}
+
+	od_wait_event_start(OD_WAIT_CONNECT_CLIENT_TLS);
+	rc = mm_io_set_tls(client->io.io, tls, config->client_login_timeout_ms);
+	od_wait_event_end(OD_WAIT_CONNECT_CLIENT_TLS);
+	if (rc == -1) {
+		od_error(logger, client, NULL,
+			 "error: %s, login time %" PRIu64 " us",
+			 od_io_error(&client->io),
+			 machine_time_us() - client->time_accept);
+		return -1;
+	}
+
+	od_debug(logger, client, NULL, "ok");
+
 	return 0;
 }
 
-machine_tls_t*
-od_tls_backend(od_configstorage_t *config)
+machine_tls_t *od_tls_backend(od_tls_opts_t *opts)
 {
 	int rc;
 	machine_tls_t *tls;
 	tls = machine_tls_create();
-	if (tls == NULL)
+	if (tls == NULL) {
 		return NULL;
-	if (config->tls_mode == OD_TLS_ALLOW)
+	}
+
+	switch (opts->tls_mode) {
+	case OD_CONFIG_TLS_ALLOW:
+	case OD_CONFIG_TLS_PREFER:
 		machine_tls_set_verify(tls, "none");
-	else
-	if (config->tls_mode == OD_TLS_REQUIRE)
+		break;
+	case OD_CONFIG_TLS_REQUIRE:
 		machine_tls_set_verify(tls, "peer");
-	else
+		break;
+	default:
 		machine_tls_set_verify(tls, "peer_strict");
-	if (config->tls_ca_file) {
-		rc = machine_tls_set_ca_file(tls, config->tls_ca_file);
+		break;
+	}
+
+	if (opts->tls_ca_file) {
+		rc = machine_tls_set_ca_file(tls, opts->tls_ca_file);
 		if (rc == -1) {
 			machine_tls_free(tls);
 			return NULL;
 		}
 	}
-	if (config->tls_cert_file) {
-		rc = machine_tls_set_cert_file(tls, config->tls_cert_file);
+	if (opts->tls_cert_file) {
+		rc = machine_tls_set_cert_file(tls, opts->tls_cert_file);
 		if (rc == -1) {
 			machine_tls_free(tls);
 			return NULL;
 		}
 	}
-	if (config->tls_key_file) {
-		rc = machine_tls_set_key_file(tls, config->tls_key_file);
+	if (opts->tls_key_file) {
+		rc = machine_tls_set_key_file(tls, opts->tls_key_file);
 		if (rc == -1) {
 			machine_tls_free(tls);
 			return NULL;
@@ -179,59 +230,67 @@ od_tls_backend(od_configstorage_t *config)
 	return tls;
 }
 
-int
-od_tls_backend_connect(od_server_t *server,
-                       od_logger_t *logger,
-                       shapito_stream_t *stream,
-                       od_configstorage_t *config)
+int od_tls_backend_connect(od_server_t *server, od_logger_t *logger,
+			   od_tls_opts_t *opts)
 {
-	od_debug(logger, "tls", NULL, server, "init");
+	od_debug(logger, NULL, server, "init");
 
 	/* SSL Request */
-	shapito_stream_reset(stream);
-	int rc;
-	rc = shapito_fe_write_ssl_request(stream);
-	if (rc == -1)
+	machine_msg_t *msg;
+	msg = kiwi_fe_write_ssl_request(NULL);
+	if (msg == NULL) {
 		return -1;
-	rc = od_write(server->io, stream);
+	}
+	int rc;
+	rc = od_write(&server->io, msg);
 	if (rc == -1) {
-		od_error(logger, "tls", NULL, server, "write error: %s",
-		         machine_error(server->io));
+		od_error(logger, NULL, server, "write error: %s",
+			 od_io_error(&server->io));
 		return -1;
 	}
 
 	/* read server reply */
-	shapito_stream_reset(stream);
-	rc = machine_read(server->io, stream->pos, 1, UINT32_MAX);
+	char type;
+	rc = od_io_read(&server->io, &type, 1, UINT32_MAX);
 	if (rc == -1) {
-		od_error(logger, "tls", NULL, server, "read error: %s",
-		         machine_error(server->io));
+		od_error(logger, NULL, server, "read error: %s",
+			 od_io_error(&server->io));
 		return -1;
 	}
-	switch (*stream->pos) {
+
+	switch (type) {
 	case 'S':
 		/* supported */
-		od_debug(logger, "tls", NULL, server, "supported");
-		rc = machine_set_tls(server->io, server->tls);
+		od_debug(logger, NULL, server, "supported");
+		if (od_readahead_unread(&server->io.readahead) > 0) {
+			od_error(logger, NULL, server,
+				 "extraneous data from server");
+			return -1; /* prevent possible buffer, protecting against CVE-2021-23222-like attacks */
+		}
+
+		rc = mm_io_set_tls(server->io.io, server->tls, UINT32_MAX);
 		if (rc == -1) {
-			od_error(logger, "tls", NULL, server, "error: %s",
-			         machine_error(server->io));
+			od_error(logger, NULL, server, "error: %s",
+				 od_io_error(&server->io));
 			return -1;
 		}
-		od_debug(logger, "tls", NULL, server, "ok");
+		od_debug(logger, NULL, server, "ok");
 		break;
 	case 'N':
 		/* not supported */
-		if (config->tls_mode == OD_TLS_ALLOW) {
-			od_debug(logger, "tls", NULL, server,
-			         "not supported, continue (allow)");
+		if (opts->tls_mode == OD_CONFIG_TLS_ALLOW ||
+		    opts->tls_mode == OD_CONFIG_TLS_PREFER) {
+			od_debug(logger, NULL, server,
+				 "not supported, continue (%s)",
+				 od_config_tls_to_str(opts->tls_mode));
 		} else {
-			od_error(logger, "tls", NULL, server, "not supported, closing");
+			od_error(logger, NULL, server,
+				 "not supported, closing");
 			return -1;
 		}
 		break;
 	default:
-		od_error(logger, "tls", NULL, server, "unexpected status reply");
+		od_error(logger, NULL, server, "unexpected status reply");
 		return -1;
 	}
 	return 0;

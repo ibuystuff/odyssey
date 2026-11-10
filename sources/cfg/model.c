@@ -1,0 +1,1578 @@
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <odyssey.h>
+
+#include <od_memory.h>
+#include <duration.h>
+#include <balancing.h>
+#include <cfg/model.h>
+
+void od_cfg_model_init(od_cfg_model_t *model)
+{
+	memset(model, 0, sizeof(*model));
+}
+
+static void od_cfg_string_field_free(od_cfg_string_field_t *field)
+{
+	od_cfg_seen_free(&field->seen);
+	od_free(field->value);
+	field->value = NULL;
+}
+
+static void od_cfg_int_field_free(od_cfg_int_field_t *field)
+{
+	od_cfg_seen_free(&field->seen);
+}
+
+static void
+od_cfg_query_parsing_mode_free(od_cfg_query_parsing_mode_field_t *field)
+{
+	od_cfg_seen_free(&field->seen);
+}
+
+static void od_cfg_bool_field_free(od_cfg_bool_field_t *field)
+{
+	od_cfg_seen_free(&field->seen);
+}
+
+static void od_cfg_u64_field_free(od_cfg_u64_field_t *field)
+{
+	od_cfg_seen_free(&field->seen);
+}
+
+static void od_cfg_i64_field_free(od_cfg_i64_field_t *field)
+{
+	od_cfg_seen_free(&field->seen);
+}
+
+void od_cfg_seen_set(od_cfg_seen_t *seen, od_cfg_location_t location)
+{
+	seen->is_set = 1;
+	seen->location = od_cfg_location_copy(location);
+}
+
+void od_cfg_seen_free(od_cfg_seen_t *seen)
+{
+	od_cfg_location_free(&seen->location);
+}
+
+od_cfg_listen_storage_t *od_cfg_listen_add_storage(od_cfg_listen_t *listen,
+						   od_cfg_location_t location,
+						   const char *name)
+{
+	if (listen->storages_count >= listen->storages_capacity) {
+		size_t new_capacity = listen->storages_capacity == 0 ?
+					      16 :
+					      listen->storages_capacity * 2;
+		od_cfg_listen_storage_t **tmp = od_realloc(
+			listen->storages,
+			sizeof(od_cfg_listen_storage_t *) * new_capacity);
+		if (tmp == NULL) {
+			return NULL;
+		}
+		listen->storages = tmp;
+		listen->storages_capacity = new_capacity;
+	}
+
+	od_cfg_listen_storage_t *storage =
+		od_malloc(sizeof(od_cfg_listen_storage_t));
+	if (storage == NULL) {
+		return NULL;
+	}
+
+	char *copy = od_strdup(name);
+	if (copy == NULL) {
+		od_free(storage);
+		return NULL;
+	}
+
+	storage->location = od_cfg_location_copy(location);
+	storage->name = copy;
+	listen->storages[listen->storages_count++] = storage;
+
+	return storage;
+}
+
+static void od_cfg_balancing_free(od_cfg_balancing_t *b)
+{
+	od_cfg_seen_free(&b->seen);
+	od_cfg_location_free(&b->location);
+	od_cfg_bool_field_free(&b->show_notice_messages);
+	od_cfg_seen_free(&b->method.seen);
+	od_cfg_location_free(&b->method.location);
+	od_cfg_bool_field_free(&b->method.az_aware);
+	od_free(b->method.name);
+}
+
+static void od_cfg_listen_free(od_cfg_listen_t *listen)
+{
+	if (listen == NULL) {
+		return;
+	}
+
+	od_cfg_string_field_free(&listen->host);
+	od_cfg_int_field_free(&listen->port);
+	od_cfg_string_field_free(&listen->target_session_attrs);
+	od_cfg_bool_field_free(&listen->auto_route_ro_on_standby);
+	od_cfg_balancing_free(&listen->balancing);
+	od_cfg_u64_field_free(&listen->client_login_timeout_ms);
+	od_cfg_bool_field_free(&listen->compression);
+	od_cfg_int_field_free(&listen->backlog);
+	od_cfg_string_field_free(&listen->tls);
+	od_cfg_string_field_free(&listen->tls_ca_file);
+	od_cfg_string_field_free(&listen->tls_key_file);
+	od_cfg_string_field_free(&listen->tls_cert_file);
+	od_cfg_string_field_free(&listen->tls_protocols);
+	od_cfg_u64_field_free(&listen->catchup_timeout_ms);
+	od_cfg_int_field_free(&listen->reserved_clients);
+
+	for (size_t i = 0; i < listen->storages_count; ++i) {
+		od_cfg_location_free(&listen->storages[i]->location);
+		od_free(listen->storages[i]->name);
+		od_free(listen->storages[i]);
+	}
+	od_free(listen->storages);
+
+	od_cfg_location_free(&listen->location);
+
+	od_free(listen);
+}
+
+static void od_cfg_user_route_free(od_cfg_route_t *user);
+
+static void od_cfg_storage_free(od_cfg_storage_t *storage)
+{
+	if (storage == NULL) {
+		return;
+	}
+
+	if (storage->watchdog) {
+		od_cfg_user_route_free(storage->watchdog);
+	}
+
+	od_free(storage->name);
+
+	od_cfg_string_field_free(&storage->type);
+	od_cfg_string_field_free(&storage->host);
+	od_cfg_int_field_free(&storage->port);
+	od_cfg_string_field_free(&storage->tls);
+	od_cfg_string_field_free(&storage->tls_ca_file);
+	od_cfg_string_field_free(&storage->tls_key_file);
+	od_cfg_string_field_free(&storage->tls_cert_file);
+	od_cfg_string_field_free(&storage->tls_protocols);
+	od_cfg_int_field_free(&storage->server_max_routing);
+	od_cfg_u64_field_free(&storage->endpoints_status_poll_interval_ms);
+
+	od_cfg_balancing_free(&storage->balancing);
+
+	od_cfg_location_free(&storage->location);
+	od_cfg_location_free(&storage->name_location);
+
+	od_free(storage);
+}
+
+static void od_cfg_shared_pool_free(od_cfg_shared_pool_t *pool)
+{
+	if (pool == NULL) {
+		return;
+	}
+
+	od_free(pool->name);
+	od_cfg_int_field_free(&pool->pool_size);
+	od_cfg_location_free(&pool->location);
+	od_cfg_location_free(&pool->name_location);
+	od_free(pool);
+}
+
+static void od_cfg_ldap_endpoint_free(od_cfg_ldap_endpoint_t *endpoint)
+{
+	if (endpoint == NULL) {
+		return;
+	}
+
+	od_free(endpoint->name);
+
+	od_cfg_string_field_free(&endpoint->ldapserver);
+	od_cfg_u64_field_free(&endpoint->ldapport);
+	od_cfg_string_field_free(&endpoint->ldapprefix);
+	od_cfg_string_field_free(&endpoint->ldapsuffix);
+	od_cfg_string_field_free(&endpoint->ldapsearchattribute);
+	od_cfg_string_field_free(&endpoint->ldapscope);
+	od_cfg_string_field_free(&endpoint->ldapscheme);
+	od_cfg_string_field_free(&endpoint->ldapbasedn);
+	od_cfg_string_field_free(&endpoint->ldapbinddn);
+	od_cfg_string_field_free(&endpoint->ldapbindpasswd);
+	od_cfg_string_field_free(&endpoint->ldapsearchfilter);
+
+	od_cfg_location_free(&endpoint->location);
+	od_cfg_location_free(&endpoint->name_location);
+
+	od_free(endpoint);
+}
+
+static void od_cfg_string_kvp_free(od_cfg_string_kvp_t *kvp)
+{
+	od_free(kvp->key);
+	od_free(kvp->value);
+	od_cfg_location_free(&kvp->location);
+	od_cfg_location_free(&kvp->key_location);
+	od_cfg_location_free(&kvp->value_location);
+}
+
+static void od_cfg_string_kvp_list_free(od_cfg_string_kvp_list_t *l)
+{
+	for (size_t i = 0; i < l->pairs_count; ++i) {
+		od_cfg_string_kvp_free(l->pairs[i]);
+		od_free(l->pairs[i]);
+	}
+	od_free(l->pairs);
+}
+
+static void od_cfg_user_route_free(od_cfg_route_t *user)
+{
+	if (user == NULL) {
+		return;
+	}
+
+	od_free(user->name);
+	od_free(user->address_range);
+
+	for (size_t i = 0; i < user->auth_common_names_count; ++i) {
+		od_free(user->auth_common_names[i]->name);
+		od_cfg_location_free(&user->auth_common_names[i]->location);
+		od_cfg_location_free(
+			&user->auth_common_names[i]->name_location);
+		od_free(user->auth_common_names[i]);
+	}
+	od_free(user->auth_common_names);
+
+	for (size_t i = 0; i < user->ldap_storage_credentials_count; ++i) {
+		od_free(user->ldap_storage_credentials[i]->name);
+		od_cfg_string_field_free(&user->ldap_storage_credentials[i]
+						  ->ldap_storage_username);
+		od_cfg_string_field_free(&user->ldap_storage_credentials[i]
+						  ->ldap_storage_password);
+		od_cfg_location_free(
+			&user->ldap_storage_credentials[i]->location);
+		od_cfg_location_free(
+			&user->ldap_storage_credentials[i]->name_location);
+		od_free(user->ldap_storage_credentials[i]);
+	}
+	od_free(user->ldap_storage_credentials);
+
+	od_cfg_string_field_free(&user->authentication);
+	od_cfg_string_field_free(&user->auth_module);
+	od_cfg_bool_field_free(&user->enable_mdb_iamproxy_auth);
+	od_cfg_string_field_free(&user->mdb_iamproxy_socket_path);
+	od_cfg_string_field_free(&user->auth_pam_service);
+	od_cfg_string_field_free(&user->target_session_attrs);
+	od_cfg_bool_field_free(&user->auto_route_ro_on_standby);
+	od_cfg_string_field_free(&user->auth_query);
+	od_cfg_string_field_free(&user->auth_query_db);
+	od_cfg_string_field_free(&user->auth_query_user);
+	od_cfg_bool_field_free(&user->password_passthrough);
+	od_cfg_string_field_free(&user->password);
+	od_cfg_string_field_free(&user->role);
+	od_cfg_int_field_free(&user->client_max);
+	od_cfg_bool_field_free(&user->client_fwd_error);
+	od_cfg_bool_field_free(&user->client_show_id);
+	od_cfg_bool_field_free(&user->reserve_session_server_connection);
+	od_cfg_string_field_free(&user->quantiles);
+	od_cfg_bool_field_free(&user->application_name_add_host);
+	od_cfg_bool_field_free(&user->server_drop_on_backend_plan_error);
+	od_cfg_bool_field_free(&user->server_drop_on_oom);
+	od_cfg_u64_field_free(&user->server_lifetime_ms);
+	od_cfg_int_field_free(&user->ldap_pool_size);
+	od_cfg_int_field_free(&user->ldap_pool_timeout);
+	od_cfg_int_field_free(&user->ldap_pool_ttl);
+	od_cfg_bool_field_free(&user->maintain_params);
+	od_cfg_string_field_free(&user->pool);
+	od_cfg_string_field_free(&user->pool_routing);
+	od_cfg_int_field_free(&user->min_pool_size);
+	od_cfg_int_field_free(&user->pool_size);
+	od_cfg_u64_field_free(&user->pool_timeout_ms);
+	od_cfg_u64_field_free(&user->pool_ttl_ms);
+	od_cfg_bool_field_free(&user->pool_discard);
+	od_cfg_bool_field_free(&user->pool_smart_discard);
+	od_cfg_string_field_free(&user->pool_discard_query);
+	od_cfg_bool_field_free(&user->pool_cancel);
+	od_cfg_bool_field_free(&user->pool_rollback);
+	od_cfg_u64_field_free(&user->pool_reset_timeout_ms);
+	od_cfg_bool_field_free(&user->pool_reserve_prepared_statement);
+	od_cfg_int_field_free(&user->server_pstmt_cache_size);
+	od_cfg_bool_field_free(&user->pool_pin_on_listen);
+	od_cfg_bool_field_free(&user->pool_attach_check);
+	od_cfg_bool_field_free(&user->pool_acquire_fail_fast);
+	od_cfg_i64_field_free(&user->pool_notice_after_waiting_ms);
+	od_cfg_u64_field_free(&user->pool_client_idle_timeout_ms);
+	od_cfg_u64_field_free(&user->pool_idle_in_transaction_timeout_ms);
+	od_cfg_string_field_free(&user->shared_pool);
+	od_cfg_string_field_free(&user->storage);
+	od_cfg_string_field_free(&user->storage_database);
+	od_cfg_string_field_free(&user->storage_user);
+	od_cfg_string_field_free(&user->storage_password);
+	od_cfg_bool_field_free(&user->log_debug);
+	od_cfg_int_field_free(&user->log_debug_sampling);
+	od_cfg_bool_field_free(&user->log_query);
+	od_cfg_int_field_free(&user->log_query_sampling);
+	od_cfg_string_field_free(&user->ldap_endpoint_name);
+	od_cfg_string_field_free(&user->ldap_storage_credentials_attr);
+	od_cfg_string_field_free(&user->watchdog_lag_query);
+	od_cfg_u64_field_free(&user->watchdog_lag_interval_ms);
+	od_cfg_u64_field_free(&user->catchup_timeout_ms);
+	od_cfg_string_field_free(&user->group_query);
+	od_cfg_string_field_free(&user->group_query_user);
+	od_cfg_string_field_free(&user->group_query_db);
+	od_cfg_u64_field_free(&user->keepalive_ms);
+	od_cfg_u64_field_free(&user->keepalive_keep_interval_ms);
+	od_cfg_int_field_free(&user->keepalive_probes);
+	od_cfg_i64_field_free(&user->keepalive_usr_timeout_ms);
+
+	od_cfg_seen_free(&user->pgoptions.seen);
+	od_cfg_location_free(&user->pgoptions.location);
+	od_cfg_string_kvp_list_free(&user->pgoptions);
+	od_cfg_seen_free(&user->backend_startup_options.seen);
+	od_cfg_location_free(&user->backend_startup_options.location);
+	od_cfg_string_kvp_list_free(&user->backend_startup_options);
+
+	od_cfg_location_free(&user->location);
+	od_cfg_location_free(&user->name_location);
+	od_cfg_location_free(&user->address_range_location);
+	od_cfg_location_free(&user->conn_type_location);
+
+	od_free(user);
+}
+
+static void od_cfg_database_free(od_cfg_database_t *db)
+{
+	if (db == NULL) {
+		return;
+	}
+
+	for (size_t i = 0; i < db->users_count; ++i) {
+		od_cfg_user_route_free(db->users[i]);
+	}
+	od_free(db->users);
+
+	for (size_t i = 0; i < db->groups_count; ++i) {
+		od_cfg_user_route_free(db->groups[i]);
+	}
+	od_free(db->groups);
+
+	od_free(db->name);
+
+	od_cfg_location_free(&db->location);
+	od_cfg_location_free(&db->name_location);
+
+	od_free(db);
+}
+
+void od_cfg_global_free(od_cfg_global_t *g)
+{
+	/* global bool fields */
+	od_cfg_bool_field_free(&g->daemonize);
+	od_cfg_bool_field_free(&g->sequential_routing);
+	od_cfg_bool_field_free(&g->enable_online_restart);
+	od_cfg_bool_field_free(&g->virtual_processing);
+	od_cfg_bool_field_free(&g->virtual_transaction);
+	od_cfg_bool_field_free(&g->bindwith_reuseport);
+	od_cfg_bool_field_free(&g->enable_host_watcher);
+	od_cfg_bool_field_free(&g->log_debug);
+	od_cfg_int_field_free(&g->log_debug_sampling);
+	od_cfg_bool_field_free(&g->maintain_params);
+	od_cfg_bool_field_free(&g->log_to_stdout);
+	od_cfg_bool_field_free(&g->log_config);
+	od_cfg_bool_field_free(&g->log_session);
+	od_cfg_bool_field_free(&g->log_query);
+	od_cfg_int_field_free(&g->log_query_sampling);
+	od_cfg_bool_field_free(&g->log_stats);
+	od_cfg_bool_field_free(&g->log_async);
+	od_cfg_bool_field_free(&g->log_syslog);
+	od_cfg_bool_field_free(&g->smart_search_path_enquoting);
+	od_cfg_bool_field_free(&g->nodelay);
+	od_cfg_bool_field_free(&g->disable_nolinger);
+	od_cfg_bool_field_free(&g->log_general_stats_prom);
+	od_cfg_bool_field_free(&g->log_route_stats_prom);
+	od_cfg_bool_field_free(&g->replication_proxy_phys);
+	od_cfg_bool_field_free(&g->replication_proxy_logic);
+	od_cfg_bool_field_free(&g->ignore_cancel);
+
+	/* global string fields */
+	od_cfg_string_field_free(&g->pid_file);
+	od_cfg_string_field_free(&g->unix_socket_dir);
+	od_cfg_string_field_free(&g->unix_socket_mode);
+	od_cfg_string_field_free(&g->locks_dir);
+	od_cfg_string_field_free(&g->external_auth_socket_path);
+	od_cfg_string_field_free(&g->availability_zone);
+	od_cfg_string_field_free(&g->log_file);
+	od_cfg_string_field_free(&g->log_format);
+	od_cfg_string_field_free(&g->log_syslog_ident);
+	od_cfg_string_field_free(&g->log_syslog_facility);
+	od_cfg_string_field_free(&g->cpu_affinity);
+	od_cfg_string_field_free(&g->hba_file);
+	od_cfg_string_field_free(&g->default_pool);
+
+	/* global int fields */
+	od_cfg_int_field_free(&g->priority);
+	od_cfg_u64_field_free(&g->graceful_shutdown_timeout_ms);
+	od_cfg_int_field_free(&g->log_queue_depth);
+	od_cfg_u64_field_free(&g->stats_interval_ms);
+	od_cfg_int_field_free(&g->client_max);
+	od_cfg_int_field_free(&g->client_max_routing);
+	od_cfg_int_field_free(&g->accept_rate_limit);
+	od_cfg_u64_field_free(&g->server_login_retry_ms);
+	od_cfg_int_field_free(&g->readahead);
+	od_cfg_u64_field_free(&g->keepalive_ms);
+	od_cfg_u64_field_free(&g->keepalive_keep_interval_ms);
+	od_cfg_int_field_free(&g->keepalive_probes);
+	od_cfg_i64_field_free(&g->keepalive_usr_timeout_ms);
+	od_cfg_int_field_free(&g->max_sigterms_to_die);
+	od_cfg_u64_field_free(&g->backend_connect_timeout_ms);
+	od_cfg_u64_field_free(&g->cancel_timeout_ms);
+	od_cfg_i64_field_free(&g->cancel_queue_timeout_ms);
+	od_cfg_int_field_free(&g->cancel_max_inflight);
+	od_cfg_int_field_free(&g->cancel_rate_limit);
+	od_cfg_int_field_free(&g->resolvers);
+	od_cfg_u64_field_free(&g->dns_cache_ttl_ms);
+	od_cfg_int_field_free(&g->cache_msg_gc_size);
+	od_cfg_int_field_free(&g->cache_msg_gc_count);
+	od_cfg_int_field_free(&g->cache_coroutine);
+	od_cfg_int_field_free(&g->coroutine_stack_size);
+	od_cfg_int_field_free(&g->system_coroutine_stack_size);
+	od_cfg_int_field_free(&g->promhttp_server_port);
+	od_cfg_u64_field_free(&g->group_checker_interval_ms);
+	od_cfg_int_field_free(&g->workers);
+
+	od_cfg_u64_field_free(&g->auth_query_cache_ttl_ms);
+	od_cfg_u64_field_free(&g->auth_query_cache_ttl_jitter_ms);
+	od_cfg_u64_field_free(&g->auth_query_cache_error_retry_ms);
+	od_cfg_bool_field_free(&g->auth_query_cache_stale_on_error);
+	od_cfg_u64_field_free(&g->auth_query_timeout_ms);
+
+	memset(g, 0, sizeof(*g));
+}
+
+void od_cfg_model_free(od_cfg_model_t *model)
+{
+	od_cfg_global_free(&model->global);
+
+	od_cfg_seen_free(&model->conn_drop_options.seen);
+	od_cfg_location_free(&model->conn_drop_options.location);
+	od_cfg_bool_field_free(&model->conn_drop_options.drop_enabled);
+	od_cfg_int_field_free(&model->conn_drop_options.rate);
+	od_cfg_u64_field_free(&model->conn_drop_options.interval_ms);
+
+	od_cfg_u64_field_free(&model->soft_oom.limit);
+	od_cfg_string_field_free(&model->soft_oom.process);
+	od_cfg_u64_field_free(&model->soft_oom.check_interval_ms);
+	od_cfg_string_field_free(&model->soft_oom.drop.signal);
+	od_cfg_int_field_free(&model->soft_oom.drop.max_rate);
+
+	od_cfg_query_parsing_mode_free(&model->query_parsing.mode);
+	od_cfg_u64_field_free(&model->query_parsing.mem_limit);
+	od_cfg_u64_field_free(&model->query_parsing.max_query_len);
+	od_cfg_string_list_free(&model->query_parsing.standby_function_list);
+
+	for (size_t i = 0; i < model->databases_count; ++i) {
+		od_cfg_database_free(model->databases[i]);
+	}
+	od_free(model->databases);
+
+	for (size_t i = 0; i < model->storages_count; ++i) {
+		od_cfg_storage_free(model->storages[i]);
+	}
+	od_free(model->storages);
+
+	for (size_t i = 0; i < model->listens_count; ++i) {
+		od_cfg_listen_free(model->listens[i]);
+	}
+	od_free(model->listens);
+
+	for (size_t i = 0; i < model->shared_pools_count; ++i) {
+		od_cfg_shared_pool_free(model->shared_pools[i]);
+	}
+	od_free(model->shared_pools);
+
+	for (size_t i = 0; i < model->ldap_endpoints_count; ++i) {
+		od_cfg_ldap_endpoint_free(model->ldap_endpoints[i]);
+	}
+	od_free(model->ldap_endpoints);
+
+	od_cfg_location_free(&model->location);
+
+	memset(model, 0, sizeof(*model));
+}
+
+od_cfg_route_t *od_cfg_storage_add_watchdog(od_cfg_storage_t *s,
+					    od_cfg_location_t loc)
+{
+	s->watchdog = od_malloc(sizeof(*s->watchdog));
+	if (s->watchdog == NULL) {
+		return NULL;
+	}
+	memset(s->watchdog, 0, sizeof(*s->watchdog));
+
+	s->watchdog->location = od_cfg_location_copy(loc);
+
+	return s->watchdog;
+}
+
+od_cfg_listen_t *od_cfg_model_add_listen(od_cfg_model_t *model,
+					 od_cfg_location_t location)
+{
+	if (model->listens_count == model->listens_capacity) {
+		size_t new_capacity = model->listens_capacity == 0 ?
+					      16 :
+					      model->listens_capacity * 2;
+
+		od_cfg_listen_t **new_items =
+			od_realloc(model->listens,
+				   sizeof(od_cfg_listen_t *) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		model->listens = new_items;
+		model->listens_capacity = new_capacity;
+	}
+
+	od_cfg_listen_t *listen = od_malloc(sizeof(*listen));
+	if (listen == NULL) {
+		return NULL;
+	}
+	memset(listen, 0, sizeof(*listen));
+
+	listen->location = od_cfg_location_copy(location);
+
+	model->listens[model->listens_count++] = listen;
+	return listen;
+}
+
+od_cfg_string_kvp_t *
+od_cfg_string_kvp_list_add(od_cfg_string_kvp_list_t *list,
+			   od_cfg_location_t location, char *key,
+			   od_cfg_location_t key_location, char *value,
+			   od_cfg_location_t value_location)
+{
+	if (list->pairs_count == list->pairs_capacity) {
+		size_t new_capacity = list->pairs_capacity == 0 ?
+					      16 :
+					      list->pairs_capacity * 2;
+		od_cfg_string_kvp_t **new_items =
+			od_realloc(list->pairs, sizeof(od_cfg_string_kvp_t *) *
+							new_capacity);
+
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		list->pairs = new_items;
+		list->pairs_capacity = new_capacity;
+	}
+
+	od_cfg_string_kvp_t *kvp = od_malloc(sizeof(*kvp));
+	if (kvp == NULL) {
+		return NULL;
+	}
+	memset(kvp, 0, sizeof(*kvp));
+
+	kvp->location = od_cfg_location_copy(location);
+
+	kvp->key = key;
+	kvp->key_location = od_cfg_location_copy(key_location);
+
+	kvp->value = value;
+	kvp->value_location = od_cfg_location_copy(value_location);
+
+	list->pairs[list->pairs_count++] = kvp;
+	return kvp;
+}
+
+od_cfg_ldap_storage_credentials_t *
+od_cfg_user_route_add_ldap_creds(od_cfg_route_t *r, od_cfg_location_t location,
+				 char *name)
+{
+	if (r->ldap_storage_credentials_count ==
+	    r->ldap_storage_credentials_capacity) {
+		size_t new_capacity =
+			r->ldap_storage_credentials_capacity == 0 ?
+				16 :
+				r->ldap_storage_credentials_capacity * 2;
+		od_cfg_ldap_storage_credentials_t **new_items =
+			od_realloc(r->ldap_storage_credentials,
+				   sizeof(od_cfg_ldap_storage_credentials_t *) *
+					   new_capacity);
+
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		r->ldap_storage_credentials = new_items;
+		r->ldap_storage_credentials_capacity = new_capacity;
+	}
+
+	od_cfg_ldap_storage_credentials_t *c = od_malloc(sizeof(*c));
+	if (c == NULL) {
+		return NULL;
+	}
+	memset(c, 0, sizeof(*c));
+
+	c->location = od_cfg_location_copy(location);
+	c->name = name;
+	c->name_location = od_cfg_location_copy(location);
+
+	r->ldap_storage_credentials[r->ldap_storage_credentials_count++] = c;
+	return c;
+}
+
+od_cfg_rule_auth_common_name_t *od_cfg_user_route_add_auth_common_name(
+	od_cfg_route_t *r, char *name, int is_default,
+	od_cfg_location_t location, od_cfg_location_t name_location)
+{
+	if (r->auth_common_names_count == r->auth_common_names_capacity) {
+		size_t new_capacity = r->auth_common_names_capacity == 0 ?
+					      16 :
+					      r->auth_common_names_capacity * 2;
+		od_cfg_rule_auth_common_name_t **new_items =
+			od_realloc(r->auth_common_names,
+				   sizeof(od_cfg_rule_auth_common_name_t *) *
+					   new_capacity);
+
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		r->auth_common_names = new_items;
+		r->auth_common_names_capacity = new_capacity;
+	}
+
+	od_cfg_rule_auth_common_name_t *cn = od_malloc(sizeof(*cn));
+	if (cn == NULL) {
+		return NULL;
+	}
+	memset(cn, 0, sizeof(*cn));
+
+	cn->name = name;
+	cn->location = od_cfg_location_copy(location);
+	cn->name_location = od_cfg_location_copy(name_location);
+	cn->is_default = is_default;
+
+	r->auth_common_names[r->auth_common_names_count++] = cn;
+	return cn;
+}
+
+od_cfg_route_t *od_cfg_database_add_user(
+	od_cfg_database_t *db, char *name, int is_default,
+	od_cfg_location_t name_location, od_cfg_location_t location,
+	char *addr_range, od_cfg_location_t addr_range_location,
+	od_cfg_conn_type_t conn_type, od_cfg_location_t conn_type_location)
+{
+	if (db->users_count == db->users_capacity) {
+		size_t new_capacity =
+			db->users_capacity == 0 ? 16 : db->users_capacity * 2;
+
+		od_cfg_route_t **new_items = od_realloc(
+			db->users, sizeof(od_cfg_route_t *) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		db->users = new_items;
+		db->users_capacity = new_capacity;
+	}
+
+	if (is_default) {
+		name = od_strdup("default_user");
+		if (name == NULL) {
+			return NULL;
+		}
+	}
+
+	od_cfg_route_t *user = od_malloc(sizeof(*user));
+	if (user == NULL) {
+		if (is_default) {
+			od_free(name);
+		}
+		return NULL;
+	}
+	memset(user, 0, sizeof(*user));
+
+	user->name = name;
+	user->name_location = od_cfg_location_copy(name_location);
+	user->is_default = is_default;
+	user->location = od_cfg_location_copy(location);
+
+	user->address_range = addr_range;
+	user->address_range_location =
+		od_cfg_location_copy(addr_range_location);
+
+	user->conn_type = conn_type;
+	user->conn_type_location = od_cfg_location_copy(conn_type_location);
+
+	db->users[db->users_count++] = user;
+	return user;
+}
+
+od_cfg_route_t *od_cfg_database_add_group(od_cfg_database_t *db, char *name,
+					  od_cfg_location_t name_location,
+					  od_cfg_location_t location,
+					  char *addr_range,
+					  od_cfg_location_t addr_range_location,
+					  od_cfg_conn_type_t conn_type,
+					  od_cfg_location_t conn_type_location)
+{
+	if (db->groups_count == db->groups_capacity) {
+		size_t new_capacity =
+			db->groups_capacity == 0 ? 16 : db->groups_capacity * 2;
+
+		od_cfg_route_t **new_items = od_realloc(
+			db->groups, sizeof(od_cfg_route_t *) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		db->groups = new_items;
+		db->groups_capacity = new_capacity;
+	}
+
+	od_cfg_route_t *group = od_malloc(sizeof(*group));
+	if (group == NULL) {
+		return NULL;
+	}
+	memset(group, 0, sizeof(*group));
+
+	group->name = name;
+	group->name_location = od_cfg_location_copy(name_location);
+	group->location = od_cfg_location_copy(location);
+
+	group->address_range = addr_range;
+	group->address_range_location =
+		od_cfg_location_copy(addr_range_location);
+
+	group->conn_type = conn_type;
+	group->conn_type_location = od_cfg_location_copy(conn_type_location);
+
+	db->groups[db->groups_count++] = group;
+	return group;
+}
+
+od_cfg_database_t *od_cfg_model_add_database(od_cfg_model_t *model, char *name,
+					     int is_default,
+					     od_cfg_location_t name_location,
+					     od_cfg_location_t location)
+{
+	if (model->databases_count == model->databases_capacity) {
+		size_t new_capacity = model->databases_capacity == 0 ?
+					      16 :
+					      model->databases_capacity * 2;
+
+		od_cfg_database_t **new_items =
+			od_realloc(model->databases,
+				   sizeof(od_cfg_database_t *) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		model->databases = new_items;
+		model->databases_capacity = new_capacity;
+	}
+
+	if (is_default) {
+		name = od_strdup("default_db");
+		if (name == NULL) {
+			return NULL;
+		}
+	}
+
+	od_cfg_database_t *database = od_malloc(sizeof(*database));
+	if (database == NULL) {
+		if (is_default) {
+			od_free(name);
+		}
+		return NULL;
+	}
+	memset(database, 0, sizeof(*database));
+
+	database->location = od_cfg_location_copy(location);
+	database->name = name;
+	database->is_default = is_default;
+	database->name_location = od_cfg_location_copy(name_location);
+
+	model->databases[model->databases_count++] = database;
+	return database;
+}
+
+od_cfg_storage_t *od_cfg_model_add_storage(od_cfg_model_t *model, char *name,
+					   od_cfg_location_t name_location,
+					   od_cfg_location_t location)
+{
+	if (model->storages_count == model->storages_capacity) {
+		size_t new_capacity = model->storages_capacity == 0 ?
+					      16 :
+					      model->storages_capacity * 2;
+
+		od_cfg_storage_t **new_items =
+			od_realloc(model->storages,
+				   sizeof(od_cfg_storage_t *) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		model->storages = new_items;
+		model->storages_capacity = new_capacity;
+	}
+
+	od_cfg_storage_t *storage = od_malloc(sizeof(*storage));
+	if (storage == NULL) {
+		return NULL;
+	}
+	memset(storage, 0, sizeof(*storage));
+
+	storage->location = od_cfg_location_copy(location);
+	storage->name = name;
+	storage->name_location = od_cfg_location_copy(name_location);
+
+	model->storages[model->storages_count++] = storage;
+	return storage;
+}
+
+static int od_cfg_check_duplicate(od_cfg_diag_list_t *diags,
+				  od_cfg_seen_t *seen,
+				  od_cfg_location_t location,
+				  const char *field_name)
+{
+	if (!seen->is_set) {
+		return 0;
+	}
+
+	od_cfg_diag_error(diags, location, "duplicate option '%s'", field_name);
+
+	/*
+	 * TODO: add hint
+	 * previously defined at file:line:column
+	 */
+
+	return -1;
+}
+
+int od_cfg_set_bool(od_cfg_diag_list_t *diags, od_cfg_bool_field_t *field,
+		    int value, od_cfg_location_t location,
+		    const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		return -1;
+	}
+
+	field->value = value ? 1 : 0;
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+int od_cfg_set_int(od_cfg_diag_list_t *diags, od_cfg_int_field_t *field,
+		   int value, od_cfg_location_t location,
+		   const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		return -1;
+	}
+
+	field->value = value;
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+int od_cfg_set_int_from_i64(od_cfg_diag_list_t *diags,
+			    od_cfg_int_field_t *field, int64_t value,
+			    od_cfg_location_t location, const char *field_name)
+{
+	if (value < INT_MIN || value > INT_MAX) {
+		od_cfg_diag_error(diags, location,
+				  "value for option '%s' is out of int range",
+				  field_name);
+		return -1;
+	}
+
+	return od_cfg_set_int(diags, field, (int)value, location, field_name);
+}
+
+int od_cfg_set_int_range_from_i64(od_cfg_diag_list_t *diags,
+				  od_cfg_int_field_t *field, int64_t value,
+				  int min, int max, od_cfg_location_t location,
+				  const char *field_name)
+{
+	if (min > max) {
+		od_cfg_diag_error(
+			diags, location,
+			"internal error: invalid range for option '%s'",
+			field_name);
+		return -1;
+	}
+
+	if (value < (int64_t)INT_MIN || value > (int64_t)INT_MAX) {
+		od_cfg_diag_error(diags, location,
+				  "value '%s' = %lld is out of integer bounds",
+				  field_name, (long long)value);
+		return -1;
+	}
+
+	if (value < min || value > max) {
+		od_cfg_diag_error(
+			diags, location,
+			"value for option '%s' must be between %d and %d",
+			field_name, min, max);
+		return -1;
+	}
+
+	return od_cfg_set_int(diags, field, (int)value, location, field_name);
+}
+
+int od_cfg_set_u64(od_cfg_diag_list_t *diags, od_cfg_u64_field_t *field,
+		   uint64_t value, od_cfg_location_t location,
+		   const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		return -1;
+	}
+
+	field->value = value;
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+static int od_cfg_set_i64(od_cfg_diag_list_t *diags, od_cfg_i64_field_t *field,
+			  int64_t value, od_cfg_location_t location,
+			  const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		return -1;
+	}
+
+	field->value = value;
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+/*
+ * Convert a parsed time value to whole milliseconds.
+ *
+ * Values with an explicit PostgreSQL-style unit ("500ms", "30 min") arrive
+ * already converted and rounded by od_duration_parse_ms().  Bare values
+ * are scaled by bare_unit_ms — the historic base unit of the option (the
+ * same idea as a PostgreSQL per-GUC base unit) — and fractional values are
+ * rounded half-to-even with rint(), like PostgreSQL rounds a GUC value.
+ */
+static int od_cfg_time_value_to_ms(od_cfg_diag_list_t *diags,
+				   od_cfg_location_t location,
+				   const char *field_name,
+				   const od_cfg_time_value_t *value,
+				   int64_t bare_unit_ms, int64_t *out_ms)
+{
+	if (bare_unit_ms <= 0) {
+		od_cfg_diag_error(
+			diags, location,
+			"internal error: invalid bare unit for option '%s'",
+			field_name);
+		return -1;
+	}
+
+	if (value->has_unit) {
+		*out_ms = value->ms;
+		return 0;
+	}
+
+	if (value->is_real) {
+		double ms = value->real * (double)bare_unit_ms;
+
+		if (!(ms >= (double)INT64_MIN && ms < (double)INT64_MAX)) {
+			od_cfg_diag_error(diags, location,
+					  "value for option '%s' is too large",
+					  field_name);
+			return -1;
+		}
+
+		*out_ms = (int64_t)rint(ms);
+		return 0;
+	}
+
+	int64_t ms;
+	if (__builtin_mul_overflow(value->bare, bare_unit_ms, &ms)) {
+		od_cfg_diag_error(diags, location,
+				  "value for option '%s' is too large",
+				  field_name);
+		return -1;
+	}
+
+	*out_ms = ms;
+	return 0;
+}
+
+static int od_cfg_check_time_range(od_cfg_diag_list_t *diags,
+				   od_cfg_location_t location,
+				   const char *field_name, int64_t ms,
+				   int64_t min_ms, int64_t max_ms)
+{
+	if (min_ms > max_ms) {
+		od_cfg_diag_error(
+			diags, location,
+			"internal error: invalid range for option '%s'",
+			field_name);
+		return -1;
+	}
+
+	if (ms < min_ms || ms > max_ms) {
+		od_cfg_diag_error(
+			diags, location,
+			"value for option '%s' must be between %lld and %lld ms",
+			field_name, (long long)min_ms, (long long)max_ms);
+		return -1;
+	}
+
+	return 0;
+}
+
+int od_cfg_set_time_u64_ms(od_cfg_diag_list_t *diags, od_cfg_u64_field_t *field,
+			   const od_cfg_time_value_t *value,
+			   int64_t bare_unit_ms, int64_t min_ms, int64_t max_ms,
+			   od_cfg_location_t location, const char *field_name)
+{
+	if (value->bare < 0) {
+		od_cfg_diag_error(diags, location,
+				  "value for option '%s' must be non-negative",
+				  field_name);
+		return -1;
+	}
+
+	int64_t ms;
+	if (od_cfg_time_value_to_ms(diags, location, field_name, value,
+				    bare_unit_ms, &ms) != 0) {
+		return -1;
+	}
+
+	if (od_cfg_check_time_range(diags, location, field_name, ms, min_ms,
+				    max_ms) != 0) {
+		return -1;
+	}
+
+	return od_cfg_set_u64(diags, field, (uint64_t)ms, location, field_name);
+}
+
+int od_cfg_set_time_i64_ms(od_cfg_diag_list_t *diags, od_cfg_i64_field_t *field,
+			   const od_cfg_time_value_t *value,
+			   int64_t bare_unit_ms, int64_t min_ms, int64_t max_ms,
+			   od_cfg_location_t location, const char *field_name)
+{
+	int64_t ms;
+	if (od_cfg_time_value_to_ms(diags, location, field_name, value,
+				    bare_unit_ms, &ms) != 0) {
+		return -1;
+	}
+
+	if (od_cfg_check_time_range(diags, location, field_name, ms, min_ms,
+				    max_ms) != 0) {
+		return -1;
+	}
+
+	return od_cfg_set_i64(diags, field, ms, location, field_name);
+}
+
+static int od_cfg_validate_shared_pools(od_cfg_model_t *model,
+					od_cfg_diag_list_t *diags)
+{
+	for (size_t i = 0; i < model->shared_pools_count; i++) {
+		od_cfg_shared_pool_t *pool = model->shared_pools[i];
+
+		if (pool->name == NULL || pool->name[0] == 0) {
+			od_cfg_diag_error(diags, pool->name_location,
+					  "shared_pool name cannot be empty");
+		}
+
+		if (!pool->pool_size.seen.is_set) {
+			od_cfg_diag_error(
+				diags, pool->location,
+				"pool_size is required in shared_pool '%s'",
+				pool->name ? pool->name : "<unknown>");
+		} else if (pool->pool_size.value <= 0) {
+			od_cfg_diag_error(
+				diags, pool->pool_size.seen.location,
+				"shared_pool '%s' pool_size must be positive",
+				pool->name);
+		}
+
+		for (size_t j = 0; j < i; j++) {
+			od_cfg_shared_pool_t *prev = model->shared_pools[j];
+
+			if (strcmp(prev->name, pool->name) == 0) {
+				od_cfg_diag_error(
+					diags, pool->name_location,
+					"duplicate shared_pool definition '%s'",
+					pool->name);
+				break;
+			}
+		}
+	}
+
+	return od_cfg_diag_has_errors(diags) ? -1 : 0;
+}
+
+static int od_cfg_validate_ldap_endpoints(od_cfg_model_t *model,
+					  od_cfg_diag_list_t *diags)
+{
+	if (model->ldap_endpoints_count == 0) {
+		return 0;
+	}
+
+#ifndef LDAP_FOUND
+	for (size_t i = 0; i < model->ldap_endpoints_count; i++) {
+		od_cfg_diag_error(diags, model->ldap_endpoints[i]->location,
+				  "LDAP is not supported by this build");
+	}
+	return -1;
+#endif
+
+	for (size_t i = 0; i < model->ldap_endpoints_count; i++) {
+		od_cfg_ldap_endpoint_t *endpoint = model->ldap_endpoints[i];
+
+		if (endpoint->name == NULL || endpoint->name[0] == 0) {
+			od_cfg_diag_error(diags, endpoint->name_location,
+					  "ldap_endpoint name cannot be empty");
+			return -1;
+		}
+
+		for (size_t j = 0; j < i; j++) {
+			od_cfg_ldap_endpoint_t *prev = model->ldap_endpoints[j];
+
+			if (strcmp(prev->name, endpoint->name) == 0) {
+				od_cfg_diag_error(
+					diags, endpoint->name_location,
+					"duplicate ldap endpoint definition: %s",
+					endpoint->name);
+				return -1;
+			}
+		}
+
+		if (endpoint->ldapport.seen.is_set &&
+		    endpoint->ldapport.value > 65535) {
+			od_cfg_diag_error(
+				diags, endpoint->ldapport.seen.location,
+				"ldapport must be between 0 and 65535");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int od_cfg_validate_conn_drop_options(od_cfg_model_t *model,
+					     od_cfg_diag_list_t *diags)
+{
+	od_cfg_conn_drop_options_t *opts = &model->conn_drop_options;
+
+	if (!opts->seen.is_set) {
+		return 0;
+	}
+
+	if (opts->interval_ms.seen.is_set && opts->interval_ms.value == 0) {
+		od_cfg_diag_error(
+			diags, opts->interval_ms.seen.location,
+			"interval for conn_drop_options must be positive");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int od_cfg_validate_soft_oom(od_cfg_model_t *model,
+				    od_cfg_diag_list_t *diags)
+{
+	od_cfg_soft_oom_t *so = &model->soft_oom;
+
+	int any = so->process.seen.is_set ||
+		  so->check_interval_ms.seen.is_set ||
+		  so->drop.signal.seen.is_set || so->drop.max_rate.seen.is_set;
+
+	if (!so->limit.seen.is_set) {
+		if (any) {
+			od_cfg_diag_error(
+				diags,
+				so->process.seen.is_set ?
+					so->process.seen.location :
+				so->check_interval_ms.seen.is_set ?
+					so->check_interval_ms.seen.location :
+				so->drop.signal.seen.is_set ?
+					so->drop.signal.seen.location :
+					so->drop.max_rate.seen.location,
+				"soft_oom_limit is not set for soft_oom");
+			return -1;
+		}
+		return 0;
+	}
+
+	if (so->limit.value == 0) {
+		od_cfg_diag_error(diags, so->limit.seen.location,
+				  "soft_oom_limit must be positive");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int od_cfg_validate_listens(od_cfg_model_t *model,
+				   od_cfg_diag_list_t *diags)
+{
+	if (model->listens_count == 0) {
+		od_cfg_diag_error(diags, model->location,
+				  "no listen sections defined");
+		return -1;
+	}
+
+	for (size_t i = 0; i < model->listens_count; i++) {
+		od_cfg_listen_t *l = model->listens[i];
+
+		if (!l->port.seen.is_set) {
+			od_cfg_diag_error(diags, l->location,
+					  "listen section is missing 'port'");
+		}
+
+		if (l->tls.seen.is_set) {
+			const char *tls = l->tls.value;
+			if (strcmp(tls, "disable") != 0 &&
+			    strcmp(tls, "allow") != 0 &&
+			    strcmp(tls, "prefer") != 0 &&
+			    strcmp(tls, "require") != 0 &&
+			    strcmp(tls, "verify_ca") != 0 &&
+			    strcmp(tls, "verify_full") != 0) {
+				od_cfg_diag_error(diags, l->tls.seen.location,
+						  "unknown tls mode '%s'", tls);
+			}
+		}
+	}
+
+	return od_cfg_diag_has_errors(diags) ? -1 : 0;
+}
+
+static int od_cfg_validate_storages(od_cfg_model_t *model,
+				    od_cfg_diag_list_t *diags)
+{
+	if (model->storages_count == 0) {
+		od_cfg_diag_error(diags, model->location,
+				  "no storage sections defined");
+		return -1;
+	}
+
+	for (size_t i = 0; i < model->storages_count; i++) {
+		od_cfg_storage_t *s = model->storages[i];
+
+		if (s->name == NULL || s->name[0] == '\0') {
+			od_cfg_diag_error(diags, s->location,
+					  "storage name cannot be empty");
+			continue;
+		}
+
+		if (!s->type.seen.is_set) {
+			od_cfg_diag_error(diags, s->location,
+					  "storage '%s': 'type' is required",
+					  s->name);
+		} else if (strcmp(s->type.value, "remote") != 0 &&
+			   strcmp(s->type.value, "local") != 0) {
+			od_cfg_diag_error(diags, s->type.seen.location,
+					  "storage '%s': unknown type '%s'",
+					  s->name, s->type.value);
+		}
+
+		/* duplicate name check */
+		for (size_t j = 0; j < i; j++) {
+			if (strcmp(model->storages[j]->name, s->name) == 0) {
+				od_cfg_diag_error(
+					diags, s->location,
+					"duplicate storage definition '%s'",
+					s->name);
+				break;
+			}
+		}
+	}
+
+	return od_cfg_diag_has_errors(diags) ? -1 : 0;
+}
+
+static int od_cfg_validate_route(const od_cfg_route_t *route,
+				 od_cfg_model_t *model,
+				 od_cfg_diag_list_t *diags)
+{
+	/* storage reference must exist */
+	if (route->storage.seen.is_set) {
+		int found = 0;
+		for (size_t k = 0; k < model->storages_count; k++) {
+			if (strcmp(model->storages[k]->name,
+				   route->storage.value) == 0) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found) {
+			od_cfg_diag_error(diags, route->storage.seen.location,
+					  "unknown storage '%s'",
+					  route->storage.value);
+		}
+	}
+
+	/* shared_pool reference must exist */
+	if (route->shared_pool.seen.is_set) {
+		int found = 0;
+		for (size_t k = 0; k < model->shared_pools_count; k++) {
+			if (strcmp(model->shared_pools[k]->name,
+				   route->shared_pool.value) == 0) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found) {
+			od_cfg_diag_error(diags,
+					  route->shared_pool.seen.location,
+					  "unknown shared_pool '%s'",
+					  route->shared_pool.value);
+		}
+	}
+
+	/* ldap_endpoint reference must exist */
+	if (route->ldap_endpoint_name.seen.is_set) {
+		int found = 0;
+		for (size_t k = 0; k < model->ldap_endpoints_count; k++) {
+			if (strcmp(model->ldap_endpoints[k]->name,
+				   route->ldap_endpoint_name.value) == 0) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found) {
+			od_cfg_diag_error(
+				diags, route->ldap_endpoint_name.seen.location,
+				"unknown ldap_endpoint '%s'",
+				route->ldap_endpoint_name.value);
+		}
+	}
+
+	return 0;
+}
+
+static int od_cfg_validate_db(od_cfg_database_t *db, od_cfg_model_t *model,
+			      od_cfg_diag_list_t *diags)
+{
+	if (db->name == NULL || db->name[0] == '\0') {
+		od_cfg_diag_error(diags, db->location,
+				  "invalid name for database");
+		return -1;
+	}
+
+	for (size_t i = 0; i < db->users_count; i++) {
+		od_cfg_validate_route(db->users[i], model, diags);
+	}
+
+	for (size_t i = 0; i < db->groups_count; i++) {
+		od_cfg_validate_route(db->groups[i], model, diags);
+	}
+
+	return 0;
+}
+
+static int od_cfg_validate_dbs(od_cfg_model_t *model, od_cfg_diag_list_t *diags)
+{
+	for (size_t i = 0; i < model->databases_count; ++i) {
+		od_cfg_database_t *db = model->databases[i];
+
+		od_cfg_validate_db(db, model, diags);
+	}
+
+	return od_cfg_diag_has_errors(diags) ? -1 : 0;
+}
+
+int od_cfg_validate_model(od_cfg_model_t *model, od_cfg_diag_list_t *diags)
+{
+	int rc;
+
+	rc = od_cfg_validate_listens(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = od_cfg_validate_storages(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = od_cfg_validate_shared_pools(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = od_cfg_validate_conn_drop_options(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = od_cfg_validate_soft_oom(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = od_cfg_validate_ldap_endpoints(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = od_cfg_validate_dbs(model, diags);
+	if (rc != 0) {
+		return rc;
+	}
+
+	return 0;
+}
+
+int od_cfg_set_string(od_cfg_diag_list_t *diags, od_cfg_string_field_t *field,
+		      char *value, od_cfg_location_t location,
+		      const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		od_free(value);
+		return -1;
+	}
+
+	field->value = value;
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+int od_cfg_string_list_begin(od_cfg_diag_list_t *diags,
+			     od_cfg_string_list_field_t *field,
+			     od_cfg_location_t location, const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		return -1;
+	}
+
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+int od_cfg_string_list_append(od_cfg_diag_list_t *diags,
+			      od_cfg_string_list_field_t *field, char *value)
+{
+	char **values =
+		od_realloc(field->values, (field->count + 1) * sizeof(char *));
+	if (values == NULL) {
+		od_cfg_diag_error(diags, field->seen.location,
+				  "can't allocate string list");
+		od_free(value);
+		return -1;
+	}
+
+	field->values = values;
+	field->values[field->count++] = value;
+	return 0;
+}
+
+void od_cfg_string_list_free(od_cfg_string_list_field_t *field)
+{
+	for (size_t i = 0; i < field->count; ++i) {
+		od_free(field->values[i]);
+	}
+	od_free(field->values);
+	memset(field, 0, sizeof(*field));
+}
+
+int od_cfg_set_query_parsing_mode(od_cfg_diag_list_t *diags,
+				  od_cfg_query_parsing_mode_field_t *field,
+				  od_cfg_query_parsing_mode_type_t value,
+				  od_cfg_location_t location,
+				  const char *field_name)
+{
+	if (od_cfg_check_duplicate(diags, &field->seen, location, field_name) !=
+	    0) {
+		return -1;
+	}
+
+	field->value = value;
+	od_cfg_seen_set(&field->seen, location);
+	return 0;
+}
+
+od_cfg_shared_pool_t *
+od_cfg_model_add_shared_pool(od_cfg_model_t *model, char *name,
+			     od_cfg_location_t name_location,
+			     od_cfg_location_t location)
+{
+	if (model->shared_pools_count == model->shared_pools_capacity) {
+		size_t new_capacity = model->shared_pools_capacity == 0 ?
+					      16 :
+					      model->shared_pools_capacity * 2;
+
+		od_cfg_shared_pool_t **new_items =
+			od_realloc(model->shared_pools,
+				   sizeof(*model->shared_pools) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		model->shared_pools = new_items;
+		model->shared_pools_capacity = new_capacity;
+	}
+
+	od_cfg_shared_pool_t *pool = od_malloc(sizeof(*pool));
+	if (pool == NULL) {
+		return NULL;
+	}
+
+	memset(pool, 0, sizeof(*pool));
+	pool->location = od_cfg_location_copy(location);
+	pool->name = name;
+	pool->name_location = od_cfg_location_copy(name_location);
+
+	model->shared_pools[model->shared_pools_count++] = pool;
+	return pool;
+}
+
+od_cfg_ldap_endpoint_t *
+od_cfg_model_add_ldap_endpoint(od_cfg_model_t *model, char *name,
+			       od_cfg_location_t name_location,
+			       od_cfg_location_t location)
+{
+	if (model->ldap_endpoints_count == model->ldap_endpoints_capacity) {
+		size_t new_capacity =
+			model->ldap_endpoints_capacity == 0 ?
+				16 :
+				model->ldap_endpoints_capacity * 2;
+
+		od_cfg_ldap_endpoint_t **new_items = od_realloc(
+			model->ldap_endpoints,
+			sizeof(*model->ldap_endpoints) * new_capacity);
+		if (new_items == NULL) {
+			return NULL;
+		}
+
+		model->ldap_endpoints = new_items;
+		model->ldap_endpoints_capacity = new_capacity;
+	}
+
+	od_cfg_ldap_endpoint_t *endpoint = od_malloc(sizeof(*endpoint));
+	if (endpoint == NULL) {
+		return NULL;
+	}
+
+	memset(endpoint, 0, sizeof(*endpoint));
+
+	endpoint->location = od_cfg_location_copy(location);
+	endpoint->name = name;
+	endpoint->name_location = od_cfg_location_copy(name_location);
+
+	model->ldap_endpoints[model->ldap_endpoints_count++] = endpoint;
+	return endpoint;
+}

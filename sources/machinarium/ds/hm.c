@@ -1,0 +1,446 @@
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdalign.h>
+
+#include <machinarium/macro.h>
+#include <machinarium/ds/hm.h>
+#include <machinarium/memory.h>
+#include <machinarium/machine.h>
+
+#define HM_LOCK_AT(locks, i) mm_mutex_padded_at((mm_mutex_padded_t *)(locks), i)
+
+static size_t adjust_to_pow2(size_t sz)
+{
+	if (sz < 8) {
+		return 8;
+	}
+
+	size_t p = 1;
+	while (p < sz) {
+		p <<= 1;
+	}
+
+	return p;
+}
+
+static size_t bucket_idx(mm_hashmap_t *hm, mm_hash_t hash)
+{
+	return hash & hm->bucket_mask;
+}
+
+static size_t lock_idx(mm_hashmap_t *hm, size_t bucket_idx)
+{
+	return bucket_idx & hm->lock_mask;
+}
+
+static inline void bucket_lock(mm_hashmap_bucket_t *b)
+{
+	if (b->mu != NULL) {
+		mm_mutex_lock2(b->mu);
+	}
+}
+
+static inline void bucket_unlock(mm_hashmap_bucket_t *b)
+{
+	if (b->mu != NULL) {
+		mm_mutex_unlock(b->mu);
+	}
+}
+
+static size_t alignsz(size_t sz)
+{
+	size_t align = alignof(max_align_t);
+	return (sz + align - 1) & ~(align - 1);
+}
+
+static void init_bucket(mm_hashmap_t *hm, mm_hashmap_bucket_t *b, size_t bix)
+{
+	mm_list_init(&b->kvps);
+
+	if (hm->nlocks > 0) {
+		size_t lix = lock_idx(hm, bix);
+		b->mu = HM_LOCK_AT(hm->locks, lix);
+	} else {
+		b->mu = NULL;
+	}
+}
+
+static void init_buckets(mm_hashmap_t *hm)
+{
+	for (size_t i = 0; i < hm->nbuckets; ++i) {
+		init_bucket(hm, &hm->buckets[i], i);
+	}
+}
+
+static void init_locks(mm_hashmap_t *hm)
+{
+	for (size_t i = 0; i < hm->nlocks; ++i) {
+		mm_mutex_init(HM_LOCK_AT(hm->locks, i));
+	}
+}
+
+static void destroy_locks(mm_hashmap_t *hm)
+{
+	for (size_t i = 0; i < hm->nlocks; ++i) {
+		mm_mutex_destroy(HM_LOCK_AT(hm->locks, i));
+	}
+}
+
+void *mm_hashmap_kvp_key(const mm_hashmap_t *hm, mm_hashmap_kvp_t *kvp)
+{
+	return (void *)((uint8_t *)kvp + hm->keyoff);
+}
+
+void *mm_hashmap_kvp_val(const mm_hashmap_t *hm, mm_hashmap_kvp_t *kvp)
+{
+	return (void *)((uint8_t *)kvp + hm->valoff);
+}
+
+const void *mm_hashmap_kvp_key_const(const mm_hashmap_t *hm,
+				     const mm_hashmap_kvp_t *kvp)
+{
+	return (const void *)((const uint8_t *)kvp + hm->keyoff);
+}
+
+const void *mm_hashmap_kvp_val_const(const mm_hashmap_t *hm,
+				     const mm_hashmap_kvp_t *kvp)
+{
+	return (const void *)((const uint8_t *)kvp + hm->valoff);
+}
+
+static mm_hashmap_kvp_t *kvp_alloc(mm_hashmap_t *hm)
+{
+	mm_lf_stack_entry_t *e = mm_lf_stack_pop(&hm->freelist);
+	if (e != NULL) {
+		atomic_fetch_sub_explicit(&hm->nfree, 1, memory_order_relaxed);
+		return mm_container_of(e, mm_hashmap_kvp_t, stack);
+	}
+
+	return mm_malloc(hm->kvpsize);
+}
+
+static void kvp_free(mm_hashmap_t *hm, mm_hashmap_kvp_t *kvp)
+{
+	if (hm->kdtor != NULL) {
+		hm->kdtor(mm_hashmap_kvp_key(hm, kvp));
+	}
+
+	if (hm->vdtor != NULL) {
+		hm->vdtor(mm_hashmap_kvp_val(hm, kvp));
+	}
+
+	size_t nfree =
+		atomic_fetch_add_explicit(&hm->nfree, 1, memory_order_relaxed);
+	if (nfree >= hm->nfree_max) {
+		atomic_fetch_sub_explicit(&hm->nfree, 1, memory_order_relaxed);
+		mm_free(kvp);
+		return;
+	}
+
+	mm_lf_stack_push(&hm->freelist, &kvp->stack);
+}
+
+static mm_hashmap_kvp_t *kvp_create(mm_hashmap_t *hm, mm_hash_t hash,
+				    const void *key)
+{
+	mm_hashmap_kvp_t *kvp = kvp_alloc(hm);
+	if (kvp == NULL) {
+		return NULL;
+	}
+	memset(kvp, 0, hm->kvpsize);
+
+	mm_list_init(&kvp->link);
+	kvp->hash = hash;
+
+	void *kkey = mm_hashmap_kvp_key(hm, kvp);
+	if (hm->kcopy != NULL) {
+		int rc = hm->kcopy(kkey, key);
+		if (rc != 0) {
+			kvp_free(hm, kvp);
+			return NULL;
+		}
+	} else {
+		memcpy(kkey, key, hm->keysz);
+	}
+
+	return kvp;
+}
+
+int mm_hashmap_init(mm_hashmap_t *hm, const mm_hashmap_ctl_t *ctl, int flags)
+{
+	if (ctl == NULL || ctl->nbuckets == 0 || ctl->keysz == 0 ||
+	    ctl->kcmp == NULL || ctl->khash == NULL) {
+		return -1;
+	}
+
+	size_t nbuckets = adjust_to_pow2(ctl->nbuckets);
+	size_t nlocks = (flags & MM_HM_NLOCKS) ? ctl->nlocks : 0;
+
+	if (nlocks > 1) {
+		nlocks = adjust_to_pow2(nlocks);
+	}
+
+	if (nlocks > nbuckets) {
+		nlocks = nbuckets;
+	}
+
+	hm->buckets = mm_malloc(sizeof(mm_hashmap_bucket_t) * nbuckets);
+	if (hm->buckets == NULL) {
+		return -1;
+	}
+
+	if (nlocks > 0) {
+		hm->locks =
+			mm_malloc_aligned(sizeof(mm_mutex_padded_t) * nlocks,
+					  MM_MUTEX_PADDED_SIZE);
+		if (hm->locks == NULL) {
+			mm_free(hm->buckets);
+			hm->buckets = NULL;
+			return -1;
+		}
+	} else {
+		hm->locks = NULL;
+	}
+
+	hm->nbuckets = nbuckets;
+	hm->bucket_mask = nbuckets - 1;
+	hm->nlocks = nlocks;
+	hm->lock_mask = nlocks > 0 ? nlocks - 1 : 0;
+	hm->keysz = ctl->keysz;
+	hm->valsz = ctl->valsz;
+	hm->kcmp = ctl->kcmp;
+	hm->khash = ctl->khash;
+	hm->kdtor = (flags & MM_HM_KEYDTOR) ? ctl->kdtor : NULL;
+	hm->vdtor = (flags & MM_HM_VALDTOR) ? ctl->vdtor : NULL;
+	hm->kcopy = (flags & MM_HM_KEYCOPY) ? ctl->kcopy : NULL;
+
+	hm->keyoff = alignsz(sizeof(mm_hashmap_kvp_t));
+	hm->valoff = alignsz(hm->keyoff + hm->keysz);
+	hm->kvpsize = alignsz(hm->valoff + hm->valsz);
+
+	mm_lf_stack_init(&hm->freelist);
+
+	atomic_init(&hm->nfree, 0);
+	hm->nfree_max = (flags & MM_HM_NFREE_MAX) ? ctl->nfree_max : 0;
+	if (hm->nfree_max == 0) {
+		hm->nfree_max = nbuckets;
+	}
+	init_locks(hm);
+	init_buckets(hm);
+
+	return 0;
+}
+
+mm_hashmap_t *mm_hashmap_create(const mm_hashmap_ctl_t *ctl, int flags)
+{
+	mm_hashmap_t *hm = mm_malloc(sizeof(mm_hashmap_t));
+	if (hm == NULL) {
+		return NULL;
+	}
+
+	if (mm_hashmap_init(hm, ctl, flags) == -1) {
+		mm_free(hm);
+		return NULL;
+	}
+
+	return hm;
+}
+
+void mm_hashmap_clear(mm_hashmap_t *hm)
+{
+	mm_list_t freelist, *i, *s;
+	mm_list_init(&freelist);
+
+	for (size_t li = 0; li < hm->nlocks; ++li) {
+		mm_mutex_lock2(HM_LOCK_AT(hm->locks, li));
+	}
+
+	for (size_t bi = 0; bi < hm->nbuckets; ++bi) {
+		mm_hashmap_bucket_t *b = &hm->buckets[bi];
+
+		mm_list_foreach_safe (&b->kvps, i, s) {
+			mm_hashmap_kvp_t *kvp =
+				mm_container_of(i, mm_hashmap_kvp_t, link);
+			mm_list_unlink(&kvp->link);
+			mm_list_append(&freelist, &kvp->link);
+		}
+	}
+
+	for (int li = (int)hm->nlocks - 1; li >= 0; --li) {
+		mm_mutex_unlock(HM_LOCK_AT(hm->locks, li));
+	}
+
+	mm_list_foreach_safe (&freelist, i, s) {
+		mm_hashmap_kvp_t *kvp =
+			mm_container_of(i, mm_hashmap_kvp_t, link);
+		mm_list_unlink(&kvp->link);
+		kvp_free(hm, kvp);
+	}
+}
+
+void mm_hashmap_destroy(mm_hashmap_t *hm)
+{
+	mm_hashmap_clear(hm);
+
+	mm_lf_stack_entry_t *e;
+	while ((e = mm_lf_stack_pop(&hm->freelist)) != NULL) {
+		mm_hashmap_kvp_t *kvp =
+			mm_container_of(e, mm_hashmap_kvp_t, stack);
+		mm_free(kvp);
+	}
+
+	mm_lf_stack_destroy(&hm->freelist);
+
+	destroy_locks(hm);
+
+	mm_free(hm->locks);
+	mm_free(hm->buckets);
+}
+
+void mm_hashmap_free(mm_hashmap_t *hm)
+{
+	if (hm == NULL) {
+		return;
+	}
+
+	mm_hashmap_destroy(hm);
+	mm_free(hm);
+}
+
+int mm_hashmap_foreach(mm_hashmap_t *hm, mm_hm_kvp_cb_fn cb, void **argv)
+{
+	int rc = 0;
+
+	for (size_t bi = 0; bi < hm->nbuckets; ++bi) {
+		mm_hashmap_bucket_t *b = &hm->buckets[bi];
+		bucket_lock(b);
+
+		mm_list_t *i;
+		mm_list_foreach (&b->kvps, i) {
+			mm_hashmap_kvp_t *kvp =
+				mm_container_of(i, mm_hashmap_kvp_t, link);
+
+			rc = cb(hm, kvp, argv);
+			if (rc != 0) {
+				break;
+			}
+		}
+
+		bucket_unlock(b);
+
+		if (rc != 0) {
+			break;
+		}
+	}
+
+	return rc;
+}
+
+static mm_hashmap_kvp_t *kvp_find_locked(mm_hashmap_t *hm,
+					 mm_hashmap_bucket_t *bucket,
+					 mm_hash_t hash, const void *key)
+{
+	mm_list_t *i;
+	mm_list_foreach (&bucket->kvps, i) {
+		mm_hashmap_kvp_t *kvp =
+			mm_container_of(i, mm_hashmap_kvp_t, link);
+
+		if (kvp->hash != hash) {
+			continue;
+		}
+
+		void *kkey = mm_hashmap_kvp_key(hm, kvp);
+		if (hm->kcmp(kkey, key) == 0) {
+			return kvp;
+		}
+	}
+
+	return NULL;
+}
+
+int mm_hashmap_lock_key(mm_hashmap_t *hm, mm_hashmap_keylock_t *klock,
+			const void *key, int flags)
+{
+	return mm_hashmap_lock_key_with_hash(hm, klock, key, hm->khash(key),
+					     flags);
+}
+
+int mm_hashmap_lock_key_with_hash(mm_hashmap_t *hm, mm_hashmap_keylock_t *klock,
+				  const void *key, mm_hash_t hash, int flags)
+{
+	memset(klock, 0, sizeof(mm_hashmap_keylock_t));
+
+	size_t bidx = bucket_idx(hm, hash);
+	mm_hashmap_bucket_t *bucket = &hm->buckets[bidx];
+
+	bucket_lock(bucket);
+	klock->bucket = bucket;
+
+	mm_hashmap_kvp_t *kvp = kvp_find_locked(hm, bucket, hash, key);
+	if (kvp != NULL) {
+		klock->found = 1;
+		klock->kvp = kvp;
+		return 0;
+	}
+
+	bucket_unlock(bucket);
+
+	if (!(flags & MM_HASHMAP_CREATE)) {
+		klock->found = 0;
+		klock->kvp = NULL;
+		return 0;
+	}
+
+	mm_hashmap_kvp_t *newkvp = kvp_create(hm, hash, key);
+	if (newkvp == NULL) {
+		return -1;
+	}
+
+	bucket_lock(bucket);
+
+	kvp = kvp_find_locked(hm, bucket, hash, key);
+	if (kvp != NULL) {
+		kvp_free(hm, newkvp);
+		klock->kvp = kvp;
+		klock->found = 1;
+		return 0;
+	}
+
+	mm_list_append(&bucket->kvps, &newkvp->link);
+	klock->kvp = newkvp;
+	klock->found = 0;
+
+	return 0;
+}
+
+int mm_hashmap_lock_shard(mm_hashmap_t *hm, mm_hashmap_keylock_t *klock,
+			  mm_hash_t hash)
+{
+	memset(klock, 0, sizeof(mm_hashmap_keylock_t));
+
+	size_t bidx = bucket_idx(hm, hash);
+	mm_hashmap_bucket_t *bucket = &hm->buckets[bidx];
+
+	bucket_lock(bucket);
+	klock->bucket = bucket;
+
+	return 0;
+}
+
+void mm_hashmap_unlock_key(mm_hashmap_t *hm, mm_hashmap_keylock_t *klock)
+{
+	(void)hm;
+	bucket_unlock(klock->bucket);
+}
+
+void mm_hashmap_remove(mm_hashmap_t *hm, mm_hashmap_keylock_t *klock)
+{
+	if (klock->kvp != NULL) {
+		mm_list_unlink(&klock->kvp->link);
+		kvp_free(hm, klock->kvp);
+		klock->kvp = NULL;
+	}
+
+	bucket_unlock(klock->bucket);
+}

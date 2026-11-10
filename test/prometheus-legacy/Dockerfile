@@ -1,0 +1,51 @@
+FROM ubuntu:noble
+
+RUN apt update && apt install -y ca-certificates
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirror.yandex.ru/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirror.yandex.ru/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources
+
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --no-install-recommends --allow-unauthenticated \
+    git \
+    libssl-dev \
+    libldap-common \
+    openssl \
+    libpam0g-dev \
+    libldap-dev \
+    build-essential \
+    cmake \
+    libmicrohttpd-dev \
+    postgresql-client-common postgresql-client \
+    procps \
+    python3 \
+    wget \
+    net-tools \
+    curl \
+    bison flex \
+    jq
+    
+WORKDIR /
+RUN wget https://github.com/digitalocean/prometheus-client-c/releases/download/v0.1.3/libprom-dev-0.1.3-Linux.deb && \
+    dpkg -i libprom-dev-0.1.3-Linux.deb
+
+RUN wget https://github.com/digitalocean/prometheus-client-c/releases/download/v0.1.3/libpromhttp-dev-0.1.3-Linux.deb && \
+    dpkg -i libpromhttp-dev-0.1.3-Linux.deb
+
+RUN mkdir /odyssey
+WORKDIR /odyssey
+
+COPY . ./
+COPY ./test/bin/ody-start /usr/bin/ody-start
+COPY ./test/bin/ody-stop /usr/bin/ody-stop
+
+WORKDIR /odyssey
+
+ARG odyssey_build_type
+
+RUN make clean && make ${odyssey_build_type}
+
+COPY ./test/prometheus-legacy/entrypoint.sh /usr/local/bin/entrypoint.sh
+WORKDIR /odyssey
+
+ENTRYPOINT ["entrypoint.sh"]

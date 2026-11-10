@@ -1,0 +1,489 @@
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <odyssey.h>
+
+#include <machinarium/machinarium.h>
+
+#include <status.h>
+#include <storage.h>
+#include <global.h>
+#include <instance.h>
+#include <route.h>
+#include <backend.h>
+#include <query.h>
+#include <attach.h>
+#include <router.h>
+#include <auth_query.h>
+#include <internal_client.h>
+
+void od_storage_endpoint_status_init(od_storage_endpoint_status_t *status)
+{
+	status->last_update_time_ms = 0ULL;
+	status->alive = 1;
+	status->is_read_write = true;
+	status->repl_lag_sec = 0;
+	mm_spinlock_init(&status->values_lock);
+}
+
+void od_storage_endpoint_status_destroy(od_storage_endpoint_status_t *status)
+{
+	mm_spinlock_destroy(&status->values_lock);
+}
+
+bool od_storage_endpoint_status_is_outdated(
+	od_storage_endpoint_status_t *status, uint64_t recheck_interval)
+{
+	mm_spinlock_lock(&status->values_lock);
+
+	uint64_t last_update_time_ms = status->last_update_time_ms;
+
+	mm_spinlock_unlock(&status->values_lock);
+
+	return (machine_time_ms() - last_update_time_ms) > recheck_interval;
+}
+
+void od_storage_endpoint_status_get(od_storage_endpoint_status_t *status,
+				    od_storage_endpoint_status_t *out)
+{
+	mm_spinlock_lock(&status->values_lock);
+
+	out->last_update_time_ms = status->last_update_time_ms;
+	out->is_read_write = status->is_read_write;
+	out->alive = status->alive;
+	out->repl_lag_sec = status->repl_lag_sec;
+
+	mm_spinlock_unlock(&status->values_lock);
+}
+
+void od_storage_endpoint_status_set(od_storage_endpoint_status_t *status,
+				    const od_storage_endpoint_status_t *value)
+{
+	mm_spinlock_lock(&status->values_lock);
+
+	status->last_update_time_ms = value->last_update_time_ms;
+	status->is_read_write = value->is_read_write;
+	status->alive = value->alive;
+	status->repl_lag_sec = value->repl_lag_sec;
+
+	mm_spinlock_unlock(&status->values_lock);
+}
+
+void od_storage_endpoint_status_set_dead(od_storage_endpoint_status_t *status)
+{
+	od_storage_endpoint_status_t endp_status;
+	od_storage_endpoint_status_init(&endp_status);
+	endp_status.alive = 0;
+	endp_status.is_read_write = 0;
+	endp_status.last_update_time_ms = machine_time_ms();
+	endp_status.repl_lag_sec = 0;
+
+	od_storage_endpoint_status_set(status, &endp_status);
+}
+
+od_storage_watchdog_t *od_storage_watchdog_allocate(od_global_t *global)
+{
+	od_storage_watchdog_t *watchdog;
+	watchdog = od_malloc(sizeof(od_storage_watchdog_t));
+	if (watchdog == NULL) {
+		return NULL;
+	}
+	memset(watchdog, 0, sizeof(od_storage_watchdog_t));
+	watchdog->global = global;
+
+	watchdog->online = machine_wait_flag_create();
+	if (watchdog->online == NULL) {
+		od_free(watchdog);
+		return NULL;
+	}
+
+	return watchdog;
+}
+
+int od_storage_watchdog_set_offline(od_storage_watchdog_t *watchdog)
+{
+	machine_wait_flag_set(watchdog->online);
+	return OK_RESPONSE;
+}
+
+int od_storage_watchdog_free(od_storage_watchdog_t *watchdog)
+{
+	if (watchdog == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+
+	if (watchdog->query) {
+		od_free(watchdog->query);
+	}
+
+	if (watchdog->route_usr) {
+		od_free(watchdog->route_usr);
+	}
+
+	if (watchdog->route_db) {
+		od_free(watchdog->route_db);
+	}
+
+	machine_wait_flag_destroy(watchdog->online);
+
+	od_free(watchdog);
+	return OK_RESPONSE;
+}
+
+od_rule_storage_t *od_rules_storage_allocate(void)
+{
+	/* Allocate and force defaults */
+	od_rule_storage_t *storage =
+		(od_rule_storage_t *)od_malloc(sizeof(od_rule_storage_t));
+	if (storage == NULL) {
+		return NULL;
+	}
+	memset(storage, 0, sizeof(*storage));
+	storage->watchdog_coro_id = -1;
+	storage->tls_opts = od_tls_opts_alloc();
+	if (storage->tls_opts == NULL) {
+		od_free(storage);
+		return NULL;
+	}
+
+	atomic_init(&storage->refs, 1);
+
+	storage->endpoints_status_poll_interval_ms = 1000;
+	od_storage_balancing_init(&storage->balancing);
+
+	od_list_init(&storage->link);
+	return storage;
+}
+
+static void storage_free_now(od_rule_storage_t *storage)
+{
+	if (storage->name) {
+		od_free(storage->name);
+	}
+	if (storage->type) {
+		od_free(storage->type);
+	}
+	if (storage->host) {
+		od_free(storage->host);
+	}
+
+	if (storage->tls_opts) {
+		od_tls_opts_free(storage->tls_opts);
+	}
+
+	if (storage->endpoints_count) {
+		for (size_t i = 0; i < storage->endpoints_count; ++i) {
+			od_storage_endpoint_status_destroy(
+				&storage->endpoints[i].status);
+			od_address_destroy(&storage->endpoints[i].address);
+		}
+
+		od_free(storage->endpoints);
+	}
+
+	od_storage_balancing_destroy(&storage->balancing);
+
+	od_free(storage);
+}
+
+void od_rules_storage_unref(od_rule_storage_t *storage)
+{
+	int64_t r = atomic_fetch_sub(&storage->refs, 1);
+	od_release_assert(r >= 1);
+
+	if (r > 1) {
+		return;
+	}
+
+	/* r == 1: last ref.  If a watchdog was allocated but never
+	 * started, free it now (it holds no coroutine ref).
+	 *
+	 * If the watchdog was started, it has already been joined by
+	 * the caller (shutdown or reload path) before dropping the
+	 * last non-watchdog ref.  By the time we get here, the watchdog
+	 * coroutine has already exited, nulled storage->watchdog, and
+	 * dropped its own ref.  So storage->watchdog is NULL here. */
+	if (storage->watchdog != NULL) {
+		od_storage_watchdog_free(storage->watchdog);
+		storage->watchdog = NULL;
+	}
+	storage_free_now(storage);
+}
+
+od_rule_storage_t *od_rules_storage_ref(od_rule_storage_t *s)
+{
+	atomic_fetch_add(&s->refs, 1);
+	return s;
+}
+
+od_storage_endpoint_t *od_storage_find_endpoint(od_rule_storage_t *storage,
+						const od_address_t *address)
+{
+	for (size_t i = 0; i < storage->endpoints_count; ++i) {
+		od_storage_endpoint_t *e = &storage->endpoints[i];
+
+		if (od_address_cmp(&e->address, address) == 0) {
+			return e;
+		}
+	}
+
+	return NULL;
+}
+
+od_storage_endpoint_t *
+od_storage_find_endpoint_by_host(od_rule_storage_t *storage,
+				 const od_address_t *address)
+{
+	int port = address->port;
+	if (port == 0) {
+		port = storage->port;
+	}
+
+	for (size_t i = 0; i < storage->endpoints_count; ++i) {
+		od_storage_endpoint_t *e = &storage->endpoints[i];
+
+		if (e->address.type != address->type) {
+			continue;
+		}
+
+		if (strcmp(e->address.host, address->host) != 0) {
+			continue;
+		}
+
+		if (address->type == OD_ADDRESS_TYPE_TCP &&
+		    e->address.port != port) {
+			continue;
+		}
+
+		return e;
+	}
+
+	return NULL;
+}
+
+static inline od_client_t *
+od_storage_watchdog_prepare_client(od_storage_watchdog_t *watchdog)
+{
+	od_global_t *global = watchdog->global;
+	od_router_t *router = global->router;
+	od_instance_t *instance = global->instance;
+
+	od_client_t *watchdog_client;
+	watchdog_client = od_client_allocate_internal(global);
+	if (watchdog_client == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "route storage watchdog failed to allocate client");
+		return NULL;
+	}
+
+	watchdog_client->is_watchdog = true;
+	watchdog_client->global = global;
+	watchdog_client->type = OD_POOL_CLIENT_INTERNAL;
+	od_id_generate(&watchdog_client->id, "a");
+
+	/* set storage user and database */
+	kiwi_var_set(&watchdog_client->startup.user, KIWI_VAR_UNDEF,
+		     watchdog->route_usr, strlen(watchdog->route_usr) + 1);
+
+	kiwi_var_set(&watchdog_client->startup.database, KIWI_VAR_UNDEF,
+		     watchdog->route_db, strlen(watchdog->route_db) + 1);
+
+	od_router_status_t status;
+	status = od_router_route(router, watchdog_client);
+	od_debug(&instance->logger, watchdog_client, NULL,
+		 "routing to internal wd route status: %s",
+		 od_router_status_to_str(status));
+
+	if (status != OD_ROUTER_OK) {
+		od_error(&instance->logger, watchdog_client, NULL,
+			 "route storage watchdog failed: %s",
+			 od_router_status_to_str(status));
+
+		od_client_free_extended(watchdog_client);
+
+		return NULL;
+	}
+
+	return watchdog_client;
+}
+
+static inline void
+od_storage_watchdog_close_client(od_storage_watchdog_t *watchdog,
+				 od_client_t *watchdog_client)
+{
+	od_global_t *global = watchdog->global;
+	od_router_t *router = global->router;
+
+	od_router_close(router, watchdog_client);
+	od_router_unroute(router, watchdog_client);
+	od_client_free_extended(watchdog_client);
+}
+
+static inline od_client_t *
+od_storage_create_and_connect_watchdog_client(od_storage_watchdog_t *watchdog,
+					      od_storage_endpoint_t *endp)
+{
+	od_global_t *global = watchdog->global;
+	od_router_t *router = global->router;
+	od_instance_t *instance = global->instance;
+
+	od_client_t *client;
+	client = od_storage_watchdog_prepare_client(watchdog);
+	if (client == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "route storage watchdog failed to prepare client");
+
+		return NULL;
+	}
+
+	od_frontend_status_t status;
+	status = od_attach_extended_endpoint(instance, router, client, endp);
+	if (status != OD_OK) {
+		od_error(&instance->logger, client, NULL,
+			 "attach failed with status = %d (%s)", status,
+			 od_frontend_status_to_str(status));
+
+		od_router_unroute(router, client);
+		od_client_free_extended(client);
+
+		return NULL;
+	}
+
+	return client;
+}
+
+static inline void watchdog_update_endpoint(od_storage_watchdog_t *watchdog,
+					    od_storage_endpoint_t *endp)
+{
+	od_global_t *global = watchdog->global;
+	od_instance_t *instance = global->instance;
+
+	od_client_t *client;
+	client = od_storage_create_and_connect_watchdog_client(watchdog, endp);
+	if (client == NULL) {
+		return;
+	}
+
+	od_server_t *server = client->server;
+
+	/* try to update, ignore errors - cant do nothing with it */
+	od_backend_update_endpoint_status(instance, client, server,
+					  watchdog->query, endp);
+
+	od_storage_watchdog_close_client(watchdog, client);
+}
+
+static inline void
+od_storage_watchdog_do_polling_step(od_storage_watchdog_t *watchdog)
+{
+	od_rule_storage_t *storage = watchdog->storage;
+
+	for (size_t i = 0; i < storage->endpoints_count; ++i) {
+		od_storage_endpoint_t *endp = &storage->endpoints[i];
+
+		watchdog_update_endpoint(watchdog, endp);
+	}
+}
+
+static inline void
+od_storage_watchdog_do_polling_loop(od_storage_watchdog_t *watchdog)
+{
+	od_instance_t *instance = od_global_get_instance();
+	od_rule_storage_t *storage = watchdog->storage;
+
+	uint64_t poll_ms = storage->endpoints_status_poll_interval_ms;
+
+	/*
+	 * increase the probability of using
+	 * the status obtained through watchdog
+	 */
+	poll_ms = poll_ms * 3 / 4;
+	if (poll_ms == 0) {
+		poll_ms = storage->endpoints_status_poll_interval_ms;
+	}
+
+	while (1) {
+		od_storage_watchdog_do_polling_step(watchdog);
+
+		int rc = machine_wait_flag_wait(watchdog->online, poll_ms);
+		if (rc == 0) {
+			od_log(&instance->logger, NULL, NULL,
+			       "online flag is set, exiting from watchdog for %s",
+			       watchdog->storage->name);
+			break;
+		}
+
+		if (rc == -1 && machine_errno() != ETIMEDOUT) {
+			od_error(&instance->logger, NULL, NULL,
+				 "can't wait online flag: %s (%d)",
+				 strerror(machine_errno()), machine_errno());
+			break;
+		}
+	}
+}
+
+void od_storage_watchdog_watch(void *arg)
+{
+	od_storage_watchdog_t *watchdog = (od_storage_watchdog_t *)arg;
+	od_global_t *global = watchdog->global;
+	od_instance_t *instance = global->instance;
+
+	od_debug(&instance->logger, NULL, NULL,
+		 "start watchdog for storage '%s'", watchdog->storage->name);
+
+	od_storage_watchdog_do_polling_loop(watchdog);
+
+	od_log(&instance->logger, NULL, NULL,
+	       "finishing watchdog for storage '%s'", watchdog->storage->name);
+
+	od_rule_storage_t *storage = watchdog->storage;
+	storage->watchdog = NULL;
+	storage->watchdog_coro_id = -1;
+	od_storage_watchdog_free(watchdog);
+	od_rules_storage_unref(storage);
+}
+
+int od_storage_parse_endpoints(const char *host_str,
+			       od_storage_endpoint_t **out, size_t *count)
+{
+	od_address_t *addrs = NULL;
+	size_t c = 0;
+
+	if (od_parse_addresses(host_str, &addrs, &c) != OK_RESPONSE) {
+		return NOT_OK_RESPONSE;
+	}
+
+	if (c > OD_STORAGE_MAX_ENDPOINTS) {
+		goto error;
+	}
+
+	od_storage_endpoint_t *result =
+		od_malloc(c * sizeof(od_storage_endpoint_t));
+	if (result == NULL) {
+		goto error;
+	}
+
+	for (size_t i = 0; i < c; ++i) {
+		od_address_t *result_addr = &result[i].address;
+		od_address_init(result_addr);
+		od_address_move(result_addr, &addrs[i]);
+	}
+
+	od_free(addrs);
+
+	*out = result;
+	*count = c;
+
+	return OK_RESPONSE;
+
+error:
+	for (size_t i = 0; i < c; ++i) {
+		od_address_destroy(&addrs[i]);
+	}
+	od_free(addrs);
+	return NOT_OK_RESPONSE;
+}

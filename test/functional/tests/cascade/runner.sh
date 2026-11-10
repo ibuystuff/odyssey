@@ -1,0 +1,71 @@
+#!/bin/bash
+
+set -ex
+
+pushd /tests/cascade/
+
+rm -f allCA*
+rm -f root*
+rm -f gateway*
+
+openssl genrsa -out allCA.key 2048
+openssl req -new -key allCA.key -out allCA.csr -nodes -subj "/CN=odyssey-test-cn"
+openssl x509 -req -days 2 -in allCA.csr -signkey allCA.key -out allCA.pem
+
+openssl genrsa -out root.key 2048
+openssl req -new -key root.key -out root.csr -nodes -subj "/CN=localhost"
+openssl x509 -req -in root.csr -CA allCA.pem -CAkey allCA.key -CAcreateserial -out root.pem -days 2
+
+openssl genrsa -out gateway.key 2048
+openssl req -new -key gateway.key -out gateway.csr -nodes -subj "/CN=localhost"
+openssl x509 -req -in gateway.csr -CA allCA.pem -CAkey allCA.key -CAcreateserial -out gateway.pem -days 2
+
+popd
+
+mkdir -p /tmp/gateway
+mkdir -p /tmp/root1
+mkdir -p /tmp/root2
+
+/usr/bin/odyssey /tests/cascade/odyssey-gateway.conf
+sleep 1
+gateway_pid=$(pidof odyssey)
+
+/usr/bin/odyssey /tests/cascade/odyssey-root1.conf
+/usr/bin/odyssey /tests/cascade/odyssey-root2.conf
+
+sleep 1
+
+psql 'host=localhost port=6432 user=postgres dbname=postgres sslmode=verify-full sslrootcert=/tests/cascade/allCA.pem' -c 'select 1' || {
+    cat /var/log/odyssey.root1.log
+    cat /var/log/odyssey.root2.log
+    cat /var/log/odyssey.gateway.log
+    echo "select 1 for postgres:postgres on root1 should work with tls"
+    exit 1
+}
+
+psql 'host=localhost port=6433 user=postgres dbname=postgres sslmode=verify-full sslrootcert=/tests/cascade/allCA.pem' -c 'select 1' || {
+    cat /var/log/odyssey.root1.log
+    cat /var/log/odyssey.root2.log
+    cat /var/log/odyssey.gateway.log
+    echo "select 1 for postgres:postgres on root2 should work with tls"
+    exit 1
+}
+
+psql 'host=localhost port=7432 user=postgres dbname=postgres sslmode=verify-full sslrootcert=/tests/cascade/allCA.pem' -c 'select 1' || {
+    cat /var/log/odyssey.root1.log
+    cat /var/log/odyssey.root2.log
+    cat /var/log/odyssey.gateway.log
+    echo "select 1 for postgres:postgres on gateway should work with tls"
+    exit 1
+}
+
+pgbench 'host=localhost port=7432 user=postgres dbname=postgres sslmode=verify-full sslrootcert=/tests/cascade/allCA.pem' -j 10 -c 500 --select-only --no-vacuum --progress 1 -T 10 || {
+    cat /var/log/odyssey.root1.log
+    cat /var/log/odyssey.root2.log
+    cat /var/log/odyssey.gateway.log
+    echo "pgbench should work on gateway odyssey"
+    exit 1
+}
+
+ody-stop $gateway_pid
+ody-stop

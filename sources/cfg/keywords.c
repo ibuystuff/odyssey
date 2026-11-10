@@ -1,0 +1,315 @@
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <odyssey.h>
+
+#include <cfg/keywords.h>
+#include <cfg/parse.tab.h>
+
+typedef struct {
+	const char *name;
+	int token;
+} od_cfg_keyword_t;
+
+static const od_cfg_keyword_t keywords[] = {
+	{ "yes", YES },
+	{ "no", NO },
+	{ "daemonize", DAEMONIZE },
+	{ "sequential_routing", SEQUENTIAL_ROUTING },
+	{ "enable_online_restart", ENABLE_ONLINE_RESTART },
+	{ "virtual_processing", VIRTUAL_PROCESSING },
+	{ "graceful_die_on_errors", GRACEFUL_DIE_ON_ERRORS },
+	{ "bindwith_reuseport", BINDWITH_REUSEPORT },
+	{ "enable_host_watcher", ENABLE_HOST_WATCHER },
+	{ "log_debug", LOG_DEBUG },
+	{ "log_debug_sampling", LOG_DEBUG_SAMPLING },
+	{ "log_to_stdout", LOG_TO_STDOUT },
+	{ "log_config", LOG_CONFIG },
+	{ "log_session", LOG_SESSION },
+	{ "log_query", LOG_QUERY },
+	{ "log_query_sampling", LOG_QUERY_SAMPLING },
+	{ "log_stats", LOG_STATS },
+	{ "log_async", LOG_ASYNC },
+	{ "log_syslog", LOG_SYSLOG },
+	{ "smart_search_path_enquoting", SMART_SEARCH_PATH_ENQUOTING },
+	{ "nodelay", NODELAY },
+	{ "disable_nolinger", DISABLE_NOLINGER },
+	{ "log_general_stats_prom", LOG_GENERAL_STATS_PROM },
+	{ "log_route_stats_prom", LOG_ROUTE_STATS_PROM },
+	{ "replication_proxy_phys", REPLICATION_PROXY_PHYS },
+	{ "replication_proxy_logic", REPLICATION_PROXY_LOGIC },
+	{ "pid_file", PID_FILE },
+	{ "unix_socket_dir", UNIX_SOCKET_DIR },
+	{ "unix_socket_mode", UNIX_SOCKET_MODE },
+	{ "locks_dir", LOCKS_DIR },
+	{ "external_auth_socket_path", EXTERNAL_AUTH_SOCKET_PATH },
+	{ "availability_zone", AVAILABILITY_ZONE },
+	{ "log_file", LOG_FILE },
+	{ "log_format", LOG_FORMAT },
+	{ "log_syslog_ident", LOG_SYSLOG_IDENT },
+	{ "log_syslog_facility", LOG_SYSLOG_FACILITY },
+	{ "cpu_affinity", CPU_AFFINITY },
+	{ "hba_file", HBA_FILE },
+	{ "priority", PRIORITY },
+	{ "graceful_shutdown_timeout_ms", GRACEFUL_SHUTDOWN_TIMEOUT_MS },
+	{ "log_queue_depth", LOG_QUEUE_DEPTH },
+	{ "stats_interval", STATS_INTERVAL },
+	{ "client_max", CLIENT_MAX },
+	{ "client_max_routing", CLIENT_MAX_ROUTING },
+	{ "accept_rate_limit", ACCEPT_RATE_LIMIT },
+	{ "server_login_retry", SERVER_LOGIN_RETRY },
+	{ "readahead", READAHEAD },
+	{ "keepalive", KEEPALIVE },
+	{ "keepalive_keep_interval", KEEPALIVE_KEEP_INTERVAL },
+	{ "keepalive_probes", KEEPALIVE_PROBES },
+	{ "keepalive_usr_timeout", KEEPALIVE_USR_TIMEOUT },
+	{ "max_sigterms_to_die", MAX_SIGTERMS_TO_DIE },
+	{ "backend_connect_timeout_ms", BACKEND_CONNECT_TIMEOUT_MS },
+	{ "cancel_timeout_ms", CANCEL_TIMEOUT_MS },
+	{ "cancel_queue_timeout_ms", CANCEL_QUEUE_TIMEOUT_MS },
+	{ "cancel_max_inflight", CANCEL_MAX_INFLIGHT },
+	{ "cancel_rate_limit", CANCEL_RATE_LIMIT },
+	{ "ignore_cancel", IGNORE_CANCEL },
+	{ "resolvers", RESOLVERS },
+	{ "dns_cache_ttl", DNS_CACHE_TTL },
+	{ "cache_msg_gc_size", CACHE_MSG_GC_SIZE },
+	{ "cache_msg_gc_count", CACHE_MSG_GC_COUNT },
+	{ "cache_coroutine", CACHE_COROUTINE },
+	{ "coroutine_stack_size", COROUTINE_STACK_SIZE },
+	{ "system_coroutine_stack_size", SYSTEM_COROUTINE_STACK_SIZE },
+	{ "promhttp_server_port", PROMHTTP_SERVER_PORT },
+	{ "group_checker_interval", GROUP_CHECKER_INTERVAL },
+	{ "auth_query_cache_ttl", AUTH_QUERY_CACHE_TTL },
+	{ "auth_query_cache_ttl_jitter", AUTH_QUERY_CACHE_TTL_JITTER },
+	{ "auth_query_cache_error_retry", AUTH_QUERY_CACHE_ERROR_RETRY },
+	{ "auth_query_cache_stale_on_error", AUTH_QUERY_CACHE_STALE_ON_ERROR },
+	{ "auth_query_timeout", AUTH_QUERY_TIMEOUT },
+	{ "shared_pool", SHARED_POOL },
+	{ "pool_size", POOL_SIZE },
+	{ "conn_drop_options", CONN_DROP_OPTIONS },
+	{ "online_restart_drop_options", ONLINE_RESTART_DROP_OPTIONS },
+	{ "drop_enabled", DROP_ENABLED },
+	{ "rate", RATE },
+	{ "interval_ms", INTERVAL_MS },
+	{ "listen", LISTEN },
+	{ "host", HOST },
+	{ "port", PORT },
+	{ "target_session_attrs", TARGET_SESSION_ATTRS },
+	{ "auto_route_ro_on_standby", AUTO_ROUTE_RO_ON_STANDBY },
+	{ "client_login_timeout", CLIENT_LOGIN_TIMEOUT },
+	{ "backlog", BACKLOG },
+	{ "tls", TLS },
+	{ "tls_ca_file", TLS_CA_FILE },
+	{ "tls_key_file", TLS_KEY_FILE },
+	{ "tls_cert_file", TLS_CERT_FILE },
+	{ "tls_protocols", TLS_PROTOCOLS },
+	{ "catchup_timeout", CATCHUP_TIMEOUT },
+	{ "storage", STORAGE },
+	{ "type", TYPE },
+	{ "server_max_routing", SERVER_MAX_ROUTING },
+	{ "endpoints_status_poll_interval", ENDPOINTS_STATUS_POLL_INTERVAL },
+	{ "balancing", BALANCING },
+	{ "method", METHOD },
+	{ "show_notice_messages", SHOW_NOTICE_MESSAGES },
+	{ "compression", COMPRESSION },
+	{ "workers", WORKERS },
+	{ "pipeline", PIPELINE },
+	{ "cache", CACHE },
+	{ "cache_chunk", CACHE_CHUNK },
+	{ "packet_read_size", PACKET_READ_SIZE },
+	{ "packet_write_queue", PACKET_WRITE_QUEUE },
+	{ "soft_oom_limit", SOFT_OOM_LIMIT },
+	{ "soft_oom_process", SOFT_OOM_PROCESS },
+	{ "soft_oom_check_interval_ms", SOFT_OOM_CHECK_INTERVAL_MS },
+	{ "soft_oom_drop_signal", SOFT_OOM_DROP_SIGNAL },
+	{ "soft_oom_drop_max_rate", SOFT_OOM_DROP_MAX_RATE },
+	{ "ldap_endpoint", LDAP_ENDPOINT },
+	{ "ldapserver", LDAP_SERVER },
+	{ "ldapport", LDAP_PORT },
+	{ "ldapprefix", LDAP_PREFIX },
+	{ "ldapsuffix", LDAP_SUFFIX },
+	{ "ldapbasedn", LDAP_BASEDN },
+	{ "ldapbinddn", LDAP_BINDDN },
+	{ "ldapbindpasswd", LDAP_BIND_PASSWD },
+	{ "ldapsearchattribute", LDAP_SEARCH_ATTRIBUTE },
+	{ "ldapscheme", LDAP_SCHEME },
+	{ "ldapscope", LDAP_SCOPE },
+	{ "ldapsearchfilter", LDAP_SEARCH_FILTER },
+	{ "database", DATABASE },
+	{ "default", DEFAULT },
+	{ "user", USER },
+	{ "local", LOCAL },
+	{ "hostssl", HOSTSSL },
+	{ "hostnossl", HOSTNOSSL },
+	{ "ldap_storage_username", LDAP_STORAGE_USERNAME },
+	{ "ldap_storage_password", LDAP_STORAGE_PASSWORD },
+	{ "auth_common_name", AUTH_COMMON_NAME },
+	{ "authentication", AUTHENTICATION },
+	{ "auth_module", AUTH_MODULE },
+	{ "enable_mdb_iamproxy_auth", ENABLE_MDB_IAMPROXY_AUTH },
+	{ "mdb_iamproxy_socket_path", MDB_IAMPROXY_SOCKET_PATH },
+	{ "auth_pam_service", AUTH_PAM_SERVICE },
+	{ "auth_query", AUTH_QUERY },
+	{ "auth_query_db", AUTH_QUERY_DB },
+	{ "auth_query_user", AUTH_QUERY_USER },
+	{ "password_passthrough", PASSWORD_PASSTHROUGH },
+	{ "password", PASSWORD },
+	{ "password_pgpass", PASSWORD_PGPASS },
+	{ "role", ROLE },
+	{ "client_fwd_error", CLIENT_FWD_ERROR },
+	{ "client_show_id", CLIENT_SHOW_ID },
+	{ "reserve_session_server_connection",
+	  RESERVE_SESSION_SERVER_CONNECTION },
+	{ "quantiles", QUANTILES },
+	{ "application_name_add_host", APPLICATION_NAME_ADD_HOST },
+	{ "server_drop_on_cached_plan_error",
+	  SERVER_DROP_ON_CACHED_PLAN_ERROR },
+	{ "server_drop_on_oom", SERVER_DROP_ON_OOM },
+	{ "server_lifetime", SERVER_LIFETIME },
+	{ "server_pstmt_cache_size", SERVER_PSTMT_CACHE_SIZE },
+	{ "ldap_pool_size", LDAP_POOL_SIZE },
+	{ "ldap_pool_timeout", LDAP_POOL_TIMEOUT },
+	{ "ldap_pool_ttl", LDAP_POOL_TTL },
+	{ "maintain_params", MAINTAIN_PARAMS },
+	{ "pool", POOL },
+	{ "pool_routing", POOL_ROUTING },
+	{ "min_pool_size", MIN_POOL_SIZE },
+	{ "pool_timeout", POOL_TIMEOUT },
+	{ "pool_ttl", POOL_TTL },
+	{ "pool_discard", POOL_DISCARD },
+	{ "pool_smart_discard", POOL_SMART_DISCARD },
+	{ "pool_discard_query", POOL_DISCARD_QUERY },
+	{ "pool_cancel", POOL_CANCEL },
+	{ "pool_rollback", POOL_ROLLBACK },
+	{ "pool_reset_timeout_ms", POOL_RESET_TIMEOUT_MS },
+	{ "pool_reserve_prepared_statement", POOL_RESERVE_PREPARED_STATEMENT },
+	{ "pool_pin_on_listen", POOL_PIN_ON_LISTEN },
+	{ "pool_attach_check", POOL_ATTACH_CHECK },
+	{ "pool_acquire_fail_fast", POOL_ACQUIRE_FAIL_FAST },
+	{ "pool_notice_after_waiting_ms", POOL_NOTICE_AFTER_WAITING_MS },
+	{ "pool_client_idle_timeout", POOL_CLIENT_IDLE_TIMEOUT },
+	{ "pool_idle_in_transaction_timeout",
+	  POOL_IDLE_IN_TRANSACTION_TIMEOUT },
+	{ "storage_db", STORAGE_DATABASE },
+	{ "storage_user", STORAGE_USER },
+	{ "storage_password", STORAGE_PASSWORD },
+	{ "ldap_endpoint_name", LDAP_ENDPOINT_NAME },
+	{ "ldap_storage_credentials_attr", LDAP_STORAGE_CREDENTIALS_ATTR },
+	{ "ldap_storage_credentials", LDAP_STORAGE_CREDENTIALS },
+	{ "watchdog_lag_query", WATCHDOG_LAG_QUERY },
+	{ "watchdog_lag_interval", WATCHDOG_LAG_INTERVAL },
+	{ "options", OPTIONS },
+	{ "backend_startup_options", BACKEND_STARTUP_OPTIONS },
+	{ "group_query", GROUP_QUERY },
+	{ "group_query_user", GROUP_QUERY_USER },
+	{ "group_query_db", GROUP_QUERY_DB },
+	{ "catchup_checks", CATCHUP_CHECKS },
+	{ "watchdog", WATCHDOG },
+	{ "group", GROUP },
+	{ "include", INCLUDE },
+	{ "az_aware", AZ_AWARE },
+	{ "virtual_transaction", VIRTUAL_TRANSACTION },
+	{ "query_parsing_mode", QUERY_PARSING_MODE },
+	{ "query_parsing_mem_limit", QUERY_PARSING_MEM_LIMIT },
+	{ "query_parsing_max_query_len", QUERY_PARSING_MAX_QUERY_LEN },
+	{ "query_parsing_standby_function_list",
+	  QUERY_PARSING_STANDBY_FUNCTION_LIST },
+	{ "disabled", DISABLED },
+	{ "minimal", MINIMAL },
+	{ "full", FULL },
+	{ "reserved_clients", RESERVED_CLIENTS },
+
+	{ NULL, 0 }
+};
+
+int od_cfg_keyword_lookup(const char *str, size_t len)
+{
+	for (size_t i = 0; keywords[i].name != NULL; i++) {
+		if (strlen(keywords[i].name) == len &&
+		    memcmp(keywords[i].name, str, len) == 0) {
+			return keywords[i].token;
+		}
+	}
+
+	return 0;
+}
+
+static int levenshtein(const char *a, size_t alen, const char *b, size_t blen)
+{
+	if (alen == 0) {
+		return (int)blen;
+	}
+	if (blen == 0) {
+		return (int)alen;
+	}
+
+	size_t n = alen + 1;
+	size_t m = blen + 1;
+
+	int *prev = od_malloc(sizeof(int) * m);
+	int *curr = od_malloc(sizeof(int) * m);
+	if (prev == NULL || curr == NULL) {
+		od_free(prev);
+		od_free(curr);
+		return (int)((alen > blen) ? alen : blen);
+	}
+
+	for (size_t j = 0; j < m; j++) {
+		prev[j] = (int)j;
+	}
+
+	for (size_t i = 1; i < n; i++) {
+		curr[0] = (int)i;
+		for (size_t j = 1; j < m; j++) {
+			int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+			int del = prev[j] + 1;
+			int ins = curr[j - 1] + 1;
+			int sub = prev[j - 1] + cost;
+			int min = del < ins ? del : ins;
+			if (sub < min) {
+				min = sub;
+			}
+			curr[j] = min;
+		}
+
+		int *tmp = prev;
+		prev = curr;
+		curr = tmp;
+	}
+
+	int result = prev[blen];
+	od_free(prev);
+	od_free(curr);
+	return result;
+}
+
+const char *od_cfg_keyword_suggest(const char *str, size_t len,
+				   int max_distance)
+{
+	const char *best = NULL;
+	int best_dist = max_distance + 1;
+
+	for (size_t i = 0; keywords[i].name != NULL; i++) {
+		size_t klen = strlen(keywords[i].name);
+		if (klen > len) {
+			if (klen - len > (size_t)max_distance) {
+				continue;
+			}
+		} else {
+			if (len - klen > (size_t)max_distance) {
+				continue;
+			}
+		}
+
+		int d = levenshtein(str, len, keywords[i].name, klen);
+		if (d < best_dist) {
+			best_dist = d;
+			best = keywords[i].name;
+		}
+	}
+
+	return best;
+}

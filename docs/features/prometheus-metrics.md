@@ -1,0 +1,212 @@
+# Prometheus metrics
+
+This section describes ways to export Odyssey metrics in Prometheus format.
+
+----
+
+## Exporter
+
+There is metrics exporter in [prometheus/exporter](https://github.com/yandex/odyssey/blob/master/prometheus/exporter/).
+This is an http server, that connects to Odyssey console and expose it metrics
+in Prometheus format on `/metrics` endpoint on specified address.
+
+To use it, you will need build and run:
+```plain
+> go mod download && go build -o odyssey-prom-exporter
+
+> ./odyssey-prom-exporter -h
+usage: odyssey-prom-exporter [<flags>]
+
+
+Flags:
+  -h, --[no-]help                Show context-sensitive help (also try --help-long and --help-man).
+      --odyssey.connectionString="host=localhost port=6432 user=console dbname=console sslmode=disable"  
+                                 Connection string for accessing Odyssey.
+      --odyssey.scrape-timeout=5s
+                                 Maximum duration for a single `/metrics` scrape (inherits the HTTP request context; use 0s to disable).
+      --[no-]web.systemd-socket  Use systemd socket activation listeners instead of port listeners (Linux only).
+      --web.listen-address=:9876 ...  
+                                 Addresses on which to expose metrics and web interface. Repeatable for multiple addresses. Examples: `:9100` or `[::1]:9100` for http,
+                                 `vsock://:9100` for vsock
+      --web.config.file=""       Path to configuration file that can enable TLS or authentication. See:
+                                 https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md
+      --[no-]version             Show application version.
+```
+
+Currently in developing stage, so if you have any troubles
+with this exporter, please, [contact us](../about/contributing.md).
+
+Each `/metrics` request now inherits the HTTP context and uses `--odyssey.scrape-timeout` (default `5s`) to bound how long the exporter waits for `SHOW ...` commands. If the timeout or client cancellation fires, outstanding queries are aborted and the scrape returns `odyssey_exporter_up 0` along with any metrics collected before the interruption.
+
+## Route-level metrics
+
+The Go-based exporter scrapes `SHOW POOLS_EXTENDED;` and `SHOW DATABASES;` and now emits **only label-based metrics** (legacy `odyssey_pool_<db>_<user>_*` names have been removed). Each route sample is keyed by the `user` and `database` labels:
+
+| Metric | Labels | Type | Description |
+| --- | --- | --- | --- |
+| `odyssey_client_pool_active_route` | `user`, `database` | Gauge | Clients currently using the route. |
+| `odyssey_client_pool_waiting_route` | `user`, `database` | Gauge | Clients holding the route but not attached to a backend, i.e. idle between transactions. Despite the name this is **not** a saturation signal. |
+| `odyssey_client_pool_queue_route` | `user`, `database` | Gauge | Clients blocked waiting for a free backend connection. Non-zero means the pool is exhausted. |
+| `odyssey_client_pool_maxwait_seconds_route` | `user`, `database` | Gauge | How long the longest-queued client has been waiting, in seconds. |
+| `odyssey_server_pool_capacity_configured_route` | `user`, `database` | Gauge | Configured `pool_size` from `SHOW DATABASES` (`0` means unlimited). When Odyssey doesn’t expose the mapping for a route, the exporter falls back to the observed `active+idle` at scrape time. |
+| `odyssey_route_pool_mode_info` | `user`, `database`, `mode` | Gauge | `1` for the active pool mode (`session`, `transaction`, `statement`). |
+| `odyssey_route_bytes_received_total` | `user`, `database` | Counter | Bytes received from clients on the route. |
+| `odyssey_route_bytes_sent_total` | `user`, `database` | Counter | Bytes sent to PostgreSQL backends. |
+| `odyssey_route_tcp_connections_total` | `user`, `database` | Counter | Client TCP connections opened toward the route. |
+| `odyssey_route_client_connections_created_total` | `user`, `database` | Counter | External client connections accepted into the route. |
+| `odyssey_route_client_connections_closed_total` | `user`, `database` | Counter | External client connections closed. |
+| `odyssey_route_server_connections_created_total` | `user`, `database` | Counter | Backend transport connections established for the route. |
+| `odyssey_route_server_connections_closed_total` | `user`, `database` | Counter | Backend connections closed or removed from the pool for closure, for any reason. |
+| `odyssey_route_server_connections_returned_total` | `user`, `database` | Counter | Open backend connections returned by clients to the pool. |
+| `odyssey_route_query_duration_seconds` | `user`, `database`, `quantile` | Gauge | Query latency quantiles (available when the `quantiles` rule option is set). |
+| `odyssey_route_transaction_duration_seconds` | `user`, `database`, `quantile` | Gauge | Transaction latency quantiles. |
+| `odyssey_route_client_lifetime_seconds` | `user`, `database`, `quantile` | Gauge | Lifetime quantiles of disconnected clients, from connection accept to session cleanup. |
+
+Saturation examples:
+
+```
+odyssey_server_pool_state_route{state="active"} / odyssey_server_pool_capacity_configured_route
+```
+
+If `capacity_configured_route == 0` (unlimited), prefer absolute values or derive current load directly from the unified family, for example:
+
+```
+sum by (user, database) (odyssey_server_pool_state_route{state=~"active|idle"})
+```
+
+Clients queuing is the most direct evidence that a pool is too small — it counts clients
+that have work to do but cannot get a backend connection:
+
+```
+odyssey_client_pool_queue_route > 0
+```
+
+Pair it with `odyssey_client_pool_maxwait_seconds_route` to tell a brief burst apart from
+sustained starvation. Note that a client that starts to queue moves out of
+`odyssey_client_pool_waiting_route` into `odyssey_client_pool_queue_route`, so the
+`waiting` series can fall exactly when saturation begins.
+
+Quantiles (`*_duration_seconds`) are instantaneous TDigest estimates; treat thresholds like gauges (for example, `odyssey_route_query_duration_seconds{quantile="0.95"} > 0.5`).
+
+### Connection lifecycle
+
+`SHOW POOLS_EXTENDED;` exposes these counters as INT8 columns:
+`client_connections`, `client_disconnections`, `server_connections`,
+`server_disconnections`, and `server_detaches`, respectively. Older Odyssey
+versions without these columns remain supported by the exporter.
+
+Client counters exclude internal clients and connections rejected before route
+assignment. Unlike the existing `tcp_conn_count`, the created counter does not
+include clients rejected by the route's connection limit. Backend counters include
+preallocated connections and connections whose TLS or PostgreSQL startup later
+fails; failed transport connects and standalone connections without a route
+(such as cancellation requests) are excluded.
+
+A detach counts as a return only if the connection stays open for the pool,
+including initial server parameter discovery and direct handoff to a waiting
+client. A detach that closes an obsolete
+or replication connection counts only as a closure. Preallocation is not a
+return. If a returned connection later expires while idle, both events count.
+Closures include normal expiration and errors, so their ratio to returns is not
+an error percentage. Counters live for the lifetime of their route and reset
+when the route is recreated or Odyssey restarts.
+
+Compare closure and return rates (events per second):
+
+```promql
+rate(odyssey_route_server_connections_closed_total[5m])
+rate(odyssey_route_server_connections_returned_total[5m])
+```
+
+### Client lifetime
+
+Enable the `quantiles` rule option on both the client route and the console route
+used by the exporter, for example `quantiles "0.5,0.95,0.99"`. The console rule
+selects the quantiles returned by `SHOW POOLS_EXTENDED;`; each client rule controls
+whether observations are collected for its route.
+
+`odyssey_route_client_lifetime_seconds` measures elapsed time from accepting a
+connection to the start of session cleanup, including startup and idle time.
+An observation is added once for each client with an assigned route that
+reaches `od_frontend_cleanup`, regardless of the session exit status. This
+includes attach failures, target session attributes mismatches, catchup
+timeouts, and other session errors. Early exits that bypass this function,
+including failures during initial startup or authentication, are not included.
+Collection does not depend on `log_session` or on having an attached backend
+server.
+
+The metric uses the same rotating t-digest windows as query and transaction
+quantiles. It is a gauge, not a cumulative Prometheus histogram: it has no
+`_bucket`, `_sum`, or `_count` series. Empty windows are reported as zero. Route
+quantiles cannot be averaged to obtain a percentile across routes or instances.
+
+`SHOW POOLS_EXTENDED;` exposes `client_lifetime_<quantile>` columns as 64-bit
+integer microseconds. The exporter converts these values to seconds and skips
+the `aggregated` row. SQL-based collectors such as a custom Telegraf input can
+read these columns directly; divide by `1000` for milliseconds or by `1e6` for
+seconds. Exporters also remain compatible with Odyssey versions without these
+columns; those versions simply do not produce the new metric.
+
+For example, the p95 lifetime on each route is:
+
+```promql
+odyssey_route_client_lifetime_seconds{quantile="0.95"}
+```
+
+## Database-level averages
+
+Odyssey’s cron thread still computes the historical averages that fed the legacy Prometheus endpoint. The Go exporter re-exposes the most in-demand gauges:
+
+- `odyssey_database_avg_tx_per_second{database="<db>"}` — average transactions per second observed over the most recent `stats_interval` window.
+- `odyssey_database_avg_query_per_second{database="<db>"}` — same concept for queries (per-second throughput).
+- `odyssey_database_avg_recv_bytes_per_second{database="<db>"}` — average bytes/sec received from clients (SHOW STATS `avg_recv`).
+- `odyssey_database_avg_sent_bytes_per_second{database="<db>"}` — average bytes/sec sent to servers (SHOW STATS `avg_sent`).
+- `odyssey_database_avg_query_time_seconds{database="<db>"}` — average query latency (seconds) over the stats window (SHOW STATS `avg_query_time`).
+- `odyssey_database_avg_xact_time_seconds{database="<db>"}` — average transaction latency (seconds) (SHOW STATS `avg_xact_time`).
+- `odyssey_database_avg_wait_time_seconds{database="<db>"}` — average wait time for server (seconds) (SHOW STATS `avg_wait_time`).
+
+## Global lists metrics
+
+Exported from `SHOW LISTS;`:
+
+| Metric | Description |
+| --- | --- |
+| `odyssey_lists_pools` | Number of connection pools |
+| `odyssey_lists_used_clients` | Total connected clients |
+| `odyssey_lists_routing_clients` | Clients currently in routing phase (between accept and route assignment) |
+| `odyssey_lists_login_clients` | Clients in login/auth phase |
+| `odyssey_lists_free_servers` | Idle backend server connections |
+| `odyssey_lists_used_servers` | Active backend server connections |
+
+## Instance metrics
+
+Exported from `SHOW INSTANCE;`, which reports the state of the Odyssey process
+itself. Servers that do not implement the command are skipped without failing
+the scrape:
+
+| Metric | Description |
+| --- | --- |
+| `odyssey_config_load_failed` | `1` if the last config load failed, leaving the process on its previous configuration |
+
+Rows of either view that the exporter has no curated name for are exported as
+`odyssey_lists_<field>` or `odyssey_instance_<field>` respectively, so a newer
+Odyssey can add counters without requiring an exporter release.
+
+**Alert example** for detecting routing queue buildup:
+```yaml
+- alert: OdysseyRoutingQueueHigh
+  expr: odyssey_lists_routing_clients > 10
+  for: 1m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Odyssey routing queue is building up"
+```
+
+## Error counters
+
+`SHOW ERRORS;` is exported as a single counter family: `odyssey_errors_total{type="OD_ECLIENT_READ"}`. Every error type reported by Odyssey becomes a label value, so new error codes do not require exporter changes.
+
+## Legacy built in support
+
+Not supported anymore. See example of usage in [docker/prometheus-legacy/](https://github.com/yandex/odyssey/tree/master/docker/prometheus-legacy/)

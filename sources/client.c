@@ -1,0 +1,168 @@
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <odyssey.h>
+
+#include <machinarium/machinarium.h>
+#include <kiwi/kiwi.h>
+
+#include <status.h>
+#include <client.h>
+#include <system.h>
+#include <config.h>
+#include <list.h>
+#include <query.h>
+
+void od_client_init(od_client_t *client)
+{
+	client->state = OD_CLIENT_UNDEF;
+	client->type = OD_POOL_CLIENT_EXTERNAL;
+	client->coroutine_id = 0;
+	client->tls = NULL;
+	client->rule = NULL;
+	client->source = NULL;
+	client->server = NULL;
+	client->route = NULL;
+	client->global = NULL;
+	client->time_accept = 0;
+	client->time_setup = 0;
+	client->time_queue_start = 0;
+#ifdef LDAP_FOUND
+	client->ldap_storage_username = NULL;
+	client->ldap_storage_username_len = 0;
+	client->ldap_storage_password = NULL;
+	client->ldap_storage_password_len = 0;
+	client->ldap_auth_dn = NULL;
+#endif
+	client->external_id = NULL;
+
+	client->physical_rep = false;
+	client->logical_rep = false;
+
+	kiwi_be_startup_init(&client->startup);
+	kiwi_vars_init(&client->vars);
+	kiwi_key_init(&client->key);
+	/*
+	 * od_malloc does not zero the struct; internal clients (auth
+	 * query, watchdog, group checker) never join the clients map,
+	 * so od_global_clients_map_add never fills the hash for them
+	 * - start deterministically zeroed instead of garbage
+	 */
+	client->key_hash = 0;
+
+	client->startup_raw = NULL;
+
+	od_io_init(&client->io);
+
+	kiwi_password_init(&client->password);
+	kiwi_password_init(&client->received_password);
+
+	od_list_init(&client->link_pool);
+	od_list_init(&client->link);
+
+	client->prep_stmt_ids = NULL;
+	client->portals = NULL;
+	client->last_catchup_lag = 0;
+
+	atomic_store(&client->killed, 0);
+
+	od_relay_init(&client->relay, client);
+
+	memset(client->peer, 0, sizeof(client->peer));
+
+	memset(&client->query_ctx, 0, sizeof(client->query_ctx));
+	client->parser_mode = -1;
+
+	client->pending_begin = NULL;
+	client->debug_log_sampled = -1;
+
+	memset(client->scram_client_key, 0, sizeof(client->scram_client_key));
+	memset(client->scram_server_key, 0, sizeof(client->scram_server_key));
+	client->scram_key_valid = 0;
+
+	client->read_msg = NULL;
+
+	/* Init GUCs. */
+	client->backend_pin = false;
+	client->backend_pin_listen = false;
+	client->opportunistic_acquire = false;
+	od_address_init(&client->execute_on_host);
+}
+
+int od_client_pending_begin_set(od_client_t *client, const char *query)
+{
+	od_assert(client->pending_begin == NULL);
+	size_t size = strlen(query) + 1;
+	if (size <= sizeof(client->pending_begin_buf)) {
+		memcpy(client->pending_begin_buf, query, size);
+		client->pending_begin = client->pending_begin_buf;
+	} else {
+		client->pending_begin = od_strdup(query);
+	}
+	return client->pending_begin == NULL ? -1 : 0;
+}
+
+void od_client_pending_begin_clear(od_client_t *client)
+{
+	if (client->pending_begin != client->pending_begin_buf) {
+		od_free(client->pending_begin);
+	}
+	client->pending_begin = NULL;
+}
+
+void od_client_free(od_client_t *client)
+{
+#ifdef LDAP_FOUND
+	od_free(client->ldap_auth_dn);
+#endif
+
+	if (client->rule != NULL) {
+		od_rules_unref(client->rule);
+	}
+
+	kiwi_be_startup_free(&client->startup);
+	kiwi_vars_free(&client->vars);
+
+	od_relay_destroy(&client->relay);
+
+	od_query_ctx_reset(&client->query_ctx);
+	od_client_pending_begin_clear(client);
+
+	od_io_free(&client->io);
+	/* clear password if saved any */
+	kiwi_password_free(&client->password);
+	kiwi_password_free(&client->received_password);
+	if (client->prep_stmt_ids) {
+		od_client_pstmt_map_free(client->prep_stmt_ids);
+	}
+	if (client->portals) {
+		od_client_portal_map_free(client->portals);
+	}
+	if (client->external_id) {
+		od_free(client->external_id);
+	}
+
+	memset(client->scram_client_key, 0, sizeof(client->scram_client_key));
+	memset(client->scram_server_key, 0, sizeof(client->scram_server_key));
+	client->scram_key_valid = 0;
+
+	machine_msg_free_safe(client->read_msg);
+	machine_msg_free_safe(client->startup_raw);
+
+	od_address_destroy(&client->execute_on_host);
+
+	od_free(client);
+}
+
+uint32_t od_client_login_timeout(const od_client_t *client)
+{
+	if (client->source != NULL) {
+		return (uint32_t)client->source->config->client_login_timeout_ms;
+	}
+
+	/* TODO: do not use infinite timeout */
+	return UINT32_MAX;
+}

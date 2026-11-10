@@ -1,0 +1,237 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <od_memory.h>
+
+static inline int od_vsnprintf(char *buf, int size, const char *fmt,
+			       va_list args)
+	__attribute__((format(printf, 3, 0)));
+static inline int od_vasprintf(char **__restrict bufp, const char *fmt,
+			       va_list args)
+	__attribute__((format(printf, 2, 0)));
+static inline int od_asprintf(char **__restrict bufp, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+static inline int od_snprintf(char *buf, int size, const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
+
+static inline int od_vsnprintf(char *buf, int size, const char *fmt,
+			       va_list args)
+{
+	int rc;
+	rc = vsnprintf(buf, size, fmt, args);
+	if (od_unlikely(rc >= size)) {
+		rc = (size - 1);
+	}
+	return rc;
+}
+
+static inline int od_vasprintf(char **__restrict bufp, const char *fmt,
+			       va_list args)
+{
+	int rc = vasprintf(bufp, fmt, args);
+	if (rc == -1) {
+		*bufp = NULL;
+		return NOT_OK_RESPONSE;
+	}
+
+	/* make it possible to od_free() the result */
+	char *t = od_strdup(*bufp);
+	free(*bufp);
+	*bufp = t;
+	if (t == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+
+	return OK_RESPONSE;
+}
+
+static inline int od_asprintf(char **__restrict bufp, const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	int rc = vasprintf(bufp, fmt, args);
+	va_end(args);
+	if (rc == -1) {
+		*bufp = NULL;
+		return NOT_OK_RESPONSE;
+	}
+
+	/* make it possible to od_free() the result */
+	char *t = od_strdup(*bufp);
+	free(*bufp);
+	*bufp = t;
+	if (t == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+
+	return OK_RESPONSE;
+}
+
+static inline int od_snprintf(char *buf, int size, const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	int rc;
+	rc = od_vsnprintf(buf, size, fmt, args);
+	va_end(args);
+	return rc;
+}
+
+/* Formats "<unix_socket_dir>/.s.PGSQL.<port>" into buf.
+ * Returns the path length, or -1 if the path does not fit into buf. */
+static inline int od_unix_socket_path(char *buf, size_t size,
+				      const char *unix_socket_dir, int port)
+{
+	int len = snprintf(buf, size, "%s/.s.PGSQL.%d", unix_socket_dir, port);
+	if (od_unlikely(len < 0 || (size_t)len >= size)) {
+		return -1;
+	}
+	return len;
+}
+
+static inline int od_concat_prefer_right(char *out, size_t max,
+					 const char *left, size_t left_len,
+					 const char *right, size_t right_len)
+{
+	if (max == 0) {
+		return 0;
+	}
+
+	if (right_len >= max) {
+		return od_snprintf(out, max, "%.*s", (int)(max - 1),
+				   right + right_len - (max - 1));
+	}
+
+	size_t max_left = (max > 1 + right_len) ? (max - 1 - right_len) : 0;
+	if (left_len > max_left) {
+		left_len = max_left;
+	}
+
+	return od_snprintf(out, max, "%.*s%s", (int)left_len, left, right);
+}
+
+static inline char *od_strdup_from_buf(const char *source, size_t size)
+{
+	char *str = od_malloc(size + 1);
+	if (str == NULL) {
+		return NULL;
+	}
+	memcpy(str, source, size);
+	str[size] = '\0';
+	return str;
+}
+
+static inline long od_memtol(char *data, size_t data_size, char **end_ptr,
+			     int base)
+{
+	/* Only 10 is supported */
+	if (base != 10) {
+		abort();
+	}
+
+	size_t i = 0;
+	while (i < data_size && isspace(data[i])) {
+		i++;
+	}
+	if (i >= data_size) {
+		return 0;
+	}
+
+	char sign = data[i];
+	if (sign == '-' || sign == '+') {
+		i++;
+	}
+	if (i >= data_size || !isdigit(data[i])) {
+		return 0;
+	}
+
+	long result = 0;
+	while (i < data_size && isdigit(data[i])) {
+		result = result * 10 + (data[i] - '0');
+		i++;
+	}
+
+	if (i < data_size && !isspace(data[i])) {
+		return 0;
+	}
+
+	if (end_ptr) {
+		*end_ptr = data + i;
+	}
+
+	if (sign == '-') {
+		return -result;
+	}
+	return result;
+}
+
+/* Splits a NUL-terminated buffer into lines in place: replaces the next
+ * '\n' with '\0' and returns the line start, or NULL when exhausted.
+ * The last line may lack '\n'. */
+static inline char *od_next_line(char **cursor)
+{
+	char *line = *cursor;
+	if (*line == '\0') {
+		return NULL;
+	}
+	char *nl = strchr(line, '\n');
+	if (nl != NULL) {
+		*nl = '\0';
+		*cursor = nl + 1;
+	} else {
+		*cursor += strlen(line);
+	}
+	return line;
+}
+
+static inline void od_array_reverse_p(void **arr, size_t start, size_t end)
+{
+	while (start < end) {
+		void *tmp = arr[start];
+		arr[start] = arr[end];
+		arr[end] = tmp;
+
+		++start;
+		--end;
+	}
+}
+
+static inline void od_array_rotate_left_p(void **arr, size_t n, size_t k)
+{
+	if (n <= 1) {
+		return;
+	}
+
+	k %= n;
+
+	if (k == 0) {
+		return;
+	}
+
+	od_array_reverse_p(arr, 0, k - 1);
+	od_array_reverse_p(arr, k, n - 1);
+	od_array_reverse_p(arr, 0, n - 1);
+}
+
+static inline void od_insertion_sort_p(void **arr, size_t n,
+				       int (*cmp)(void *arg, const void *a,
+						  const void *b),
+				       void *arg)
+{
+	for (size_t i = 1; i < n; ++i) {
+		void *key = arr[i];
+		size_t j = i;
+
+		while (j > 0 && cmp(arg, arr[j - 1], key) > 0) {
+			arr[j] = arr[j - 1];
+			--j;
+		}
+
+		arr[j] = key;
+	}
+}

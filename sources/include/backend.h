@@ -1,0 +1,75 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <kiwi/kiwi.h>
+#include <types.h>
+#include <wait_event.h>
+#include <storage.h>
+#include <tsa.h>
+#include <tls_config.h>
+
+int od_backend_connect(od_server_t *, kiwi_params_t *, od_client_t *,
+		       od_rule_storage_t *);
+
+typedef enum {
+	OD_TSA_CHECK_OK,
+	OD_TSA_CHECK_FAIL,
+	OD_TSA_CHECK_BACKEND_ERROR,
+} od_tsa_check_result_t;
+
+od_tsa_check_result_t od_backend_check_tsa(od_rule_storage_t *,
+					   od_storage_endpoint_t *,
+					   od_server_t *, od_client_t *,
+					   od_target_session_attrs_t);
+
+int od_backend_connect_cancel(od_server_t *, od_rule_storage_t *,
+			      const od_address_t *, kiwi_key_t *);
+
+typedef enum {
+	/* obey tls_mode, i.e. plaintext for the first attempt of "allow" */
+	OD_BACKEND_TLS_DEFAULT,
+	/* negotiate TLS even if tls_mode alone would have chosen plaintext */
+	OD_BACKEND_TLS_NEGOTIATE,
+} od_backend_tls_attempt_t;
+
+/* need perform startup after this */
+int od_backend_connect_to(od_server_t *, const od_address_t *, od_tls_opts_t *,
+			  od_backend_tls_attempt_t);
+
+int od_backend_startup(od_server_t *server, kiwi_params_t *route_params,
+		       od_client_t *client);
+
+/*
+ * startup preallocated connection
+ * for connections that was created for min_pool_size
+ */
+int od_backend_startup_preallocated(od_server_t *server,
+				    kiwi_params_t *route_params,
+				    od_client_t *client);
+
+void od_backend_close_connection(od_server_t *);
+void od_backend_abort_connection(od_server_t *);
+void od_backend_close(od_server_t *);
+void od_backend_error(od_server_t *, char *, uint32_t);
+
+int od_backend_update_parameter(od_server_t *, char *, uint32_t, int);
+int od_backend_ready(od_server_t *, char *, uint32_t);
+int od_backend_ready_wait(od_server_t *, uint32_t, od_wait_event_t wait_event);
+
+od_retcode_t od_backend_query_send(od_server_t *server, const char *query,
+				   char *param, int len, uint32_t timeout_ms);
+od_retcode_t od_backend_query(od_server_t *, char *, char *, int, uint32_t);
+
+int od_backend_not_connected(od_server_t *);
+
+int od_backend_need_startup(od_server_t *);
+
+int od_backend_update_endpoint_status(od_instance_t *instance,
+				      od_client_t *client, od_server_t *server,
+				      const char *lag_query,
+				      od_storage_endpoint_t *endpoint);

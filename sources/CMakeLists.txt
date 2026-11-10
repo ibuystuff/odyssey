@@ -1,45 +1,535 @@
+# To make postgresql sources do not use backend functions
+add_definitions(-DFRONTEND)
+
+add_definitions(-D_GNU_SOURCE)
+
+option(USE_UCONTEXT "Use ucontext library for context switches" off)
+option(MM_MEM_PROF "Built-in memory profiling" off)
+option(USE_TCMALLOC "Use TCMalloc" off)
+option(USE_TCMALLOC_PROFILE "Use TCMalloc with profiling" off)
+option(ENABLE_SSL_KEYLOG "Enable OpenSSL TLS key logging support" off)
+option(ENABLE_INJECTION_POINTS "Enable test injection points" OFF)
 
 set(od_binary ${CMAKE_PROJECT_NAME})
 set(od_src
-    pid.c
+    kiwi/md5.c
+    kiwi/options.c
+    kiwi/var.c
+    machinarium/ds/vrb.c
+    machinarium/ds/hash.c
+    machinarium/ds/hm.c
+    machinarium/ds/vector.c
+    machinarium/ds/queue.c
+    machinarium/ds/heap.c
+    machinarium/ds/intrusive/lf-stack.c
+    machinarium/thread.c
+    machinarium/lrand48.c
+    machinarium/loop.c
+    machinarium/clock.c
+    machinarium/socket.c
+    machinarium/file.c
+    machinarium/stat.c
+    machinarium/context_stack.c
+    machinarium/context.c
+    machinarium/coroutine.c
+    machinarium/coroutine_cache.c
+    machinarium/scheduler.c
+    machinarium/call.c
+    machinarium/signal_mgr.c
+    machinarium/event_mgr.c
+    machinarium/eventfd.c
+    machinarium/machine.c
+    machinarium/mm.c
+    machinarium/machine_mgr.c
+    machinarium/msg_cache.c
+    machinarium/msg.c
+    machinarium/mutex.c
+    machinarium/memory.c
+    machinarium/channel.c
+    machinarium/channel_api.c
+    machinarium/task_mgr.c
+    machinarium/tls.c
+    machinarium/io.c
+    machinarium/close.c
+    machinarium/connect.c
+    machinarium/bind.c
+    machinarium/backtrace.c
+    machinarium/cond.c
+    machinarium/read.c
+    machinarium/write.c
+    machinarium/accept.c
+    machinarium/ring_buffer.c
+    machinarium/dns.c
+    machinarium/wait_list.c
+    machinarium/wait_flag.c
+    machinarium/thread_pool.c
+    machinarium/wait_group.c
+    machinarium/zpq_stream.c
+    machinarium/compression.c
+    machinarium/cert_hash.c
+    machinarium/sem.c
+    alloc/linear.c
+    cfg/diag.c
+    cfg/model.c
+    cfg/keywords.c
+    cfg/reader.c
+    cfg/ctx.c
+    cfg/convert.c
+    od_memory.c
+    affinity.c
+    balancing.c
     daemon.c
+    pid.c
     logger.c
+    od_assert.c
+    pool.c
+    port.c
+    rules.c
     config.c
-    config_reader.c
-    id.c
-    instance.c
-    server_pool.c
-    client_pool.c
-    route_pool.c
-    io.c
-    system.c
+    autoconf.c
+    dns.c
+    route.c
     router.c
-    console.c
+    relay.c
+    virtual.c
+    global.c
+    system.c
+    stream.c
+    scram.c
+    cron.c
     worker.c
-    worker_pool.c
+    tls.c
+    attribute.c
+    auth_query.c
+    auth.c
+    cancel.c
+    client.c
+    console.c
+    deploy.c
+    reset.c
+    pstmt.c
+    sql_pstmt.c
+    analyze.c
+    clients_map.c
     frontend.c
     backend.c
-    reset.c
-    deploy.c
-    auth.c
-    auth_query.c
-    cancel.c
-    cron.c
-    tls.c
-    main.c
+    instance.c
+    duration.c
+    misc.c
+    io.c
+    tdigest.c
+    module.c
+    attach.c
+    multi_pool.c
+    counter.c
+    err_logger.c
+    setproctitle.c
+    restart_sync.c
+    readahead.c
+    rate.c
+    soft_oom.c
+    sighandler.c
+    systemd_notify.c
+    ejection.c
+    thread_global.c
+    host_watcher.c
+    compression.c
+    option.c
+    tls_config.c
+    tsa.c
+    query.c
+    storage.c
+    wait_event.c
+    server.c
+    shared_pool.c
+    address.c
+    hba.c
+    hba_rule.c
+    mdb_iamproxy.c
+    external_auth.c
+    group.c
+    xplan.c
+    common/base64.c
+    common/saslprep.c
+    common/cryptohash_openssl.c
+    common/hmac.c
+    common/md5.c
+    common/scram-common.c
+    common/fe_memutils.c
+    common/unicode_norm.c
+    common/wchar.c
+    common/string.c)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND od_src machinarium/epoll.c)
+elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin|.*BSD")
+    list(APPEND od_src machinarium/kqueue.c)
+else()
+    message(FATAL_ERROR "Unsupported platform for machinarium poll backend: ${CMAKE_SYSTEM_NAME}")
+endif()
+
+message(STATUS "Poll backend: ${CMAKE_SYSTEM_NAME}")
+
+set(CONFIG_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/cfg)
+file(MAKE_DIRECTORY ${CONFIG_GEN_DIR})
+
+BISON_TARGET(cfg_parser
+    cfg/parse.y
+    ${CONFIG_GEN_DIR}/parse.tab.c
+    DEFINES_FILE ${CONFIG_GEN_DIR}/parse.tab.h
+    COMPILE_FLAGS "-Werror -Wall"
+)
+FLEX_TARGET(cfg_scanner
+    cfg/scan.l
+    ${CONFIG_GEN_DIR}/scan.c
+    COMPILE_FLAGS "--header-file=${CONFIG_GEN_DIR}/scan.h"
+)
+ADD_FLEX_BISON_DEPENDENCY(cfg_scanner cfg_parser)
+list(APPEND od_src ${FLEX_cfg_scanner_OUTPUTS} ${BISON_cfg_parser_OUTPUTS})
+
+set(SQL_MINIMAL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/sql/minimal)
+file(MAKE_DIRECTORY ${SQL_MINIMAL_GEN_DIR})
+
+BISON_TARGET(sql_parser
+    sql/minimal/parse.y
+    ${SQL_MINIMAL_GEN_DIR}/parse.tab.c
+    DEFINES_FILE ${SQL_MINIMAL_GEN_DIR}/parse.tab.h
+    COMPILE_FLAGS "-Werror -Wall"
+)
+FLEX_TARGET(sql_scanner
+    sql/minimal/scan.l
+    ${SQL_MINIMAL_GEN_DIR}/scan.c
+    COMPILE_FLAGS "--header-file=${SQL_MINIMAL_GEN_DIR}/scan.h -CF -8"
+)
+ADD_FLEX_BISON_DEPENDENCY(sql_scanner sql_parser)
+set_source_files_properties(${FLEX_sql_scanner_OUTPUTS} PROPERTIES
+    COMPILE_FLAGS "-Wno-unused-function"
+)
+list(APPEND od_src
+    ${FLEX_sql_scanner_OUTPUTS}
+    ${BISON_sql_parser_OUTPUTS}
+    sql/minimal/ast.c
+    sql/minimal/ctx.c
+    sql/minimal/keywords.c
+    sql/minimal/parser.c
 )
 
-configure_file("version.h.cmake" "version.h")
+# Full PostgreSQL-compatible SQL parser
+set(SQL_FULL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/sql/full)
+file(MAKE_DIRECTORY ${SQL_FULL_GEN_DIR})
+
+BISON_TARGET(sql_full_parser
+    sql/full/gram.y
+    ${SQL_FULL_GEN_DIR}/gram.tab.c
+    DEFINES_FILE ${SQL_FULL_GEN_DIR}/gram.tab.h
+    COMPILE_FLAGS "-Wall -Wno-precedence -Wno-empty-rule"
+)
+FLEX_TARGET(sql_full_scanner
+    sql/full/scan.l
+    ${SQL_FULL_GEN_DIR}/scan.c
+    COMPILE_FLAGS "--header-file=${SQL_FULL_GEN_DIR}/scan.h -CF -p -p"
+)
+ADD_FLEX_BISON_DEPENDENCY(sql_full_scanner sql_full_parser)
+set_source_files_properties(${FLEX_sql_full_scanner_OUTPUTS} PROPERTIES
+    COMPILE_FLAGS "-Wno-unused-function -Wno-macro-redefined -Wno-unused-parameter -Wno-missing-field-initializers"
+)
+set_source_files_properties(${BISON_sql_full_parser_OUTPUTS} PROPERTIES
+    COMPILE_FLAGS "-Wno-macro-redefined -Wno-unused-but-set-variable -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-unused-value -Wno-unused-parameter -Wno-int-to-pointer-cast -Wno-constant-conversion -Wno-shift-count-overflow"
+)
+list(APPEND od_src
+    ${FLEX_sql_full_scanner_OUTPUTS}
+    ${BISON_sql_full_parser_OUTPUTS}
+    sql/full/parser.c
+    sql/full/ctx.c
+    sql/full/keywords.c
+    sql/full/kwlookup.c
+    sql/full/list.c
+    sql/full/makefuncs.c
+    sql/full/scansup.c
+    sql/full/pg_compat.c
+)
+
+set(CONSOLE_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/console)
+file(MAKE_DIRECTORY ${CONSOLE_GEN_DIR})
+
+BISON_TARGET(console_parser
+    console/parse.y
+    ${CONSOLE_GEN_DIR}/parse.tab.c
+    DEFINES_FILE ${CONSOLE_GEN_DIR}/parse.tab.h
+    COMPILE_FLAGS "-Werror -Wall"
+)
+FLEX_TARGET(console_scanner
+    console/scan.l
+    ${CONSOLE_GEN_DIR}/scan.c
+    COMPILE_FLAGS "--header-file=${CONSOLE_GEN_DIR}/scan.h"
+)
+ADD_FLEX_BISON_DEPENDENCY(console_scanner console_parser)
+set_source_files_properties(${FLEX_console_scanner_OUTPUTS} PROPERTIES
+    COMPILE_FLAGS "-Wno-unused-function"
+)
+list(APPEND od_src
+    ${FLEX_console_scanner_OUTPUTS}
+    ${BISON_console_parser_OUTPUTS}
+    console/ast.c
+    console/ctx.c
+    console/keywords.c
+    console/parser.c
+)
+
+if (USE_TCMALLOC)
+    find_library(TCMALLOC_STATIC_LIB
+        NAMES libtcmalloc.a
+        PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+    )
+
+    if(NOT TCMALLOC_STATIC_LIB)
+        message(FATAL_ERROR "Static tcmalloc not found! Is libtcmalloc-dev installed?")
+    endif()
+
+    message(STATUS "TCMALLOC STATIC LIB:       ${TCMALLOC_STATIC_LIB}")
+
+    set(od_libraries ${od_libraries} ${TCMALLOC_STATIC_LIB} stdc++ unwind)
+endif()
+
+if (USE_TCMALLOC_PROFILE)
+    find_library(TCMALLOC_PROFILER_STATIC_LIB 
+        NAMES libtcmalloc_and_profiler.a
+        PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+    )
+
+    if(NOT TCMALLOC_PROFILER_STATIC_LIB)
+        message(FATAL_ERROR "Static tcmalloc profiler not found!")
+    endif()
+
+    message(STATUS "TCMALLOC STATIC LIB:       ${TCMALLOC_PROFILER_STATIC_LIB}")
+    set(od_libraries ${od_libraries} ${TCMALLOC_PROFILER_STATIC_LIB} stdc++ unwind)
+endif()
+
+if (NOT USE_UCONTEXT)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        set_property(SOURCE machinarium/context_swap_x64.S PROPERTY LANGUAGE C)
+        list(APPEND od_src machinarium/context_swap_x64.S)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|i.86")
+        set_property(SOURCE machinarium/context_swap_x32.S PROPERTY LANGUAGE C)
+        list(APPEND od_src machinarium/context_swap_x32.S)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch64")
+        set_property(SOURCE machinarium/context_swap_aarch64.S PROPERTY LANGUAGE C)
+        list(APPEND od_src machinarium/context_swap_aarch64.S)
+    else()
+        message(WARNING "Fallback to ucontext due to unsupported arch: ${CMAKE_SYSTEM_PROCESSOR}")
+        set(USE_UCONTEXT on)
+    endif()
+endif()
+
+message(STATUS "USE_UCONTEXT:           ${USE_UCONTEXT}")
+message(STATUS "MM_MEM_PROF:            ${MM_MEM_PROF}")
+message(STATUS "USE_TCMALLOC:           ${USE_TCMALLOC}")
+message(STATUS "USE_TCMALLOC_PROFILE:   ${USE_TCMALLOC_PROFILE}")
+message(STATUS "ENABLE_INJECTION_POINTS: ${ENABLE_INJECTION_POINTS}")
+
+configure_file("include/build.h.cmake" "build.h")
+configure_file("include/machinarium/build.h.cmake" "machinarium/build.h")
+
+if (ENABLE_INJECTION_POINTS)
+    list(APPEND od_src injection.c)
+endif()
+
+if (PAM_FOUND)
+    list(APPEND od_src pam.c)
+endif()
+
+if (LDAP_FOUND)
+    list(APPEND od_src ldap.c)
+endif()
+
+if (PROM_FOUND)
+    list(APPEND od_src prom_metrics.c)
+endif()
 
 include_directories("${PROJECT_SOURCE_DIR}/")
+include_directories("${PROJECT_SOURCE_DIR}/sources")
+include_directories("${PROJECT_SOURCE_DIR}/sources/include")
 include_directories("${PROJECT_BINARY_DIR}/")
+include_directories("${PROJECT_BINARY_DIR}/sources")
+include_directories("${PROJECT_BINARY_DIR}/sources/include")
 
-add_executable(${od_binary} ${od_src})
+add_executable(${od_binary} ${od_src} main.c)
 add_dependencies(${od_binary} build_libs)
+
+target_include_directories(${od_binary} PRIVATE ${CONFIG_GEN_DIR} ${SQL_MINIMAL_GEN_DIR} ${SQL_FULL_GEN_DIR} ${CONSOLE_GEN_DIR})
 
 if(THREADS_HAVE_PTHREAD_ARG)
     set_property(TARGET ${od_binary} PROPERTY COMPILE_OPTIONS "-pthread")
     set_property(TARGET ${od_binary} PROPERTY INTERFACE_COMPILE_OPTIONS "-pthread")
 endif()
 
+if (ENABLE_SSL_KEYLOG)
+    target_compile_definitions(${od_binary} PRIVATE OD_ENABLE_SSL_KEYLOG=1)
+endif()
+
+message(STATUS "od_libraries:   ${od_libraries}")
+
 target_link_libraries(${od_binary} ${od_libraries} ${CMAKE_THREAD_LIBS_INIT})
+if(NOT APPLE)
+    target_link_libraries(${od_binary} m)
+endif()
+
+if (BUILD_COMPRESSION)
+    target_link_libraries(${od_binary} ${compression_libraries})
+endif()
+
+# Unit test building
+
+set(od_test_binary odyssey_test)
+set(od_test_src
+    tests/odyssey_test.c
+    tests/kiwi/test_kiwi_enquote.c
+    tests/kiwi/test_kiwi_pgoptions.c
+    tests/kiwi/test_kiwi_fe_read_auth.c
+    tests/kiwi/test_kiwi_be_read_query.c
+    tests/kiwi/test_kiwi_cancel.c
+    tests/kiwi/test_kiwi_msg_size_limits.c
+    tests/machinarium/test_init.c
+    tests/machinarium/test_create0.c
+    tests/machinarium/test_create1.c
+    tests/machinarium/test_config.c
+    tests/machinarium/test_context_switch.c
+    tests/machinarium/test_sleep.c
+    tests/machinarium/test_sleep_yield.c
+    tests/machinarium/test_sleep_cancel0.c
+    tests/machinarium/test_join.c
+    tests/machinarium/test_condition0.c
+    tests/machinarium/test_stat.c
+    tests/machinarium/test_eventfd.c
+    tests/machinarium/test_signal0.c
+    tests/machinarium/test_signal1.c
+    tests/machinarium/test_channel_create.c
+    tests/machinarium/test_channel_rw0.c
+    tests/machinarium/test_channel_rw1.c
+    tests/machinarium/test_channel_rw2.c
+    tests/machinarium/test_channel_rw3.c
+    tests/machinarium/test_channel_rw4.c
+    tests/machinarium/test_channel_timeout.c
+    tests/machinarium/test_channel_cancel.c
+    tests/machinarium/test_channel_shared_create.c
+    tests/machinarium/test_channel_shared_rw0.c
+    tests/machinarium/test_channel_shared_rw1.c
+    tests/machinarium/test_channel_shared_rw2.c
+    tests/machinarium/test_sleeplock.c
+    tests/machinarium/test_producer_consumer0.c
+    tests/machinarium/test_producer_consumer1.c
+    tests/machinarium/test_producer_consumer2.c
+    tests/machinarium/test_io_new.c
+    tests/machinarium/test_connect.c
+    tests/machinarium/test_connect_timeout.c
+    tests/machinarium/test_connect_cancel0.c
+    tests/machinarium/test_connect_cancel1.c
+    tests/machinarium/test_accept_timeout.c
+    tests/machinarium/test_accept_cancel.c
+    tests/machinarium/test_advice_keepalive_usr_timeout.c
+    tests/machinarium/test_wait_list_compare_wait_timeout.c
+    tests/machinarium/test_wait_list_notify_after_compare_wait.c
+    tests/machinarium/test_wait_list_compare_wait_wrong_value.c
+    tests/machinarium/test_wait_list_without_notify.c
+    tests/machinarium/test_wait_list_notify_after_wait.c
+    tests/machinarium/test_wait_list_one_producer_multiple_consumers.c
+    tests/machinarium/test_wait_list_one_producer_multiple_consumers_threads.c
+    tests/machinarium/test_wait_list_notify_all.c
+    tests/machinarium/test_machine_reserve_ids.c
+    tests/machinarium/test_wait_group_simple.c
+    tests/machinarium/test_wait_group_timeout.c
+    tests/machinarium/test_wait_group_lifetime.c
+    tests/machinarium/test_wait_flag_simple.c
+    tests/machinarium/test_wait_flag_timeout.c
+    tests/machinarium/test_hm_hash.c
+    tests/machinarium/test_hm_dist.c
+    tests/machinarium/test_getaddrinfo0.c
+    tests/machinarium/test_getaddrinfo1.c
+    tests/machinarium/test_getaddrinfo2.c
+    tests/machinarium/test_client_server0.c
+    tests/machinarium/test_client_server1.c
+    tests/machinarium/test_client_server2.c
+    tests/machinarium/test_client_server_unix_socket.c
+    tests/machinarium/test_client_server_unix_socket_no_msg.c
+    tests/machinarium/test_check_stack_depth.c
+    tests/machinarium/test_coroutine_names.c
+    tests/machinarium/test_mutex_threads.c
+    tests/machinarium/test_mutex_coroutines.c
+    tests/machinarium/test_mutex_timeout.c
+    tests/machinarium/test_read_10mb0.c
+    tests/machinarium/test_read_10mb1.c
+    tests/machinarium/test_read_10mb2.c
+    tests/machinarium/test_read_timeout.c
+    tests/machinarium/test_read_cancel.c
+    tests/machinarium/test_read_var.c
+    tests/machinarium/test_read_close.c
+    tests/machinarium/test_ring_buffer.c
+    tests/machinarium/test_tls0.c
+    tests/machinarium/test_tls_verify_error.c
+    tests/machinarium/test_tls_cache.c
+    tests/machinarium/test_tls_unix_socket.c
+    tests/machinarium/test_tls_unix_socket_no_msg.c
+    tests/machinarium/test_tls_read_10mb0.c
+    tests/machinarium/test_tls_read_10mb1.c
+    tests/machinarium/test_tls_read_10mb2.c
+    tests/machinarium/test_tls_read_multithread.c
+    tests/machinarium/test_tls_read_var.c
+    tests/machinarium/test_tsan_simple_race_example.c
+    tests/machinarium/test_vrb.c
+    tests/machinarium/test_mutex_bench.c
+    tests/machinarium/test_queue.c
+    tests/machinarium/test_heap.c
+    tests/machinarium/test_clock.c
+    tests/machinarium/test_lf_stack.c
+    tests/machinarium/test_sem.c
+    tests/odyssey/test_attribute.c
+    tests/odyssey/test_tdigest.c
+    tests/odyssey/test_util.c
+    tests/odyssey/test_hba_parse.c
+    tests/odyssey/test_address.c
+    tests/odyssey/test_affinity.c
+    tests/odyssey/test_pstmt.c
+    tests/odyssey/test_clients_map.c
+    tests/odyssey/test_router_free.c
+    tests/odyssey/test_duration_parse.c
+    tests/odyssey/test_misc.c
+    tests/odyssey/test_thread_pool.c
+    tests/odyssey/test_linear_alloc.c
+    tests/odyssey/test_scram.c
+    tests/odyssey/test_sql_parser.c
+    tests/odyssey/test_sql_full_parser.c
+    tests/odyssey/test_sql_pstmt.c
+    tests/odyssey/test_console_parser.c
+    tests/odyssey/test_config_field.c
+    tests/odyssey/test_autoconf.c
+    tests/odyssey/test_soft_oom.c
+    tests/odyssey/test_wait_event.c)
+
+include_directories("${PROJECT_SOURCE_DIR}/tests")
+include_directories("${PROJECT_BINARY_DIR}/tests")
+
+file(COPY tests/machinarium/ca.crt DESTINATION machinarium)
+file(COPY tests/machinarium/client.crt DESTINATION machinarium)
+file(COPY tests/machinarium/client.key DESTINATION machinarium)
+file(COPY tests/machinarium/server.crt DESTINATION machinarium)
+file(COPY tests/machinarium/server.key DESTINATION machinarium)
+
+add_executable(${od_test_binary} ${od_test_src} ${od_src})
+add_dependencies(${od_test_binary} build_libs)
+
+if(THREADS_HAVE_PTHREAD_ARG)
+    set_property(TARGET ${od_test_binary} PROPERTY COMPILE_OPTIONS "-pthread")
+    set_property(TARGET ${od_test_binary} PROPERTY INTERFACE_COMPILE_OPTIONS "-pthread")
+endif()
+
+target_include_directories(${od_test_binary} PRIVATE ${CONFIG_GEN_DIR} ${SQL_MINIMAL_GEN_DIR} ${SQL_FULL_GEN_DIR} ${CONSOLE_GEN_DIR})
+
+target_link_libraries(${od_test_binary} ${od_libraries} ${CMAKE_THREAD_LIBS_INIT})
+
+if(NOT APPLE)
+    target_link_libraries(${od_test_binary} m)
+endif()
+
+if (BUILD_COMPRESSION)
+    target_link_libraries(${od_test_binary} ${compression_libraries})
+endif()

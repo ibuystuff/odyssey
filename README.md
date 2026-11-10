@@ -1,15 +1,20 @@
 <p align="center">
-	<img src="documentation/odyssey.png" width="35%" height="35%" /><br>
+	<img src="docs/img/odyssey.png" width="35%" height="35%" /><br>
 </p>
 <br>
 
 ## Odyssey
 
-Advanced multi-threaded PostgreSQL connection pooler and request router.
+AI-ready advanced multi-threaded PostgreSQL connection pooler and request router.
 
 #### Project status
 
-Although we run Odyssey in production, the project is currently in Beta. We appreciate any kind of feedback and contribution to the project.
+Odyssey is production-ready, it is being used in large production setups. We appreciate any kind of feedback and contribution to the project.
+
+<a href="https://scan.coverity.com/projects/yandex-odyssey">
+  <img alt="Coverity Scan Build Status"
+       src="https://scan.coverity.com/projects/20374/badge.svg"/>
+</a>
 
 ### Design goals and main features
 
@@ -38,7 +43,9 @@ Each defined pool can have separate authentication, pooling mode and limits sett
 #### Authentication
 
 Odyssey has full-featured `SSL/TLS` support and common authentication methods
-like: `md5` and `clear text` both for client and server authentication.
+like: `md5` and `clear text` both for client and server authentication. 
+Odyssey supports PAM & LDAP authentication, this methods operates similarly to `clear text` auth except that it uses 
+PAM/LDAP to validate user name/password pairs. PAM optionally checks the connected remote host name or IP address.
 Additionally it allows to block each pool user separately.
 
 #### Logging
@@ -48,132 +55,56 @@ Any log events and client error responses include the id, which then can be used
 uniquely identify client and track actions. Odyssey can save log events into log file and
 using system logger.
 
-#### Architecture and internals
-
-Odyssey has sophisticated asynchronous multi-threaded architecture which
-is driven by custom made coroutine engine: [machinarium](https://github.com/yandex/odyssey/tree/master/third_party/machinarium).
-Main idea behind coroutine design is to make event-driven asynchronous applications to look and feel
-like being written in synchronous-procedural manner instead of using traditional
-callback approach.
-
-One of the main goal was to make code base understandable for new developers and
-to make an architecture easily extensible for future development.
-
-More information: [Architecture and internals](documentation/internals.md).
 
 #### Build instructions
 
 Currently Odyssey runs only on Linux. Supported platforms are x86/x86_64.
 
-To build you will need:
+To build you will need in ubuntu distros:
 
-* cmake >= 2.8
+* cmake >= 3.12.4
 * gcc >= 4.6
-* openssl 1.0.*
+* openssl
+* flex
+* bison
+
+Optional dependencies:
+
+* libsystemd-dev (for systemd notify support)
+
+And for fedora-based distros:
+
+* openssl-devel
+* flex
+* bison
+* systemd-devel (optional, for systemd notify)
+
+> **Note (since 1.5.3):** the config parser is now generated from a Flex/Bison
+> grammar at build time. `flex` and `bison` must be installed before running
+> cmake.
+
+For Mac-OS you will need:
 
 ```sh
 git clone git://github.com/yandex/odyssey.git
 cd odyssey
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+make local_build
+```
+Adapt odyssey-dev.conf then:
+```sh
+make local_run
 ```
 
-### Configuration reference
+Alternatively:
+```sh
+make console_run
+```
 
-##### Service
+### Documentation
 
-* [include](documentation/configuration.md#include-string)
-* [daemonize](documentation/configuration.md#daemonize-yesno)
-* [pid\_file](documentation/configuration.md#pid_file-string)
+See [docs](docs/) dir with more documentation info. You can serve docs locally by `make serve_docs`.
 
-##### Logging
+You can also read about Odyssey on our [website](https://pg-odyssey.tech/).
+### Support
 
-* [log\_file](documentation/configuration.md#log_file-string)
-* [log\_format](documentation/configuration.md#log_format-string)
-* [log\_to\_stdout](documentation/configuration.md#log_to_stdout-yesno)
-* [log\_syslog](documentation/configuration.md#log_syslog-yesno)
-* [log\_syslog\_ident](documentation/configuration.md#log_syslog_ident-string)
-* [log\_syslog\_facility](documentation/configuration.md#log_syslog_facility-string)
-* [log\_debug](documentation/configuration.md#log_debug-yesno)
-* [log\_config](documentation/configuration.md#log_config-yesno)
-* [log\_session](documentation/configuration.md#log_session-yesno)
-* [log\_query](documentation/configuration.md#log_query-yesno)
-* [log\_stats](documentation/configuration.md#log_stats-yesno)
-* [stats\_interval](documentation/configuration.md#stats_interval-integer)
-
-##### Performance
-
-* [workers](documentation/configuration.md#workers-integer)
-* [resolvers](documentation/configuration.md#resolvers-integer)
-* [readahead](documentation/configuration.md#readahead-integer)
-* [pipeline](documentation/configuration.md#pipeline-integer)
-* [cache](documentation/configuration.md#cache-integer)
-* [cache\_chunk](documentation/configuration.md#cache_chunk-integer)
-* [cache\_coroutine](documentation/configuration.md#cache_coroutine-integer)
-* [nodelay](documentation/configuration.md#nodelay-yesno)
-* [keepalive](documentation/configuration.md#keepalive-integer)
-
-##### Global limits
-
-* [client\_max](documentation/configuration.md#client_max-integer)
-
-##### Listen
-
-* [host](documentation/configuration.md#host-string)
-* [port](documentation/configuration.md#port-integer)
-* [backlog](documentation/configuration.md#backlog-integer)
-* [tls](documentation/configuration.md#tls-string)
-* [tls\_ca\_file](documentation/configuration.md#tls-string)
-* [tls\_key\_file](documentation/configuration.md#tls-string)
-* [tls\_cert\_file](documentation/configuration.md#tls-string)
-* [tls\_protocols](documentation/configuration.md#tls-string)
-* [example](documentation/configuration.md#example)
-
-##### Routing
-
-* [overview](documentation/configuration.md#routing-rules)
-
-##### Storage
-
-* [overview](documentation/configuration.md#storage)
-* [type](documentation/configuration.md#type-string)
-* [host](documentation/configuration.md#host-string-1)
-* [port](documentation/configuration.md#port-integer-1)
-* [tls](documentation/configuration.md#tls-string-1)
-* [tls\_ca\_file](documentation/configuration.md#tls-string-1)
-* [tls\_key\_file](documentation/configuration.md#tls-string-1)
-* [tls\_cert\_file](documentation/configuration.md#tls-string-1)
-* [tls\_protocols](documentation/configuration.md#tls-string-1)
-* [example](documentation/configuration.md#example-1)
-
-##### Database and user
-
-* [overview](documentation/configuration.md#database-and-user)
-* [authentication](documentation/configuration.md#authentication-string)
-* [password](documentation/configuration.md#password-string)
-* [auth\_common\_name](documentation/configuration.md#auth_common_name-defaultstring)
-* [auth\_query](documentation/configuration.md#auth_query-string)
-* [auth\_query\_db](documentation/configuration.md#auth_query-string)
-* [auth\_query\_user](documentation/configuration.md#auth_query-string)
-* [client\_max](documentation/configuration.md#client_max-integer-1)
-* [storage](documentation/configuration.md#storage-string)
-* [storage\_db](documentation/configuration.md#storage-string)
-* [storage\_user](documentation/configuration.md#storage-string)
-* [storage\_password](documentation/configuration.md#storage-string)
-* [pool](documentation/configuration.md#pool-string)
-* [pool\_size](documentation/configuration.md#pool_size-integer)
-* [pool\_timeout](documentation/configuration.md#pool_timeout-integer)
-* [pool\_ttl](documentation/configuration.md#pool_ttl-integer)
-* [pool\_cancel](documentation/configuration.md#pool_cancel-yesno)
-* [pool\_rollback](documentation/configuration.md#pool_rollback-yesno)
-* [client\_fwd\_error](documentation/configuration.md#client_fwd_error-yesno)
-* [log\_debug](documentation/configuration.md#log_debug-yesno-1)
-* [example](documentation/configuration.md#example-remote)
-* [example console](documentation/configuration.md#example-admin-console)
-
-##### Architecture and Internals
-
-* [overview](documentation/internals.md)
-* [error codes](documentation/internals.md#client-error-codes)
+We have a [Telegram chat](https://t.me/+-P-dtScP5_A5ZTRi) to discuss Odyssey usage and development.

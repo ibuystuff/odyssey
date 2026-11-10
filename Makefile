@@ -1,0 +1,320 @@
+BUILD_TEST_DIR=build
+BUILD_REL_DIR=build
+BUILD_TEST_ASAN_DIR=build
+BUILD_TEST_TSAN_DIR=build
+
+FMT_BIN:=clang-format-18
+CMAKE_BIN:=cmake
+
+SKIP_CLEANUP_DOCKER:=
+
+CMAKE_FLAGS:=-DCC_FLAGS=""
+BUILD_TYPE=Release
+
+DEV_CONF=./config-examples/odyssey-dev.conf
+
+ODYSSEY_BUILD_TYPE ?= build_release
+ODYSSEY_TEST_CODENAME ?= noble
+ODYSSEY_TEST_DEBIAN_DISTRO ?= bookworm
+ODYSSEY_TEST_TARGET_PLATFORM ?= linux/$(shell uname -m)
+ODYSSEY_ORACLELINUX_VERSION ?= 8
+ODYSSEY_CC ?= gcc
+ODYSSEY_CMAKE_EXTRA ?=
+PROTO_TEST_TAG ?= all
+
+CMAKE_FLAGS += $(ODYSSEY_CMAKE_EXTRA)
+
+CONCURRENCY:=1
+CURRENT_USER_UID_GID:=$(shell id -u):$(shell id -g)
+OS:=$(shell uname -s)
+ifeq ($(OS), Linux)
+	CONCURRENCY:=$(shell nproc)
+endif
+ifeq ($(OS), Darwin)
+	CONCURRENCY:=$(shell sysctl -n hw.logicalcpu)
+	CMAKE_FLAGS += -DOPENSSL_ROOT_DIR=$(shell brew --prefix openssl@3 2>/dev/null) -DCMAKE_PREFIX_PATH=$(shell brew --prefix 2>/dev/null)
+	CMAKE_FLAGS += -DBISON_EXECUTABLE=$(shell brew --prefix bison 2>/dev/null)/bin/bison
+	CMAKE_FLAGS += -DFLEX_EXECUTABLE=$(shell FLEX_BREW=$(shell brew --prefix flex 2>/dev/null)/bin/flex; if [ -x "$$FLEX_BREW" ]; then echo "$$FLEX_BREW"; else which flex; fi)
+endif
+
+ifeq ($(OS), Darwin)
+STAT_OWNER_CMD := stat -f "%u:%g" .
+else
+STAT_OWNER_CMD := stat -c "%u:%g" .
+endif
+
+.PHONY: clean apply_fmt
+
+clean:
+	rm -fr $(BUILD_REL_DIR)
+	rm -fr $(BUILD_TEST_DIR)
+	rm -fr $(BUILD_TEST_ASAN_DIR)
+
+local_build: clean
+	+$(CMAKE_BIN) -B$(BUILD_TEST_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	+make -C$(BUILD_TEST_DIR) -j$(CONCURRENCY)
+
+local_run: 
+	$(BUILD_TEST_DIR)/sources/odyssey $(DEV_CONF)
+
+console_run: 
+	$(BUILD_TEST_DIR)/sources/odyssey $(DEV_CONF) --console --log_to_stdout # --verbose
+
+check-format:
+	docker build -f docker/format/Dockerfile --tag=odyssey/clang-format-runner .
+	docker run -v .:/odyssey:ro odyssey/clang-format-runner modules sources
+
+format:
+	docker build -f docker/format/Dockerfile --tag=odyssey/clang-format-runner .
+	docker run --user=`$(STAT_OWNER_CMD)` -v .:/odyssey:rw odyssey/clang-format-runner -i modules sources
+
+build_images:
+	docker build -f docker/quickstart/Dockerfile . --tag=odyssey
+
+build_asan:
+	mkdir -p $(BUILD_TEST_ASAN_DIR)
+	cd $(BUILD_TEST_ASAN_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=ASAN $(CMAKE_FLAGS) && make -j$(CONCURRENCY)
+
+# setarch `uname -m` -R ./odyssey ...
+build_tsan:
+	mkdir -p $(BUILD_TEST_TSAN_DIR)
+	cd $(BUILD_TEST_TSAN_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=TSAN $(CMAKE_FLAGS) && make -j$(CONCURRENCY)
+
+build_release:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=Release $(CMAKE_FLAGS) && make -j$(CONCURRENCY)
+
+build_relwithdbginfo:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=RelWithDbgInfo && make -j$(CONCURRENCY)
+
+build_relmemprof:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=RelWithDbgInfo -DMM_MEM_PROF=ON && make -j$(CONCURRENCY)
+
+build_reltcmalloc:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=Release -DUSE_TCMALLOC=ON && make -j$(CONCURRENCY)
+
+build_reltcmalloc_prof:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=Release -DUSE_TCMALLOC_PROFILE=ON && make -j$(CONCURRENCY)
+
+build_reldbgtcmalloc_prof:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=RelWithDbgInfo -DUSE_TCMALLOC_PROFILE=ON && make -j$(CONCURRENCY)
+
+build_reldbgtcmalloc:
+	mkdir -p $(BUILD_REL_DIR)
+	cd $(BUILD_REL_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=RelWithDbgInfo -DUSE_TCMALLOC=ON && make -j$(CONCURRENCY)
+
+build_dbg:
+	mkdir -p $(BUILD_TEST_DIR)
+	cd $(BUILD_TEST_DIR) && $(CMAKE_BIN) .. -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS) && make -j$(CONCURRENCY)
+
+gdb:
+	gdb --args ./build/sources/odyssey $(DEV_CONF) --console --log_to_stdout # --verbose
+
+lldb:
+	lldb -- ./build/sources/odyssey $(DEV_CONF) --console --log_to_stdout
+
+submit-cov:
+	mkdir cov-build && cd cov-build
+	$(COV-BIN-PATH)/cov-build --dir cov-int make -j 4 && tar czvf odyssey.tgz cov-int && curl --form token=$(COV_TOKEN) --form email=$(COV_ISSUER) --form file=@./odyssey.tgz --form version="2" --form description="scalable potgresql connection pooler"  https://scan.coverity.com/builds\?project\=yandex%2Fodyssey
+
+cpack-deb: build_release
+	cd $(BUILD_REL_DIR) && cpack -G DEB
+
+cpack-deb-debug: build_dbg
+	cd $(BUILD_REL_DIR) && cpack -G DEB
+
+cpack-rpm: build_release
+	cd $(BUILD_REL_DIR) && cpack -G RPM
+
+cpack-rpm-debug: build_dbg
+	cd $(BUILD_REL_DIR) && cpack -G RPM
+
+package-bionic:
+	mkdir -p build
+	./docker/dpkg/runner.sh -c bionic -o build
+
+package-jammy:
+	mkdir -p build
+	./docker/dpkg/runner.sh -c jammy -o build
+
+install:
+	install -D build/sources/odyssey $(DESTDIR)/usr/bin/odyssey
+
+quickstart: build_images
+	docker run -d \
+		--rm \
+		--name "odyssey" \
+		-p "6432:6432" \
+	 	-v ./docker/quickstart/config.conf:/etc/odyssey/odyssey.conf \
+		odyssey
+
+dev_run: format local_build console_run
+
+start-test-env-release:
+	docker compose -f ./test/functional/docker-compose.yml down || true
+	ODYSSEY_FUNCTIONAL_BUILD_TYPE=build_release \
+	ODYSSEY_TEST_TARGET=dev-env \
+	ODYSSEY_CC="$(ODYSSEY_CC)" \
+	docker compose -f ./test/functional/docker-compose.yml up --force-recreate --build -d --remove-orphans
+
+start-test-env-dbg:
+	docker compose -f ./test/functional/docker-compose.yml down || true
+	ODYSSEY_FUNCTIONAL_BUILD_TYPE=build_dbg \
+	ODYSSEY_TEST_TARGET=dev-env \
+	ODYSSEY_CC="$(ODYSSEY_CC)" \
+	docker compose -f ./test/functional/docker-compose.yml up --force-recreate --build -d --remove-orphans
+
+start-test-env-asan:
+	docker compose -f ./test/functional/docker-compose.yml down || true
+	ODYSSEY_FUNCTIONAL_BUILD_TYPE=build_asan \
+	ODYSSEY_TEST_TARGET=dev-env \
+	ODYSSEY_CC="$(ODYSSEY_CC)" \
+	docker compose -f ./test/functional/docker-compose.yml up --force-recreate --build -d --remove-orphans
+
+quickstart_test:
+	docker build -f docker/quickstart/Dockerfile . --tag=odyssey
+	docker compose -f ./test/quickstart/docker-compose.yml up --exit-code-from tester --force-recreate --build --remove-orphans
+
+prometheus-legacy-test:
+	docker compose -f ./test/prometheus-legacy/docker-compose.yml down || true
+	ODYSSEY_PROM_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) \
+	docker compose -f ./test/prometheus-legacy/docker-compose.yml up --exit-code-from odyssey --force-recreate --build --remove-orphans
+
+soft-oom-test: build_images
+	docker compose -f ./test/oom/docker-compose.yml down || true
+	docker compose -f ./test/oom/docker-compose.yml up --exit-code-from runner --force-recreate --build --remove-orphans
+
+prom-exporter-test: build_images
+	docker compose -f ./test/prom-exporter/docker-compose.yml up --exit-code-from tester --force-recreate --build --remove-orphans
+
+async-notice-test: build_images
+	docker compose -f ./test/async-notice/docker-compose.yml up --exit-code-from tester --force-recreate --build --remove-orphans
+
+proto-test:
+	ODYSSEY_PROTO_TEST_TAG=$(PROTO_TEST_TAG) \
+	ODYSSEY_CC="$(ODYSSEY_CC)" \
+	ODYSSEY_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) \
+	ODYSSEY_PROTO_TEST_SPQR_REF=$(shell git ls-remote https://github.com/pg-sharding/spqr HEAD | cut -f1) \
+	docker compose -f ./test/proto/docker-compose.yml up --exit-code-from tester --force-recreate --build --remove-orphans
+
+functional-test:
+	ODYSSEY_FUNCTIONAL_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) \
+	ODYSSEY_TEST_TARGET=functional-entrypoint \
+	ODYSSEY_FUNCTIONAL_TESTS_SELECTOR="$(ODYSSEY_TEST_SELECTOR)" \
+	ODYSSEY_CC="$(ODYSSEY_CC)" \
+	docker compose -f ./test/functional/docker-compose.yml up --exit-code-from odyssey --build --remove-orphans
+
+jemalloc-test:
+	docker compose -f ./test/jeamalloc/docker-compose.yml down || true
+	ODYSSEY_JEMALLOC_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) \
+	docker compose -f ./test/jemalloc/docker-compose.yml up --exit-code-from runner --build --remove-orphans
+
+stress-tests:
+	docker compose -f ./test/stress/docker-compose.yml down || true
+
+	ODYSSEY_STRESS_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) \
+	ODYSSEY_STRESS_TEST_TARGET=stress-entrypoint \
+	docker compose -f ./test/stress/docker-compose.yml up --exit-code-from runner --build --remove-orphans
+
+stress-tests-dev-env:
+	docker compose -f ./test/stress/docker-compose.yml down || true
+
+	ODYSSEY_STRESS_BUILD_TYPE=build_release \
+	ODYSSEY_STRESS_TEST_TARGET=dev-env \
+	docker compose -f ./test/stress/docker-compose.yml up --force-recreate --build -d --remove-orphans
+
+stress-tests-dev-env-dbg:
+	docker compose -f ./test/stress/docker-compose.yml down || true
+
+	ODYSSEY_STRESS_BUILD_TYPE=build_dbg \
+	ODYSSEY_STRESS_TEST_TARGET=dev-env \
+	docker compose -f ./test/stress/docker-compose.yml up --force-recreate --build -d --remove-orphans
+
+replication_test: build_images
+	docker compose -f ./test/replication/docker-compose.yml up --exit-code-from tester --build --remove-orphans --force-recreate
+
+jdbc_test: build_images
+	docker compose -f ./test/drivers/jdbc/docker-compose.yml up --exit-code-from regress_test --build --remove-orphans --force-recreate
+
+userver_test: build_images
+	docker compose -f ./test/drivers/userver/docker-compose.yml up --build --abort-on-container-exit --exit-code-from userver_test --remove-orphans # --force-recreate
+
+regress_test:
+	docker build -f ./test/pg_regress/Dockerfile \
+		--build-arg build_type=$(ODYSSEY_BUILD_TYPE) \
+		--build-arg odyssey_cc=$(ODYSSEY_CC) \
+		--tag=odyssey/regress-tester .
+	docker run odyssey/regress-tester
+
+scram_passthrough_test:
+	docker build -f ./test/scram-passthrough/Dockerfile \
+		--build-arg build_type=$(ODYSSEY_BUILD_TYPE) \
+		--build-arg odyssey_cc=$(ODYSSEY_CC) \
+		--tag=odyssey/scram-passthrough-tester .
+	docker run odyssey/scram-passthrough-tester
+
+ci-unittests:
+	docker build \
+		--platform $(ODYSSEY_TEST_TARGET_PLATFORM) \
+		-f ./test/unit/Dockerfile \
+		--build-arg build_type=$(ODYSSEY_BUILD_TYPE) \
+		--build-arg odyssey_cc=$(ODYSSEY_CC) \
+		--build-arg odyssey_cmake_extra="$(ODYSSEY_CMAKE_EXTRA)" \
+		--tag=odyssey/unit-test-runner .
+	docker run --init odyssey/unit-test-runner
+
+ci-build-check-ubuntu:
+	docker build \
+		--platform $(ODYSSEY_TEST_TARGET_PLATFORM) \
+		-f test/build-test/Dockerfile.ubuntu \
+		--build-arg codename=$(ODYSSEY_TEST_CODENAME) \
+		--tag=odyssey/$(ODYSSEY_TEST_CODENAME)-builder-$(ODYSSEY_TEST_TARGET_PLATFORM) .
+	docker run -e ODYSSEY_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) odyssey/$(ODYSSEY_TEST_CODENAME)-builder-$(ODYSSEY_TEST_TARGET_PLATFORM)
+
+ci-build-check-debian:
+	docker build \
+		--platform $(ODYSSEY_TEST_TARGET_PLATFORM) \
+		-f test/build-test/Dockerfile.debian \
+		--build-arg codename=$(ODYSSEY_TEST_DEBIAN_DISTRO) \
+		--tag=odyssey/$(ODYSSEY_TEST_DEBIAN_DISTRO)-builder-$(ODYSSEY_TEST_TARGET_PLATFORM) .
+	docker run -e ODYSSEY_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) odyssey/$(ODYSSEY_TEST_DEBIAN_DISTRO)-builder-$(ODYSSEY_TEST_TARGET_PLATFORM)
+
+ci-build-check-fedora:
+	docker build \
+		-f test/build-test/Dockerfile.fedora \
+		--tag=odyssey/fedora-img .
+
+ci-build-check-oracle-linux:
+	docker build \
+		-f test/build-test/Dockerfile.oraclelinux \
+		--build-arg version=$(ODYSSEY_ORACLELINUX_VERSION) \
+		--tag=odyssey/oraclelinux-$(ODYSSEY_ORACLELINUX_VERSION)-builder .
+	docker run -e ODYSSEY_BUILD_TYPE=$(ODYSSEY_BUILD_TYPE) odyssey/oraclelinux-$(ODYSSEY_ORACLELINUX_VERSION)-builder
+
+ci-build-check-macos: local_build
+
+build-docs-web:
+	docker build -f docs/Dockerfile --tag=odyssey/docs-builder .
+	docker run --user="$(CURRENT_USER_UID_GID)" -v .:/odyssey:rw odyssey/docs-builder
+
+serve-docs: build-docs-web
+	docker stop odyssey_docs_web || true
+	docker run \
+		-it --rm \
+		--name odyssey_docs_web \
+		-p "80:80" -p "443:443" \
+		-v "${PWD}/site:/usr/share/nginx/html:ro" \
+		-v "${PWD}/docs/nginx.conf:/etc/nginx/nginx.conf:ro" \
+		-v "${PWD}/certificate.pem":/etc/certificate.pem:ro \
+		-d nginx:alpine
+
+debian-build-package:
+	dpkg-buildpackage -us -uc
+
+debian-lintian-check:
+	lintian -I -E --pedantic ../odyssey_*_amd64.deb 

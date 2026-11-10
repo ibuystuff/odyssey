@@ -1,0 +1,1560 @@
+#include <odyssey.h>
+#include <tests/odyssey_test.h>
+
+#include <sql/minimal/ast.h>
+#include <sql/minimal/parser.h>
+#include <alloc/linear.h>
+#include <query.h>
+#include <client.h>
+
+#define PRINT_BUF_SIZE 1024
+#define ARENA_SIZE 8192
+
+static _Alignas(max_align_t) uint8_t s_arena_buf[ARENA_SIZE];
+static od_linear_alloc_t s_arena;
+
+#define DEFAULT_MAX_QUERY_LEN 10000
+
+static od_config_query_parsing_t s_minimal_parsing = {
+	.mode = OD_CONFIG_QUERY_PARSING_MODE_MINIMAL,
+	.max_query_len = DEFAULT_MAX_QUERY_LEN,
+};
+
+static od_config_query_parsing_t s_disabled_parsing = {
+	.mode = OD_CONFIG_QUERY_PARSING_MODE_DISABLED,
+	.max_query_len = DEFAULT_MAX_QUERY_LEN,
+};
+
+static od_config_query_parsing_t s_small_parsing = {
+	.mode = OD_CONFIG_QUERY_PARSING_MODE_MINIMAL,
+	.max_query_len = 6,
+};
+
+static od_config_query_parsing_t s_full_parsing = {
+	.mode = OD_CONFIG_QUERY_PARSING_MODE_FULL,
+	.max_query_len = DEFAULT_MAX_QUERY_LEN,
+};
+
+static char *s_standby_extra_names[] = { "my_ro_fn", "other_safe_fn" };
+
+static od_config_query_parsing_t s_full_parsing_extra = {
+	.mode = OD_CONFIG_QUERY_PARSING_MODE_FULL,
+	.max_query_len = DEFAULT_MAX_QUERY_LEN,
+	.standby_function_names = s_standby_extra_names,
+	.standby_function_names_count = 2,
+};
+
+#define FULL_ARENA_SIZE (5 * 1024 * 1024)
+
+static _Alignas(max_align_t) uint8_t s_full_arena_buf[FULL_ARENA_SIZE];
+static od_linear_alloc_t s_full_arena;
+
+static void on_error(const char *msg, void *userdata)
+{
+	strcpy((char *)userdata, msg);
+}
+
+static const char *parse_ok(const char *input)
+{
+	static char out[PRINT_BUF_SIZE];
+	static char err[PRINT_BUF_SIZE];
+
+	memset(err, 0, sizeof(err));
+	memset(out, 0, sizeof(out));
+
+	od_linear_alloc_reset(&s_arena, 0);
+	od_sql_minimal_node_t *node = od_sql_minimal_parse(
+		input, strlen(input), &s_arena, on_error, err);
+
+	if (node == NULL || strlen(err) != 0) {
+		fprintf(stderr,
+			"parse_ok failed: input=[%s] err=[s%s] node=%p\n",
+			input, err, (void *)node);
+		abort();
+	}
+
+	int n = od_sql_minimal_node_print(node, out, sizeof(out));
+	test(n > 0 && (size_t)n < sizeof(out));
+	return out;
+}
+
+static void parse_fail(const char *input)
+{
+	static char err[PRINT_BUF_SIZE];
+
+	memset(err, 0, sizeof(err));
+	od_linear_alloc_reset(&s_arena, 0);
+	od_sql_minimal_node_t *node = od_sql_minimal_parse(
+		input, strlen(input), &s_arena, on_error, err);
+	if (node != NULL) {
+		fprintf(stderr,
+			"parse_fail: expected failure but got node for [%s]\n",
+			input);
+		abort();
+	}
+	test(node == NULL);
+}
+
+/*
+ * SHOW tests
+ */
+static void test_show_basic(void)
+{
+	test(strcmp(parse_ok("SHOW search_path"), "(show search_path)") == 0);
+}
+
+static void test_show_all(void)
+{
+	test(strcmp(parse_ok("SHOW ALL"), "(show all)") == 0);
+}
+
+static void test_show_dotted(void)
+{
+	test(strcmp(parse_ok("SHOW odyssey.target_session_attrs"),
+		    "(show odyssey.target_session_attrs)") == 0);
+}
+
+static void test_show_case_insensitive(void)
+{
+	test(strcmp(parse_ok("show search_path"), "(show search_path)") == 0);
+	test(strcmp(parse_ok("Show Search_Path"), "(show search_path)") == 0);
+}
+
+static void test_show_with_semicolon(void)
+{
+	test(strcmp(parse_ok("SHOW search_path;"), "(show search_path)") == 0);
+}
+
+static void test_show_whitespace(void)
+{
+	test(strcmp(parse_ok("  SHOW   search_path  "), "(show search_path)") ==
+	     0);
+}
+
+static void test_show_with_block_comment(void)
+{
+	test(strcmp(parse_ok("SHOW /* comment */ search_path"),
+		    "(show search_path)") == 0);
+
+	test(strcmp(parse_ok("SHOW search_path /* comment */"),
+		    "(show search_path)") == 0);
+
+	test(strcmp(parse_ok("SHOW search_path -- comment"),
+		    "(show search_path)") == 0);
+}
+
+static void test_show_multiline_block_comment(void)
+{
+	test(strcmp(parse_ok("/* multi\nline\ncomment */ SHOW search_path"),
+		    "(show search_path)") == 0);
+}
+
+static void test_set_equals(void)
+{
+	test(strcmp(parse_ok("SET search_path = public"),
+		    "(set search_path=public)") == 0);
+}
+
+static void test_set_to(void)
+{
+	test(strcmp(parse_ok("SET search_path TO public"),
+		    "(set search_path=public)") == 0);
+}
+
+static void test_set_string_value(void)
+{
+	test(strcmp(parse_ok("SET application_name = 'myapp'"),
+		    "(set application_name=myapp)") == 0);
+}
+
+static void test_set_default(void)
+{
+	test(strcmp(parse_ok("SET search_path = DEFAULT"),
+		    "(set search_path=default)") == 0);
+	test(strcmp(parse_ok("SET search_path TO DEFAULT"),
+		    "(set search_path=default)") == 0);
+}
+
+static void test_set_session_local(void)
+{
+	test(strcmp(parse_ok("SET SESSION search_path = public"),
+		    "(set search_path=public)") == 0);
+	test(strcmp(parse_ok("SET LOCAL search_path = public"),
+		    "(set search_path=public)") == 0);
+}
+
+static void test_set_dotted_name(void)
+{
+	test(strcmp(parse_ok("SET odyssey.target_session_attrs = 'read-only'"),
+		    "(set odyssey.target_session_attrs=read-only)") == 0);
+}
+
+static void test_set_boolean_values(void)
+{
+	test(strcmp(parse_ok("SET enable_seqscan = ON"),
+		    "(set enable_seqscan=on)") == 0);
+	test(strcmp(parse_ok("SET enable_seqscan = OFF"),
+		    "(set enable_seqscan=off)") == 0);
+	test(strcmp(parse_ok("SET enable_seqscan = TRUE"),
+		    "(set enable_seqscan=true)") == 0);
+	test(strcmp(parse_ok("SET enable_seqscan = FALSE"),
+		    "(set enable_seqscan=false)") == 0);
+}
+
+static void test_set_integer(void)
+{
+	test(strcmp(parse_ok("SET work_mem = 4096"), "(set work_mem=4096)") ==
+	     0);
+}
+
+static void test_set_with_semicolon(void)
+{
+	test(strcmp(parse_ok("SET search_path = public;"),
+		    "(set search_path=public)") == 0);
+}
+
+static void test_begin_basic(void)
+{
+	test(strcmp(parse_ok("BEGIN"), "(begin)") == 0);
+}
+
+static void test_begin_work(void)
+{
+	test(strcmp(parse_ok("BEGIN WORK"), "(begin)") == 0);
+}
+
+static void test_begin_transaction(void)
+{
+	test(strcmp(parse_ok("BEGIN TRANSACTION"), "(begin)") == 0);
+}
+
+static void test_begin_case_insensitive(void)
+{
+	test(strcmp(parse_ok("begin"), "(begin)") == 0);
+	test(strcmp(parse_ok("Begin"), "(begin)") == 0);
+}
+
+static void test_begin_with_semicolon(void)
+{
+	test(strcmp(parse_ok("BEGIN;"), "(begin)") == 0);
+}
+
+static void test_deallocate_name(void)
+{
+	test(strcmp(parse_ok("DEALLOCATE foo_stmt"), "(deallocate foo_stmt)") ==
+	     0);
+	test(strcmp(parse_ok("DEALLOCATE foo_bar"), "(deallocate foo_bar)") ==
+	     0);
+	test(strcmp(parse_ok("DEALLOCATE foo123"), "(deallocate foo123)") == 0);
+}
+
+static void test_deallocate_prepare_name(void)
+{
+	test(strcmp(parse_ok("DEALLOCATE PREPARE foo_stmt"),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE PREPARE pst"), "(deallocate pst)") ==
+	     0);
+	test(strcmp(parse_ok("deallocate prepare pst"), "(deallocate pst)") ==
+	     0);
+}
+
+static void test_deallocate_keyword_as_name(void)
+{
+	/* "preparepst" is not KW_PREPARE — parsed as IDENT */
+	test(strcmp(parse_ok("DEALLOCATE preparepst"),
+		    "(deallocate preparepst)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE PREPAREpst"),
+		    "(deallocate preparepst)") == 0);
+
+	/* "allpst" / "ALLpst" are not KW_ALL — parsed as IDENT */
+	test(strcmp(parse_ok("DEALLOCATE allpst"), "(deallocate allpst)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE ALLpst"), "(deallocate allpst)") == 0);
+}
+
+static void test_deallocate_all(void)
+{
+	test(strcmp(parse_ok("DEALLOCATE ALL"), "(deallocate all)") == 0);
+}
+
+static void test_deallocate_prepare_all(void)
+{
+	test(strcmp(parse_ok("DEALLOCATE PREPARE ALL"), "(deallocate all)") ==
+	     0);
+}
+
+static void test_deallocate_case_insensitive(void)
+{
+	test(strcmp(parse_ok("deallocate foo_stmt"), "(deallocate foo_stmt)") ==
+	     0);
+	test(strcmp(parse_ok("Deallocate All"), "(deallocate all)") == 0);
+}
+
+static void test_deallocate_with_semicolon(void)
+{
+	test(strcmp(parse_ok("DEALLOCATE foo_stmt;"),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE ALL;"), "(deallocate all)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE foo_stmt;   "),
+		    "(deallocate foo_stmt)") == 0);
+}
+
+static void test_deallocate_whitespace(void)
+{
+	test(strcmp(parse_ok("  DEALLOCATE foo_stmt"),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok("\tDEALLOCATE\tfoo_stmt"),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE    foo_stmt   "),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE foo_stmt   ;"),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok("DEALLOCATE foo_stmt;   "),
+		    "(deallocate foo_stmt)") == 0);
+	test(strcmp(parse_ok(" \n\r\t DEALLOCATE \n foo_stmt \r\n"),
+		    "(deallocate foo_stmt)") == 0);
+}
+
+static void test_deallocate_string_literal(void)
+{
+	/*
+	 * the old od_parse_deallocate accepted string literals
+	 * (DEALLOCATE 'foo'); the minimal parser only accepts
+	 * identifiers and ALL, so these now fail.
+	 */
+	parse_fail("DEALLOCATE 'foo'");
+	parse_fail("DEALLOCATE PREPARE 'foo'");
+	parse_fail("DEALLOCATE 'foo';");
+	parse_fail("DEALLOCATE 'ALL'");
+	parse_fail("DEALLOCATE PREPARE 'ALL'");
+	parse_fail("DEALLOCATE 'a''b'");
+	parse_fail("DEALLOCATE PREPARE 'a''b'");
+	parse_fail("DEALLOCATE 'x''y''z';");
+	parse_fail("DEALLOCATE 'PREPARE'");
+}
+
+static void test_discard_all(void)
+{
+	test(strcmp(parse_ok("DISCARD ALL"), "(discard all)") == 0);
+}
+
+static void test_discard_temp(void)
+{
+	test(strcmp(parse_ok("DISCARD TEMP"), "(discard temp)") == 0);
+}
+
+static void test_discard_temporary(void)
+{
+	test(strcmp(parse_ok("DISCARD TEMPORARY"), "(discard temp)") == 0);
+}
+
+static void test_discard_plans(void)
+{
+	test(strcmp(parse_ok("DISCARD PLANS"), "(discard plans)") == 0);
+}
+
+static void test_discard_sequences(void)
+{
+	test(strcmp(parse_ok("DISCARD SEQUENCES"), "(discard sequences)") == 0);
+}
+
+static void test_discard_case_insensitive(void)
+{
+	test(strcmp(parse_ok("discard all"), "(discard all)") == 0);
+	test(strcmp(parse_ok("Discard Plans"), "(discard plans)") == 0);
+}
+
+static void test_discard_with_semicolon(void)
+{
+	test(strcmp(parse_ok("DISCARD ALL;"), "(discard all)") == 0);
+}
+
+static void test_unlisten_name(void)
+{
+	test(strcmp(parse_ok("UNLISTEN foo"), "(unlisten foo)") == 0);
+}
+
+static void test_unclosed_comments(void)
+{
+	parse_fail("/* SHOW x");
+}
+
+static void test_unlisten_star(void)
+{
+	test(strcmp(parse_ok("UNLISTEN *"), "(unlisten *)") == 0);
+	test(strcmp(parse_ok("UNLISTEN \"*\""), "(unlisten *)") == 0);
+}
+
+static void test_unlisten_case_insensitive(void)
+{
+	test(strcmp(parse_ok("unlisten foo"), "(unlisten foo)") == 0);
+	test(strcmp(parse_ok("Unlisten Foo"), "(unlisten foo)") == 0);
+}
+
+static void test_unlisten_with_semicolon(void)
+{
+	test(strcmp(parse_ok("UNLISTEN foo;"), "(unlisten foo)") == 0);
+	test(strcmp(parse_ok("UNLISTEN *;"), "(unlisten *)") == 0);
+}
+
+static void test_empty_input(void)
+{
+	od_linear_alloc_reset(&s_arena, 0);
+	od_sql_minimal_node_t *node =
+		od_sql_minimal_parse("", 0, &s_arena, NULL, NULL);
+	test(node != NULL);
+	test(node->type == OD_SQL_MINIMAL_NODE_TYPE_EMPTY_STMT);
+
+	od_linear_alloc_reset(&s_arena, 0);
+	node = od_sql_minimal_parse(";", 1, &s_arena, NULL, NULL);
+	test(node != NULL);
+	test(node->type == OD_SQL_MINIMAL_NODE_TYPE_EMPTY_STMT);
+
+	od_linear_alloc_reset(&s_arena, 0);
+	node = od_sql_minimal_parse(" ; ; ", strlen(" ; ; "), &s_arena, NULL,
+				    NULL);
+	test(node != NULL);
+	test(node->type == OD_SQL_MINIMAL_NODE_TYPE_EMPTY_STMT);
+
+	/* an empty query followed by a statement is not an empty query */
+	od_linear_alloc_reset(&s_arena, 0);
+	node = od_sql_minimal_parse("; SELECT 1;", strlen("; SELECT 1;"),
+				    &s_arena, NULL, NULL);
+	test(node == NULL);
+}
+
+static void test_parse_errors(void)
+{
+	parse_fail("SELECT 1");
+	parse_fail("SHOW");
+	parse_fail("SET foo =");
+	parse_fail("DEALLOCATE");
+	test(strcmp(parse_ok("DEALLOCATE PREPARE"), "(deallocate prepare)") ==
+	     0);
+	test(strcmp(parse_ok("DEALLOCATE PREPARE;"), "(deallocate prepare)") ==
+	     0);
+	parse_fail("DEALLOCATE PREPARE prepared pst");
+	parse_fail("DEALLOCATE PREPARED pst");
+	parse_fail("DEALLOCATE ALL pst");
+	parse_fail("DEALLOCATE foo_stmt extra");
+	parse_fail("DISCARD");
+	parse_fail("UNLISTEN");
+	parse_fail("COMMIT");
+	parse_fail("ROLLBACK");
+	parse_fail("ABORT");
+	parse_fail("END");
+	parse_fail("ALLOCATE foo");
+	parse_fail("PREPARE foo");
+}
+
+/*
+ * the point is to verify that flex does not call exit(1) when
+ * yy_scan_bytes cannot allocate the buffer copy — instead the parser
+ * should return NULL via longjmp recovery
+ */
+static void test_long_query_oom(void)
+{
+	static char big_query[ARENA_SIZE * 2];
+	memset(big_query, ' ', sizeof(big_query) - 1);
+	memcpy(big_query, "SELECT ", 7);
+	big_query[sizeof(big_query) - 2] = ';';
+	big_query[sizeof(big_query) - 1] = '\0';
+
+	od_linear_alloc_reset(&s_arena, 0);
+	od_sql_minimal_error_cb_t saved_cb = NULL;
+	(void)saved_cb;
+
+	od_sql_minimal_node_t *node = od_sql_minimal_parse(
+		big_query, strlen(big_query), &s_arena, NULL, NULL);
+	test(node == NULL);
+}
+
+static void test_long_set_value(void)
+{
+	static char long_value[512];
+	memset(long_value, 'x', sizeof(long_value) - 1);
+	long_value[sizeof(long_value) - 1] = '\0';
+
+	char input[600];
+	int n = snprintf(input, sizeof(input), "SET application_name = '%s'",
+			 long_value);
+	test(n > 0 && (size_t)n < sizeof(input));
+
+	const char *res = parse_ok(input);
+	test(strncmp(res, "(set application_name=", 21) == 0);
+	test(strstr(res, "xxx") != NULL);
+}
+
+static void test_extract_query_ctx(void)
+{
+	od_linear_alloc_reset(&s_arena, 0);
+
+	/* DISCARD ALL */
+	od_sql_minimal_node_t *ast = od_sql_minimal_parse(
+		"DISCARD ALL", strlen("DISCARD ALL"), &s_arena, NULL, NULL);
+	test(ast != NULL);
+	od_query_ctx_t ctx;
+	memset(&ctx, 0, sizeof(ctx));
+	od_sql_minimal_extract_query_ctx(ast, &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	od_query_ctx_reset(&ctx);
+
+	/* UNLISTEN * */
+	od_linear_alloc_reset(&s_arena, 0);
+	ast = od_sql_minimal_parse("UNLISTEN *", strlen("UNLISTEN *"), &s_arena,
+				   NULL, NULL);
+	test(ast != NULL);
+	od_sql_minimal_extract_query_ctx(ast, &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	od_query_ctx_reset(&ctx);
+
+	/* DEALLOCATE ALL */
+	od_linear_alloc_reset(&s_arena, 0);
+	ast = od_sql_minimal_parse("DEALLOCATE ALL", strlen("DEALLOCATE ALL"),
+				   &s_arena, NULL, NULL);
+	test(ast != NULL);
+	od_sql_minimal_extract_query_ctx(ast, &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	od_query_ctx_reset(&ctx);
+
+	/* DEALLOCATE name */
+	od_linear_alloc_reset(&s_arena, 0);
+	ast = od_sql_minimal_parse("DEALLOCATE foo", strlen("DEALLOCATE foo"),
+				   &s_arena, NULL, NULL);
+	test(ast != NULL);
+	od_sql_minimal_extract_query_ctx(ast, &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	test(strcmp(ctx.s1, "foo") == 0);
+	od_query_ctx_reset(&ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+
+	/* SELECT — nothing */
+	od_linear_alloc_reset(&s_arena, 0);
+	ast = od_sql_minimal_parse("SELECT 1", strlen("SELECT 1"), &s_arena,
+				   NULL, NULL);
+	test(ast == NULL); /* not recognized by minimal parser */
+	od_sql_minimal_extract_query_ctx(NULL, &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	od_query_ctx_reset(&ctx);
+
+	/* DISCARD TEMP — not ALL, no parse error */
+	od_linear_alloc_reset(&s_arena, 0);
+	ast = od_sql_minimal_parse("DISCARD TEMP", strlen("DISCARD TEMP"),
+				   &s_arena, NULL, NULL);
+	test(ast != NULL);
+	od_sql_minimal_extract_query_ctx(ast, &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	od_query_ctx_reset(&ctx);
+}
+
+static void test_parse_fill_ctx(void)
+{
+	od_query_ctx_t ctx;
+	memset(&ctx, 0, sizeof(ctx));
+
+	/* DISCARD ALL — ctx filled */
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx("DISCARD ALL", strlen("DISCARD ALL"), &s_arena,
+				&ctx, &s_minimal_parsing);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx(" ; ; ", strlen(" ; ; "), &s_arena, &ctx,
+				&s_minimal_parsing);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_EMPTY));
+	od_query_ctx_reset(&ctx);
+
+	/* SHOW — name stored in ctx */
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx("SHOW application_name",
+				strlen("SHOW application_name"), &s_arena, &ctx,
+				&s_minimal_parsing);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s1, "application_name") == 0);
+	od_query_ctx_reset(&ctx);
+
+	/* SET — key and value stored in ctx */
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx("SET application_name = 'foo'",
+				strlen("SET application_name = 'foo'"),
+				&s_arena, &ctx, &s_minimal_parsing);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+	test(strcmp(ctx.s1, "application_name") == 0);
+	test(strcmp(ctx.s2, "foo") == 0);
+	test(ctx.s2_long == NULL);
+	od_query_ctx_reset(&ctx);
+	test(ctx.s2_long == NULL);
+
+	/* SET with a long value — truncated inline, full copy owned by ctx */
+	{
+		char long_value[128];
+		char query[192];
+		memset(long_value, 'x', sizeof(long_value) - 1);
+		long_value[sizeof(long_value) - 1] = '\0';
+		int n = snprintf(query, sizeof(query),
+				 "SET application_name = '%s'", long_value);
+		test(n > 0 && (size_t)n < sizeof(query));
+
+		od_linear_alloc_reset(&s_arena, 0);
+		od_query_parse_fill_ctx(query, strlen(query), &s_arena, &ctx,
+					&s_minimal_parsing);
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+		test(strlen(ctx.s2) == 64 - 1);
+		test(ctx.s2_long != NULL);
+		test(strcmp(ctx.s2_long, long_value) == 0);
+		od_query_ctx_reset(&ctx);
+		test(ctx.s2_long == NULL);
+	}
+
+	/* SET ... DEFAULT — empty value */
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx("SET application_name TO DEFAULT",
+				strlen("SET application_name TO DEFAULT"),
+				&s_arena, &ctx, &s_minimal_parsing);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(ctx.s2[0] == '\0');
+	test(ctx.s2_long == NULL);
+	od_query_ctx_reset(&ctx);
+
+	/* BEGIN */
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx("BEGIN", strlen("BEGIN"), &s_arena, &ctx,
+				&s_minimal_parsing);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_BEGIN));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	od_query_ctx_reset(&ctx);
+
+	/* SELECT — minimal parse fails, ctx is still filled */
+	od_linear_alloc_reset(&s_arena, 0);
+	od_query_parse_fill_ctx("SELECT 1", strlen("SELECT 1"), &s_arena, &ctx,
+				&s_minimal_parsing);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+}
+
+static void fill_ctx_full(const char *query, od_query_ctx_t *ctx)
+{
+	od_linear_alloc_reset(&s_full_arena, 0);
+	od_query_parse_fill_ctx(query, strlen(query), &s_full_arena, ctx,
+				&s_full_parsing);
+}
+
+static void fill_ctx_full_extra(const char *query, od_query_ctx_t *ctx)
+{
+	od_linear_alloc_reset(&s_full_arena, 0);
+	od_query_parse_fill_ctx(query, strlen(query), &s_full_arena, ctx,
+				&s_full_parsing_extra);
+}
+
+static void test_parse_fill_ctx_full(void)
+{
+	od_linear_alloc_init(&s_full_arena, s_full_arena_buf,
+			     sizeof(s_full_arena_buf));
+
+	od_query_ctx_t ctx;
+	memset(&ctx, 0, sizeof(ctx));
+
+	/* SHOW — name stored in ctx; in full mode SHOW is also a select */
+	fill_ctx_full("SHOW application_name", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s1, "application_name") == 0);
+	od_query_ctx_reset(&ctx);
+
+	/* SET — string value stored in ctx */
+	fill_ctx_full("SET application_name = 'foo'", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+	test(strcmp(ctx.s1, "application_name") == 0);
+	test(strcmp(ctx.s2, "foo") == 0);
+	test(ctx.s2_long == NULL);
+	od_query_ctx_reset(&ctx);
+	test(ctx.s2_long == NULL);
+
+	/* SET ... TO — same as '=' */
+	fill_ctx_full("SET application_name TO 'bar'", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s1, "application_name") == 0);
+	test(strcmp(ctx.s2, "bar") == 0);
+	test(ctx.s2_long == NULL);
+	od_query_ctx_reset(&ctx);
+
+	/* SET — boolean/ident values are stored as strings */
+	fill_ctx_full("SET statement_timeout = on", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s1, "statement_timeout") == 0);
+	test(strcmp(ctx.s2, "on") == 0);
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SET x = true", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s2, "true") == 0);
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SET x = false", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s2, "false") == 0);
+	od_query_ctx_reset(&ctx);
+
+	/* SET — integer and float values are stored as strings */
+	fill_ctx_full("SET statement_timeout = 100", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s2, "100") == 0);
+	test(ctx.s2_long == NULL);
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SET x = 1.5", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(strcmp(ctx.s2, "1.5") == 0);
+	od_query_ctx_reset(&ctx);
+
+	/* SET with a long value — truncated inline, full copy owned by ctx */
+	{
+		char long_value[128];
+		char query[192];
+		memset(long_value, 'x', sizeof(long_value) - 1);
+		long_value[sizeof(long_value) - 1] = '\0';
+		int n = snprintf(query, sizeof(query),
+				 "SET application_name = '%s'", long_value);
+		test(n > 0 && (size_t)n < sizeof(query));
+
+		fill_ctx_full(query, &ctx);
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+		test(strlen(ctx.s2) == 64 - 1);
+		test(ctx.s2_long != NULL);
+		test(strcmp(ctx.s2_long, long_value) == 0);
+		od_query_ctx_reset(&ctx);
+		test(ctx.s2_long == NULL);
+	}
+
+	/* DEFAULT uses the same empty value as the minimal parser. */
+	fill_ctx_full("SET application_name TO DEFAULT", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	od_query_ctx_reset(&ctx);
+
+	/* SET with multiple values — no IS_SET, no parse error */
+	fill_ctx_full("SET x = 1, 2", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	od_query_ctx_reset(&ctx);
+
+	/* BEGIN */
+	fill_ctx_full("BEGIN", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_BEGIN));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("BEGIN WORK", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_BEGIN));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("BEGIN TRANSACTION;", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_BEGIN));
+	od_query_ctx_reset(&ctx);
+
+	/* Virtual BEGIN must recognize transaction options for deferred replay. */
+	const char *begin_with_options[] = {
+		"BEGIN ISOLATION LEVEL SERIALIZABLE;",
+		"BEGIN ISOLATION LEVEL REPEATABLE READ;",
+		"BEGIN ISOLATION LEVEL READ COMMITTED;",
+		"BEGIN ISOLATION LEVEL READ UNCOMMITTED;",
+		"BEGIN WORK READ ONLY;",
+		"BEGIN TRANSACTION READ WRITE;",
+		"BEGIN DEFERRABLE;",
+		"BEGIN NOT DEFERRABLE;",
+		"BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE;",
+	};
+	for (size_t i = 0;
+	     i < sizeof(begin_with_options) / sizeof(begin_with_options[0]);
+	     i++) {
+		fill_ctx_full(begin_with_options[i], &ctx);
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_BEGIN));
+		od_query_ctx_reset(&ctx);
+	}
+
+	/* UNLISTEN * */
+	fill_ctx_full("UNLISTEN *", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("UNLISTEN", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	od_query_ctx_reset(&ctx);
+
+	/* UNLISTEN name — not ALL */
+	fill_ctx_full("UNLISTEN chan", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_UNLISTEN_ALL));
+	od_query_ctx_reset(&ctx);
+
+	/* DISCARD ALL */
+	fill_ctx_full("DISCARD ALL", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	od_query_ctx_reset(&ctx);
+
+	/* DISCARD PLANS — not ALL */
+	fill_ctx_full("DISCARD PLANS", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	od_query_ctx_reset(&ctx);
+
+	/* DEALLOCATE name */
+	fill_ctx_full("DEALLOCATE stmt", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(strcmp(ctx.s1, "stmt") == 0);
+	od_query_ctx_reset(&ctx);
+
+	/* DEALLOCATE ALL */
+	fill_ctx_full("DEALLOCATE ALL", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DEALLOCATE_ALL));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_DEALLOCATE_NAME));
+	od_query_ctx_reset(&ctx);
+
+	/* SELECT — simple select is flagged */
+	fill_ctx_full("SELECT 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SELECT * FROM t WHERE a = 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* UNION — still a select */
+	fill_ctx_full("SELECT 1 UNION SELECT 2", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* VALUES — still a select */
+	fill_ctx_full("VALUES (1), (2)", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* safe built-in functions — still a select */
+	fill_ctx_full("SELECT count(*) FROM t", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SELECT now()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SELECT random(), version()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("SELECT pg_catalog.count(*) FROM t", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* unknown functions — not a select */
+	fill_ctx_full("SELECT write_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* safe function wrapping an unknown one — the argument is walked */
+	fill_ctx_full("SELECT count(write_fn())", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* non pg_catalog qualification is never whitelisted */
+	fill_ctx_full("SELECT myschema.count(*)", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/*
+	 * query_parsing.standby_function_list extends the built-in list
+	 */
+	fill_ctx_full_extra("SELECT my_ro_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full_extra("SELECT other_safe_fn('x')", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full_extra("SELECT pg_catalog.my_ro_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* built-in functions are still recognized together with the extra list */
+	fill_ctx_full_extra("SELECT count(*), my_ro_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* unknown functions are still not recognized */
+	fill_ctx_full_extra("SELECT unknown_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* the extra list does not bypass the qualification check */
+	fill_ctx_full_extra("SELECT myschema.my_ro_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* the default list alone does not know about the extra functions */
+	fill_ctx_full("SELECT my_ro_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* SELECT INTO — writes, not flagged */
+	fill_ctx_full("SELECT 1 INTO t2", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* FOR UPDATE — locking, not flagged */
+	fill_ctx_full("SELECT 1 FOR UPDATE", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* WITH — all CTEs are selects, flagged */
+	fill_ctx_full("WITH cte AS (SELECT 1) SELECT * FROM cte", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("WITH cte AS (SELECT 1), cte2 AS (SELECT 2) SELECT 1",
+		      &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* WITH — a writing CTE disqualifies the query */
+	fill_ctx_full(
+		"WITH cte AS (INSERT INTO t VALUES (1)) SELECT * FROM cte",
+		&ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* COPY TO STDOUT — like a select */
+	fill_ctx_full("COPY t TO STDOUT", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("COPY (SELECT 1) TO STDOUT", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* COPY FROM STDIN — writes, not flagged */
+	fill_ctx_full("COPY t FROM STDIN", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* COPY TO file — not flagged */
+	fill_ctx_full("COPY t TO '/tmp/out'", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN — like a select */
+	fill_ctx_full("EXPLAIN SELECT 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN of a writing statement — treat as write query */
+	fill_ctx_full("EXPLAIN UPDATE t SET a = 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE SELECT — still a select */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN (ANALYZE) — parenthesized form */
+	fill_ctx_full("EXPLAIN (ANALYZE) SELECT 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE UPDATE — writes, not flagged */
+	fill_ctx_full("EXPLAIN ANALYZE UPDATE t SET a = 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE with a function call — not flagged */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT write_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* plain EXPLAIN with a function call — no ANALYZE, still a select */
+	fill_ctx_full("EXPLAIN SELECT write_fn()", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE — function call in WHERE */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT * FROM t WHERE b = write_fn()",
+		      &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE — safe function in FROM */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT * FROM generate_series(1, 10)",
+		      &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE — safe function in SELECT list */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT count(*) FROM t", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE — safe function wrapping an unknown one */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT count(write_fn())", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE — function call inside a CTE */
+	fill_ctx_full(
+		"EXPLAIN ANALYZE WITH cte AS (SELECT write_fn()) SELECT * FROM cte",
+		&ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* EXPLAIN ANALYZE — function call in ORDER BY */
+	fill_ctx_full("EXPLAIN ANALYZE SELECT * FROM t ORDER BY write_fn()",
+		      &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* UPDATE — writes, not flagged */
+	fill_ctx_full("UPDATE t SET a = 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("UPDATE t SET a = 1 WHERE b = 2", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("UPDATE t SET a = 1 WHERE b = 2 RETURNING a", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* UPDATE with a CTE — writes, not flagged */
+	fill_ctx_full("WITH cte AS (SELECT 1) UPDATE t SET a = 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* DELETE — writes, not flagged */
+	fill_ctx_full("DELETE FROM t", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("DELETE FROM t WHERE a = 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full("DELETE FROM t WHERE a = 1 RETURNING a", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* TRUNCATE — writes, not flagged */
+	fill_ctx_full("TRUNCATE t", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* CREATE TABLE AS SELECT — writes, not flagged */
+	fill_ctx_full("CREATE TABLE t2 AS SELECT 1", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* INSERT — parsed, no ctx flags */
+	fill_ctx_full("INSERT INTO t VALUES (1)", &ctx);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SELECT));
+	od_query_ctx_reset(&ctx);
+
+	/* multi statement — parse error */
+	fill_ctx_full("SHOW x; SHOW y", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+	od_query_ctx_reset(&ctx);
+
+	/* syntax error — parse error */
+	fill_ctx_full("FOO BAR", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	od_query_ctx_reset(&ctx);
+
+	/* empty query — answered virtually, no parse error at all */
+	fill_ctx_full("", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_EMPTY));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full(";", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_EMPTY));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	od_query_ctx_reset(&ctx);
+
+	fill_ctx_full(" ; ;  ", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_EMPTY));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	od_query_ctx_reset(&ctx);
+
+	/* "; SELECT 1;" is not an empty query */
+	fill_ctx_full("; SELECT 1;", &ctx);
+	test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_EMPTY) == 0);
+	od_query_ctx_reset(&ctx);
+}
+
+static void test_parse_fill_ctx_modes(void)
+{
+	od_query_ctx_t ctx;
+	memset(&ctx, 0, sizeof(ctx));
+
+	/* DISABLED — no parsing at all, ctx is reset */
+	od_query_parse_fill_ctx("DISCARD ALL", strlen("DISCARD ALL"), &s_arena,
+				&ctx, &s_disabled_parsing);
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+	test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_DISCARD_ALL));
+	test(ctx.s2_long == NULL);
+
+	/* DISABLED — a previously filled s2_long is released */
+	{
+		char long_value[128];
+		char query[192];
+		memset(long_value, 'x', sizeof(long_value) - 1);
+		long_value[sizeof(long_value) - 1] = '\0';
+		int n = snprintf(query, sizeof(query),
+				 "SET application_name = '%s'", long_value);
+		test(n > 0 && (size_t)n < sizeof(query));
+
+		od_linear_alloc_reset(&s_arena, 0);
+		od_query_parse_fill_ctx(query, strlen(query), &s_arena, &ctx,
+					&s_minimal_parsing);
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+		test(ctx.s2_long != NULL);
+
+		od_query_parse_fill_ctx(query, strlen(query), &s_arena, &ctx,
+					&s_disabled_parsing);
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SET));
+		test(ctx.s2_long == NULL);
+	}
+
+	/*
+	 * max_query_len: queries of length > max_query_len are not parsed,
+	 * TOO_LONG | PARSE_ERROR are set; the boundary itself is parsed
+	 */
+	{
+		/* "SHOW x" — exactly max_query_len, still parsed */
+		od_linear_alloc_reset(&s_arena, 0);
+		od_query_parse_fill_ctx("SHOW x", strlen("SHOW x"), &s_arena,
+					&ctx, &s_small_parsing);
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_TOO_LONG));
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+		test(strcmp(ctx.s1, "x") == 0);
+
+		/* "SHOW xx" — one byte over the limit */
+		od_query_parse_fill_ctx("SHOW xx", strlen("SHOW xx"), &s_arena,
+					&ctx, &s_small_parsing);
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_TOO_LONG));
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_SHOW));
+		od_query_ctx_reset(&ctx);
+
+		/* a query over the default limit is not parsed either */
+		{
+			char query[DEFAULT_MAX_QUERY_LEN + 16];
+			memset(query, ' ', sizeof(query) - 1);
+			query[sizeof(query) - 1] = '\0';
+			memcpy(query, "DISCARD ALL", strlen("DISCARD ALL"));
+
+			od_query_parse_fill_ctx(query, strlen(query), &s_arena,
+						&ctx, &s_minimal_parsing);
+			test(od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+			test(od_query_ctx_has(&ctx, OD_QUERY_CTX_TOO_LONG));
+			test(!od_query_ctx_has(&ctx,
+					       OD_QUERY_CTX_IS_DISCARD_ALL));
+			od_query_ctx_reset(&ctx);
+		}
+
+		/* DISABLED ignores the limit, ctx is always reset */
+		od_query_parse_fill_ctx("SHOW xx", strlen("SHOW xx"), &s_arena,
+					&ctx, &s_disabled_parsing);
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_PARSE_ERROR));
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_TOO_LONG));
+		od_query_ctx_reset(&ctx);
+	}
+}
+
+static void test_pending_begin_storage(void)
+{
+	od_client_t *client = od_client_allocate();
+	test(client != NULL);
+	test(client->pending_begin == NULL);
+	od_client_pending_begin_clear(client);
+
+	/* Include the terminator: 127 bytes fit, 128 bytes need the heap. */
+	const size_t lengths[] = { 6, 127, 128, 511, 6 };
+	char query[512];
+	for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+		size_t len = lengths[i];
+		memset(query, ' ', len);
+		memcpy(query, "BEGIN;", 6);
+		query[len] = '\0';
+		test(od_client_pending_begin_set(client, query) == 0);
+		test(strcmp(client->pending_begin, query) == 0);
+		test((client->pending_begin == client->pending_begin_buf) ==
+		     (len < 128));
+		/* The saved SQL must outlive the input message. */
+		query[0] = 'X';
+		test(client->pending_begin[0] == 'B');
+		od_client_pending_begin_clear(client);
+		test(client->pending_begin == NULL);
+	}
+
+	/* Disconnect must safely release both inline and heap-backed SQL. */
+	test(od_client_pending_begin_set(
+		     client,
+		     "BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE;") ==
+	     0);
+	test(client->pending_begin == client->pending_begin_buf);
+	od_client_free(client);
+
+	client = od_client_allocate();
+	test(client != NULL);
+	memset(query, ' ', sizeof(query) - 1);
+	memcpy(query, "BEGIN;", 6);
+	query[sizeof(query) - 1] = '\0';
+	test(od_client_pending_begin_set(client, query) == 0);
+	test(client->pending_begin != client->pending_begin_buf);
+	od_client_free(client);
+}
+
+static void test_prepare_locations(void)
+{
+	const char *sql =
+		" /* leading */ PREPARE \"Ab\" (numeric(10, 2), text[]) AS SELECT $1, ';', $$a;b$$ /* tail */;";
+	od_sql_minimal_prepare_stmt_t *node = (void *)od_sql_minimal_parse(
+		sql, strlen(sql), &s_arena, NULL, NULL);
+	test(node != NULL);
+	test(node->type == OD_SQL_MINIMAL_NODE_TYPE_PREPARE_STMT);
+	test(strcmp(node->name, "Ab") == 0);
+	test(node->name_location.start == strstr(sql, "\"A") - sql);
+	test(node->name_location.end == node->name_location.start + 4);
+	test(node->types_location.start == strstr(sql, "numeric") - sql);
+	test(node->types_location.end == strstr(sql, ") AS") - sql);
+	test(node->query_location.start == strstr(sql, "SELECT") - sql);
+	test(node->query_location.end == (int)strlen(sql) - 1);
+
+	sql = "PREPARE foo AS select 1";
+	node = (void *)od_sql_minimal_parse(sql, strlen(sql), &s_arena, NULL,
+					    NULL);
+	test(node != NULL);
+	test(node->types_location.start == -1);
+	test(node->query_location.start == 15);
+	test(node->query_location.end == (int)strlen(sql));
+
+	sql = " EXECUTE \"Ab\"(1, 'a;b');";
+	od_sql_minimal_execute_stmt_t *execute = (void *)od_sql_minimal_parse(
+		sql, strlen(sql), &s_arena, NULL, NULL);
+	test(execute != NULL);
+	test(execute->type == OD_SQL_MINIMAL_NODE_TYPE_EXECUTE_STMT);
+	test(strcmp(execute->name, "Ab") == 0);
+	test(execute->name_location.start == 9);
+	test(execute->name_location.end == 13);
+	test(execute->args_location.start == 13);
+	test(execute->args_location.end == (int)strlen(sql) - 1);
+
+	parse_fail("PREPARE foo$bar AS SELECT 1");
+	parse_fail("PREPARE \"A\"\"B\" AS SELECT 1");
+	parse_fail("PREPARE канал AS SELECT 1");
+	parse_fail("PREPARE U&\"name\" AS SELECT 1");
+}
+
+static void test_locations_after_comments(void)
+{
+	/*
+	 * block comments (including nested ones) are consumed via
+	 * input() and must not shift offsets of the following tokens
+	 */
+	const char *sql =
+		"/* pre * with stars ** /* nested */ */"
+		" PREPARE \"Ab\" /* c1 */(numeric(10, 2) /* c2 */, text[])"
+		" AS SELECT /* c3 */ $1, 'a;b'";
+	od_sql_minimal_prepare_stmt_t *node = (void *)od_sql_minimal_parse(
+		sql, strlen(sql), &s_arena, NULL, NULL);
+	test(node != NULL);
+	test(node->type == OD_SQL_MINIMAL_NODE_TYPE_PREPARE_STMT);
+	test(strcmp(node->name, "Ab") == 0);
+	test(node->name_location.start == strstr(sql, "\"A") - sql);
+	test(node->name_location.end == node->name_location.start + 4);
+	test(node->types_location.start == strstr(sql, "numeric") - sql);
+	test(node->types_location.end == strstr(sql, ") AS") - sql);
+	test(node->query_location.start == strstr(sql, "SELECT") - sql);
+	test(node->query_location.end == (int)strlen(sql));
+
+	/* comments inside the opaque EXECUTE() tail */
+	sql = "/* lead */ EXECUTE \"Ab\" (1 /* c */, 'a;b' /* c2 */);";
+	od_sql_minimal_execute_stmt_t *execute = (void *)od_sql_minimal_parse(
+		sql, strlen(sql), &s_arena, NULL, NULL);
+	test(execute != NULL);
+	test(strcmp(execute->name, "Ab") == 0);
+	test(execute->name_location.start == strstr(sql, "\"A") - sql);
+	test(execute->name_location.end == execute->name_location.start + 4);
+	test(execute->args_location.start == strstr(sql, "(1") - sql);
+	test(execute->args_location.end == (int)strlen(sql) - 1);
+}
+
+static void test_execute_query_ctx(void)
+{
+	const char *sql =
+		"/* before */ EXECUTE \"Mixed\" /* args */ (1 + 2, upper('я'));";
+	od_query_ctx_t ctx = { 0 };
+	const od_config_query_parsing_t *modes[] = { &s_minimal_parsing,
+						     &s_full_parsing };
+	for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+		od_linear_alloc_reset(&s_full_arena, 0);
+		od_query_parse_fill_ctx(sql, strlen(sql), &s_full_arena, &ctx,
+					modes[i]);
+		test(ctx.flags == OD_QUERY_CTX_IS_EXECUTE);
+		test(strcmp(ctx.s1, "Mixed") == 0);
+		test(ctx.name_location.start == 21);
+		test(ctx.name_location.end == 28);
+		od_query_ctx_reset(&ctx);
+
+		const char *batch = "EXECUTE p(1); SELECT 2";
+		od_linear_alloc_reset(&s_full_arena, 0);
+		od_query_parse_fill_ctx(batch, strlen(batch), &s_full_arena,
+					&ctx, modes[i]);
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_IS_EXECUTE));
+		od_query_ctx_reset(&ctx);
+	}
+
+	const char *full_only =
+		"/* я */ EXECUTE U&\"A!0042\" UESCAPE '!' /* keep */ (1+2)";
+	fill_ctx_full(full_only, &ctx);
+	test(ctx.flags == OD_QUERY_CTX_IS_EXECUTE);
+	test(strcmp(ctx.s1, "AB") == 0);
+	test(ctx.name_location.start == 17);
+	test(ctx.name_location.end == 39);
+	od_query_ctx_reset(&ctx);
+}
+
+static void test_reserved_query_ctx(void)
+{
+	static const struct {
+		const char *query;
+		int minimal_reserved;
+		int full_reserved;
+	} cases[] = {
+		{ "PREPARE odyssey AS SELECT 1", 1, 1 },
+		{ "PREPARE ODYSSEY_custom AS SELECT 1", 1, 1 },
+		{ "EXECUTE odyssey_pstmt_0", 1, 1 },
+		{ "DEALLOCATE PREPARE \"odyssey_custom\"", 1, 1 },
+		{ "EXECUTE U&\"\\006fdyssey_pstmt_0\"", 0, 1 },
+		{ "EXECUTE U&\"!006fdyssey_pstmt_0\" UESCAPE '!'", 0, 1 },
+		{ "DEALLOCATE ALL", 0, 0 },
+		{ "PREPARE ordinary AS SELECT 'odyssey'", 0, 0 },
+		{ "PREPARE \"ODYSSEY\" AS SELECT 1", 0, 0 },
+		{ "SELECT 'EXECUTE odyssey_pstmt_0'", 0, 0 },
+		{ "-- EXECUTE odyssey_pstmt_0\nSELECT 1", 0, 0 },
+		{ "EXPLAIN EXECUTE odyssey_pstmt_0", 0, 1 },
+		{ "CREATE TABLE t AS EXECUTE odyssey_pstmt_0", 0, 1 },
+		{ "EXPLAIN ANALYZE CREATE TABLE t AS EXECUTE odyssey_pstmt_0",
+		  0, 1 },
+		{ "SELECT nextval('s'); EXECUTE odyssey_pstmt_0", 0, 0 },
+		{ "EXECUTE odyssey_pstmt_0; SELECT 1", 0, 0 },
+		{ "EXECUTE odyssey_pstmt_0; SELECT FROM", 0, 0 },
+		{ "PREPARE odyssey AS SELECT FROM", 1, 0 },
+	};
+	od_query_ctx_t ctx = { 0 };
+	const od_config_query_parsing_t *modes[] = { &s_minimal_parsing,
+						     &s_full_parsing };
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		for (size_t mode = 0; mode < 2; mode++) {
+			od_linear_alloc_reset(&s_full_arena, 0);
+			od_query_parse_fill_ctx(cases[i].query,
+						strlen(cases[i].query),
+						&s_full_arena, &ctx,
+						modes[mode]);
+			int expected = mode == 0 ? cases[i].minimal_reserved :
+						   cases[i].full_reserved;
+			test(od_query_ctx_has(&ctx,
+					      OD_QUERY_CTX_HAS_RESERVED_NAME) ==
+			     expected);
+			od_query_ctx_reset(&ctx);
+		}
+	}
+	/* Length and disabled policies cannot leave a previous reserved flag. */
+	const char *query = "EXECUTE odyssey_pstmt_0";
+	for (size_t i = 0; i < 2; i++) {
+		const od_config_query_parsing_t *policy =
+			i == 0 ? &s_disabled_parsing : &s_small_parsing;
+		od_linear_alloc_reset(&s_full_arena, 0);
+		od_query_parse_fill_ctx(query, strlen(query), &s_full_arena,
+					&ctx, &s_full_parsing);
+		test(od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_RESERVED_NAME));
+		od_query_parse_fill_ctx(query, strlen(query), &s_full_arena,
+					&ctx, policy);
+		test(!od_query_ctx_has(&ctx, OD_QUERY_CTX_HAS_RESERVED_NAME));
+	}
+	od_query_ctx_reset(&ctx);
+}
+
+void odyssey_test_sql_minimal_parser(void)
+{
+	od_linear_alloc_init(&s_arena, s_arena_buf, sizeof(s_arena_buf));
+	test_pending_begin_storage();
+	test_prepare_locations();
+	test_locations_after_comments();
+
+	test_parse_fill_ctx_modes();
+
+	test_show_basic();
+	test_show_all();
+	test_show_dotted();
+	test_show_case_insensitive();
+	test_show_with_semicolon();
+	test_show_whitespace();
+	test_show_with_block_comment();
+	test_show_multiline_block_comment();
+
+	test_set_equals();
+	test_set_to();
+	test_set_string_value();
+	test_set_default();
+	test_set_session_local();
+	test_set_dotted_name();
+	test_set_boolean_values();
+	test_set_integer();
+	test_set_with_semicolon();
+
+	test_begin_basic();
+	test_begin_work();
+	test_begin_transaction();
+	test_begin_case_insensitive();
+	test_begin_with_semicolon();
+
+	test_deallocate_name();
+	test_deallocate_prepare_name();
+	test_deallocate_all();
+	test_deallocate_prepare_all();
+	test_deallocate_case_insensitive();
+	test_deallocate_with_semicolon();
+	test_deallocate_whitespace();
+	test_deallocate_keyword_as_name();
+	test_deallocate_string_literal();
+
+	test_discard_all();
+	test_discard_temp();
+	test_discard_temporary();
+	test_discard_plans();
+	test_discard_sequences();
+	test_discard_case_insensitive();
+	test_discard_with_semicolon();
+
+	test_unlisten_name();
+	test_unlisten_star();
+	test_unlisten_case_insensitive();
+	test_unlisten_with_semicolon();
+
+	test_empty_input();
+	test_parse_errors();
+
+	test_long_query_oom();
+	test_long_set_value();
+
+	test_extract_query_ctx();
+	test_parse_fill_ctx();
+	test_parse_fill_ctx_full();
+
+	test_unclosed_comments();
+	test_execute_query_ctx();
+	test_reserved_query_ctx();
+}

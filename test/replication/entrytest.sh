@@ -1,0 +1,248 @@
+#!/bin/sh
+
+set -ex
+
+until pg_isready -h primary -p 5432 -U postgres -d postgres; do
+  echo "Wait for primary..."
+  sleep 0.1
+done
+
+CONN='-h odyssey -p 6432 -U postgres -d postgres'
+REPLSLOTNAME='test_slot'
+
+until pg_isready $CONN; do
+  echo "Wait for odyssey..."
+  sleep 0.1
+done
+
+lsn_ge() {
+    local left="$1"
+    local right="$2"
+
+    result="$(psql $CONN -Atqc "select pg_lsn('$left') >= pg_lsn('$right')")"
+    [ "$result" = "t" ]
+}
+
+get_confirmed_flush_lsn() {
+    local slotname="$1"
+    psql $CONN -Atqc "
+        select coalesce(confirmed_flush_lsn::text, '')
+        from pg_replication_slots
+        where slot_name = '$slotname'
+    "
+}
+
+wait_for_confirmed_flush_lsn_ge() {
+    local target_lsn="$1"
+    local slotname="$2"
+
+    for _ in $(seq 1 30); do
+        current_lsn="$(get_confirmed_flush_lsn $slotname)"
+        if [ -n "$current_lsn" ] && lsn_ge "$current_lsn" "$target_lsn"; then
+            echo "confirmed_flush_lsn reached target: $current_lsn >= $target_lsn"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "confirmed_flush_lsn did not reach target $target_lsn" >&2
+    current_lsn="$(get_confirmed_flush_lsn $slotname)"
+    echo "current confirmed_flush_lsn: $current_lsn" >&2
+    exit 1
+}
+
+do_logical_repl_test() {
+    psql $CONN -c "select pg_drop_replication_slot('$REPLSLOTNAME')" || true
+    psql $CONN -c 'drop table if exists z'
+    psql $CONN -c 'create table z(x int, y int, z int)'
+
+    pg_recvlogical $CONN --slot $REPLSLOTNAME --create-slot -P test_decoding
+
+    psql $CONN -c 'insert into z values(1, 2, 3)'
+    psql $CONN -c 'insert into z values(4, 5, 6)'
+    psql $CONN -c 'insert into z values(7, 8, 9)'
+
+    echo "=== START 1 ===" >/logical_actual.out
+    pg_recvlogical $CONN --slot $REPLSLOTNAME --start -f - -o include-xids=0 >>/logical_actual.out 2>&1 &
+    pid=$!
+
+    psql $CONN -c 'insert into z values(10, 11, 12)'
+    psql $CONN -c 'insert into z values(13, 14, 15)'
+    psql $CONN -c 'insert into z values(16, 17, 18)'
+
+    target_lsn="$(psql $CONN -Atqc "select pg_current_wal_lsn()")"
+    wait_for_confirmed_flush_lsn_ge $target_lsn $REPLSLOTNAME
+
+    kill -INT $pid
+    wait $pid || {
+        echo 'recvlogical failed'
+        exit 1
+    }
+    unset pid
+
+    psql $CONN -c 'insert into z values(19, 20, 21)'
+    psql $CONN -c 'insert into z values(22, 23, 24)'
+    psql $CONN -c 'insert into z values(25, 26, 27)'
+
+    echo "=== START 2 ===" >>/logical_actual.out
+    pg_recvlogical $CONN --slot $REPLSLOTNAME --start -f - -o include-xids=0 >>/logical_actual.out 2>&1 &
+    pid=$!
+
+    psql $CONN -c 'insert into z values(28, 29, 30)'
+    psql $CONN -c 'insert into z values(31, 32, 33)'
+    psql $CONN -c 'insert into z values(34, 35, 36)'
+
+    target_lsn="$(psql $CONN -Atqc "select pg_current_wal_lsn()")"
+    wait_for_confirmed_flush_lsn_ge $target_lsn $REPLSLOTNAME
+
+    kill -INT $pid
+    wait $pid || {
+        echo 'recvlogical failed'
+        exit 1
+    }
+    unset pid
+
+    diff /logical_actual.out /logical_expected.out || {
+        cat /logical_actual.out
+        exit 1
+    }
+}
+
+do_physical_repl_test() {
+    psql $CONN -c "select pg_drop_replication_slot('$REPLSLOTNAME')" || true
+
+    local backup_dir='/tmp/backup'
+    rm -rf $backup_dir
+
+    pg_basebackup -h odyssey -p 6432 -U postgres -D "$backup_dir" -X stream --checkpoint=fast -Fp -R -C -S "$REPLSLOTNAME" -v || {
+        echo "pg_basebackup failed"
+        exit 1
+    }
+
+    test -f "$backup_dir/PG_VERSION"
+    test -d "$backup_dir/base"
+    test -d "$backup_dir/global"
+    test -f "$backup_dir/standby.signal"
+    test -f "$backup_dir/postgresql.auto.conf"
+
+    grep -q "primary_conninfo" "$backup_dir/postgresql.auto.conf"
+
+    psql $CONN -Atqc "select slot_name from pg_replication_slots where slot_name = '$REPLSLOTNAME' and slot_type = 'physical'" | grep -q "^$REPLSLOTNAME$"
+}
+
+reload() {
+    psql -h odyssey -p 6432 -U console -d console -c 'reload' || exit 1
+    psql -h odyssey -p 6432 -U console -d console -c 'gc' || exit 1
+}
+
+use_config() {
+    local name="$1"
+
+    echo "Doing config $name.."
+    diff "/conf/$name" /conf/odyssey.conf || true
+
+    cp /conf/odyssey.conf /conf/odyssey.conf.bak
+    cp "/conf/$name" /conf/odyssey.conf
+    reload
+}
+
+restore_config() {
+    cp /conf/odyssey.conf.bak /conf/odyssey.conf
+    rm /conf/odyssey.conf.bak
+    reload
+}
+
+pool_mode() {
+    psql -h odyssey -p 6432 -U console -d console -Atqc 'show pools' |
+        grep '^replication|repl_user|' | grep -o '[a-z]*$'
+}
+
+do_replication_db_test() {
+    # a database named "replication" must not be mistaken for the replication parameter
+    psql -h primary -p 5432 -U postgres -d postgres -c 'drop database if exists replication' || true
+    psql -h primary -p 5432 -U postgres -d postgres -c 'create database replication'
+    psql -h primary -p 5432 -U postgres -d postgres -c 'drop role if exists repl_user' || true
+    psql -h primary -p 5432 -U postgres -d postgres -c 'create role repl_user login'
+
+    [ "$(psql -h odyssey -p 6432 -U repl_user -d replication -Atqc 'select current_database()')" = "replication" ]
+    psql -h odyssey -p 6432 -U repl_user -d replication -Atqc 'select 1' | grep -qx '1'
+    # base config routes it via default rule
+    [ "$(pool_mode)" = "transaction" ] || {
+        psql -h odyssey -p 6432 -U console -d console -c 'show pools'
+        psql -h odyssey -p 6432 -U console -d console -c 'show rules'
+        exit 1
+    }
+
+    use_config odyssey_replication.conf
+
+    psql -h odyssey -p 6432 -U repl_user -d replication -Atqc 'select 1' | grep -qx '1'
+     # dedicated route applied after reload
+    [ "$(pool_mode)" = "session" ] || {
+        psql -h odyssey -p 6432 -U console -d console -c 'show pools'
+        psql -h odyssey -p 6432 -U console -d console -c 'show rules'
+        exit 1
+    }
+
+    restore_config
+}
+
+do_replication_blocked_test() {
+    # only db1 allowed; everything else (incl. replication) is blocked
+    psql -h primary -p 5432 -U postgres -d postgres -c 'drop database if exists db1' || true
+    psql -h primary -p 5432 -U postgres -d postgres -c 'create database db1'
+
+    use_config odyssey_blocked.conf
+
+    psql -h odyssey -p 6432 -U postgres -d db1 -Atqc 'select 1' | grep -qx '1'
+
+    if psql -h odyssey -p 6432 -U postgres -d postgres -Atqc 'select 1' 2>/dev/null; then
+        echo "non-db1 database should be blocked"
+        exit 1
+    fi
+
+    if psql "host=odyssey port=6432 user=postgres dbname=replication replication=true" 2>/dev/null; then
+        echo "replication connection should be blocked"
+        exit 1
+    fi
+
+    restore_config
+}
+
+do_replication_proxy_test() {
+    # with replication_proxy all replication connections are full proxies:
+    # odyssey does not authenticate the client (server does), does not
+    # pool or deploy anything - just pipes the bytes both ways
+    use_config odyssey_proxy.conf
+
+    do_logical_repl_test
+    do_physical_repl_test
+    do_replication_proxy_no_route_test
+
+    restore_config
+}
+
+do_replication_proxy_no_route_test() {
+    # rules are not involved at all: a replication client from a user
+    # and a database which are not present in any rule still must be
+    # proxied to the first remote storage of the configuration
+    psql -h primary -p 5432 -U postgres -d postgres -c 'drop role if exists no_route_user' || true
+    psql -h primary -p 5432 -U postgres -d postgres -c 'create role no_route_user login replication'
+
+    [ "$(psql "host=odyssey port=6432 user=no_route_user dbname=no_such_db replication=yes" -Atqc 'IDENTIFY_SYSTEM' | wc -l)" -eq 1 ] || {
+        echo "physical replication from a client not present in rules should be proxied"
+        exit 1
+    }
+
+    [ "$(psql "host=odyssey port=6432 user=no_route_user dbname=postgres replication=database" -Atqc 'IDENTIFY_SYSTEM' | wc -l)" -eq 1 ] || {
+        echo "logical replication from a client not present in rules should be proxied"
+        exit 1
+    }
+
+    psql -h primary -p 5432 -U postgres -d postgres -c 'drop role no_route_user'
+}
+
+do_logical_repl_test
+do_physical_repl_test
+do_replication_db_test
+do_replication_blocked_test
+do_replication_proxy_test

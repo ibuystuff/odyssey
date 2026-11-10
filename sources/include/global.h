@@ -1,0 +1,110 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <stdatomic.h>
+
+#include <machinarium/sem.h>
+
+#include <types.h>
+#include <soft_oom.h>
+#include <host_watcher.h>
+#include <logger.h>
+#include <od_memory.h>
+#include <rate.h>
+#include <wait_event.h>
+
+struct od_global {
+	od_instance_t *instance;
+	od_system_t *system;
+	od_router_t *router;
+	od_cron_t *cron;
+	od_worker_pool_t *worker_pool;
+	od_extension_t *extensions;
+	od_hba_t *hba;
+
+	od_soft_oom_checker_t soft_oom;
+
+	od_host_watcher_t host_watcher;
+
+	atomic_uint_fast64_t pause;
+	mm_wait_list_t *resume_waiters;
+
+	od_rate_limiter_t accept_rate_limiter;
+
+	mm_sem_t cancel_sem;
+	od_rate_limiter_t cancel_rate_limiter;
+
+	mm_sem_t routing_sem;
+};
+
+od_global_t *od_global_create(od_instance_t *instance, od_system_t *system,
+			      od_router_t *router, od_cron_t *cron,
+			      od_worker_pool_t *worker_pool,
+			      od_extension_t *extensions, od_hba_t *hba);
+
+int od_global_init(od_global_t *global, od_instance_t *instance,
+		   od_system_t *system, od_router_t *router, od_cron_t *cron,
+		   od_worker_pool_t *worker_pool, od_extension_t *extensions,
+		   od_hba_t *hba);
+
+void od_global_set(od_global_t *global);
+
+od_global_t *od_global_get(void);
+
+od_logger_t *od_global_get_logger(void);
+
+od_instance_t *od_global_get_instance(void);
+
+static inline void od_global_destroy(od_global_t *global)
+{
+	mm_wait_list_free(global->resume_waiters);
+	od_rate_limiter_destroy(&global->accept_rate_limiter);
+	od_rate_limiter_destroy(&global->cancel_rate_limiter);
+	od_free(global);
+	od_global_set(NULL);
+}
+
+static inline uint64_t od_global_is_paused(od_global_t *global)
+{
+	return atomic_load_explicit(&global->pause, memory_order_relaxed);
+}
+
+static inline void od_global_pause(od_global_t *global)
+{
+	atomic_store_explicit(&global->pause, 1ULL, memory_order_relaxed);
+}
+
+static inline void od_global_resume(od_global_t *global)
+{
+	atomic_store_explicit(&global->pause, 0ULL, memory_order_relaxed);
+	mm_wait_list_notify_all(global->resume_waiters);
+}
+
+static inline int od_global_wait_resumed(od_global_t *global, uint32_t timeout)
+{
+	if (!od_global_is_paused(global)) {
+		return 0;
+	}
+
+	od_wait_event_start(OD_WAIT_PAUSE);
+	int rc = mm_wait_list_wait(global->resume_waiters, NULL, timeout);
+	od_wait_event_end(OD_WAIT_PAUSE);
+	if (rc == 0) {
+		return 0;
+	}
+	return 1;
+}
+
+int od_global_is_in_soft_oom(od_global_t *global, uint64_t *used_memory);
+
+void od_global_read_host_utilization(od_global_t *global, float *cpu,
+				     float *mem);
+
+int od_routing_slot_acquire(od_global_t *global, uint32_t timeout_ms);
+
+void od_routing_slot_release(od_global_t *global);

@@ -1,0 +1,380 @@
+#pragma once
+
+/*
+ * machinarium.
+ *
+ * cooperative multitasking engine.
+ */
+
+/*
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !													!
+ * ! THIS HEADER IS UNDER RECONSTRUCTION				!
+ * ! CONSIDER INCLUDING SPECIFIC machinarium/... files	!
+ * !													!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+*/
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdatomic.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <netdb.h>
+
+#include "zpq_stream.h"
+#include "bind.h"
+
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
+
+#include "macro.h"
+#include "channel_limit.h"
+
+#if __GNUC__ >= 4
+#define MACHINE_API __attribute__((visibility("default")))
+#else
+#define MACHINE_API
+#endif
+
+typedef void (*machine_coroutine_t)(void *arg);
+
+#define mm_yield machine_sleep(0);
+
+#define MM_CERT_HASH_LEN EVP_MAX_MD_SIZE
+
+/* library handles */
+
+typedef struct mm_io mm_io_t;
+
+typedef struct machine_cond_private machine_cond_t;
+typedef struct machine_msg_private machine_msg_t;
+typedef struct machine_channel_private machine_channel_t;
+typedef struct machine_tls_private machine_tls_t;
+typedef struct machine_iov_private machine_iov_t;
+typedef struct machine_wait_flag machine_wait_flag_t;
+typedef struct machine_wait_group machine_wait_group_t;
+typedef struct machine_ring_buffer machine_ring_buffer_t;
+
+/* configuration */
+
+MACHINE_API void machinarium_set_stack_size(int size);
+
+MACHINE_API void machinarium_set_system_stack_size(int size);
+
+MACHINE_API void machinarium_set_pool_size(int size);
+
+MACHINE_API void machinarium_set_coroutine_cache_size(int size);
+
+MACHINE_API void machinarium_set_msg_cache_gc_size(int size);
+
+MACHINE_API void machinarium_set_msg_cache_gc_count(int count);
+
+MACHINE_API void machinarium_set_dns_ttl_ms(int ttl_ms);
+
+/* main */
+
+MACHINE_API int machinarium_init(void);
+
+MACHINE_API void machinarium_free(void);
+
+/* machine control */
+
+MACHINE_API int64_t machine_create(char *name, machine_coroutine_t, void *arg);
+
+/*
+ * Reserve a consecutive block of machine ids: the next `count` ids are
+ * taken atomically under the machine manager lock and can then be
+ * assigned to machines created via machine_create_at().  Machines
+ * created between the reservation and the block creation get ids after
+ * the reserved block.
+ */
+MACHINE_API int64_t machine_reserve_ids(int count);
+
+/* create a machine with an id reserved by machine_reserve_ids() */
+MACHINE_API int64_t machine_create_at(uint64_t machine_id, char *name,
+				      machine_coroutine_t, void *arg);
+
+MACHINE_API void machine_stop_current(void);
+
+MACHINE_API int machine_active(void);
+
+MACHINE_API uint64_t machine_self(void);
+
+MACHINE_API void **machine_thread_private(void);
+
+MACHINE_API int machine_wait(uint64_t machine_id);
+
+MACHINE_API int machine_stop(uint64_t machine_id);
+
+MACHINE_API int machinarium_check_stack_depth(void);
+
+/* time */
+
+MACHINE_API uint64_t machine_time_ms(void);
+
+MACHINE_API uint64_t machine_time_us(void);
+
+MACHINE_API int64_t machine_timeofday_sec(void);
+
+MACHINE_API void
+machine_stat(uint64_t *coroutine_count, uint64_t *coroutine_cache_count,
+	     uint64_t *msg_allocated, uint64_t *msg_cache_count,
+	     uint64_t *msg_cache_gc_count, uint64_t *msg_cache_size);
+
+/* signals */
+
+MACHINE_API int machine_signal_init(sigset_t *, sigset_t *);
+
+MACHINE_API int machine_signal_wait(uint32_t time_ms);
+
+/* coroutine */
+
+MACHINE_API int64_t machine_coroutine_create(machine_coroutine_t, void *arg);
+
+MACHINE_API int64_t machine_coroutine_create_named(machine_coroutine_t, void *,
+						   const char *);
+
+MACHINE_API int64_t machine_coroutine_create_system(machine_coroutine_t, void *,
+						    const char *);
+
+MACHINE_API void machine_sleep(uint32_t time_ms);
+
+MACHINE_API int machine_join(uint64_t coroutine_id);
+
+MACHINE_API int machine_cancel(uint64_t coroutine_id);
+
+MACHINE_API int machine_cancelled(void);
+
+MACHINE_API int machine_timedout(void);
+
+MACHINE_API int machine_errno(void);
+
+MACHINE_API int machine_errno_retryable(int errno_);
+
+MACHINE_API int machine_accept_errno_retryable(int errno_);
+
+MACHINE_API const char *machine_coroutine_get_name(uint64_t coroutine_id);
+
+/* condition */
+
+MACHINE_API machine_cond_t *machine_cond_create(void);
+
+MACHINE_API void machine_cond_free(machine_cond_t *);
+
+MACHINE_API void machine_cond_propagate(machine_cond_t *, machine_cond_t *);
+
+MACHINE_API void machine_cond_signal(machine_cond_t *);
+
+MACHINE_API int machine_cond_wait(machine_cond_t *, uint32_t time_ms);
+
+/* msg */
+
+MACHINE_API machine_msg_t *machine_msg_create(int reserve);
+
+MACHINE_API machine_msg_t *machine_msg_create_or_advance(machine_msg_t *,
+							 int size);
+
+MACHINE_API void machine_msg_free(machine_msg_t *);
+
+MACHINE_API void machine_msg_free_safe(machine_msg_t *obj);
+
+MACHINE_API void machine_msg_set_type(machine_msg_t *, int type);
+
+MACHINE_API int machine_msg_type(machine_msg_t *);
+
+MACHINE_API void *machine_msg_data(machine_msg_t *);
+
+MACHINE_API int machine_msg_size(machine_msg_t *);
+
+MACHINE_API void machine_msg_reset(machine_msg_t *);
+
+MACHINE_API int machine_msg_shrink(machine_msg_t *, int size);
+
+MACHINE_API int machine_msg_write(machine_msg_t *, void *buf, int size);
+
+MACHINE_API machine_msg_t *machine_msg_copy(machine_msg_t *msg);
+
+MACHINE_API struct iovec machine_msg_iovec(machine_msg_t *msg);
+
+/* channel */
+
+MACHINE_API machine_channel_t *machine_channel_create(void);
+
+MACHINE_API void machine_channel_free(machine_channel_t *);
+
+MACHINE_API void
+machine_channel_assign_limit_policy(machine_channel_t *obj, int limit,
+				    mm_channel_limit_policy_t policy);
+
+MACHINE_API mm_retcode_t machine_channel_write(machine_channel_t *,
+					       machine_msg_t *);
+
+/*
+ * A delivered message is returned even if the wait also times out or is
+ * cancelled. NULL means no message was delivered; inspect machine_errno()
+ * only then. Returning a message does not clear coroutine cancellation.
+ */
+MACHINE_API machine_msg_t *machine_channel_read(machine_channel_t *,
+						uint32_t time_ms);
+
+MACHINE_API machine_msg_t *machine_channel_read_back(machine_channel_t *,
+						     uint32_t time_ms);
+
+MACHINE_API size_t machine_channel_get_size(machine_channel_t *chan);
+
+/* tls */
+
+MACHINE_API machine_tls_t *machine_tls_create(void);
+
+MACHINE_API void machine_tls_free(machine_tls_t *);
+
+MACHINE_API int machine_tls_set_verify(machine_tls_t *, char *);
+
+MACHINE_API int machine_tls_set_server(machine_tls_t *, char *);
+
+MACHINE_API int machine_tls_set_protocols(machine_tls_t *, char *);
+
+MACHINE_API int machine_tls_set_ca_path(machine_tls_t *, char *);
+
+MACHINE_API int machine_tls_set_ca_file(machine_tls_t *, char *);
+
+MACHINE_API int machine_tls_set_cert_file(machine_tls_t *, char *);
+
+MACHINE_API int machine_tls_set_key_file(machine_tls_t *, char *);
+
+MACHINE_API void machine_tls_cache_invalidate(void);
+
+/* dns */
+
+MACHINE_API int machine_getsockname(mm_io_t *, struct sockaddr *, int *);
+
+MACHINE_API int machine_getpeername(mm_io_t *, struct sockaddr *, int *);
+
+/* read */
+
+MACHINE_API ssize_t machine_read_raw(mm_io_t *, void *, size_t);
+
+/*
+ * Returns 1 if there are some bytes in io, that are ready to be read.
+ */
+MACHINE_API int machine_read_pending(mm_io_t *);
+
+MACHINE_API machine_msg_t *machine_read(mm_io_t *, size_t, uint32_t time_ms);
+
+/* write */
+
+MACHINE_API ssize_t machine_write_raw(mm_io_t *, const void *, size_t,
+				      size_t *);
+
+MACHINE_API ssize_t machine_writev_raw(mm_io_t *, const struct iovec *iov,
+				       int iovcnt, size_t *processed);
+
+MACHINE_API int machine_write(mm_io_t *, machine_msg_t *, uint32_t time_ms);
+
+MACHINE_API int machine_write_no_free(mm_io_t *, machine_msg_t *,
+				      uint32_t time_ms);
+
+/* lrand48 */
+MACHINE_API void machine_lrand48_seed(void);
+MACHINE_API long int machine_lrand48(void);
+MACHINE_API double machine_erand48(unsigned short xseed[3]);
+
+/* stat/debug */
+
+MACHINE_API int machine_io_sysfd(mm_io_t *);
+
+MACHINE_API int machine_io_mask(mm_io_t *);
+
+MACHINE_API int machine_io_mm_fd(mm_io_t *);
+
+/* tls cert hash */
+
+MACHINE_API ssize_t machine_tls_cert_hash(
+	mm_io_t *obj, unsigned char (*cert_hash)[MM_CERT_HASH_LEN],
+	unsigned int *len);
+
+/* compression */
+MACHINE_API char
+machine_compression_choose_alg(char *client_compression_algorithms);
+
+/* debug tools */
+
+/*
+ * note: backtrace functions are currently slow
+ * if you want bt collection to be fast, impl should be rewritten
+ */
+MACHINE_API const char *machine_get_backtrace_string(void);
+MACHINE_API int machine_get_backtrace(void **entries, int max);
+
+/* wait group */
+
+/*
+See pkg.go.dev/sync#WaitGroup for reference.
+
+There are two main differences between this wait group and the one from Go:
+1. The user can pass a timeout in wait(). Obviously, there are no synchronization guarantees in case of wait() timing out.
+2. There is a destroy() method that needs to be called to free the memory.
+
+The user should ensure that destroy() is called after all wait() calls are completed. Possible examples:
+
+1. A simple scenario with two coroutines (or threads) and a single wait() call.
+The first thread creates a wait group, calls add(), spawns the second thread, calls wait() and calls destroy().
+The second thread calls done().
+See test_wait_group_simple.c for a code example.
+
+2. A scenario with multiple wait() calls from different threads.
+Another wait group is used to wait (without timeout) until all wait() calls of the first wait group are completed.
+(This assumes that every thread that calls wait() on the first wait group also calls done() on the second wait group afterwards.)
+See test_wait_group_lifetime.c for a code example.
+*/
+MACHINE_API machine_wait_group_t *machine_wait_group_create(void);
+
+/* See notes above before using. */
+MACHINE_API void machine_wait_group_destroy(machine_wait_group_t *group);
+MACHINE_API void machine_wait_group_add(machine_wait_group_t *group);
+
+/* This method exists for debug purposes only. It doesn't guarantee anything. */
+MACHINE_API uint64_t machine_wait_group_count(machine_wait_group_t *group);
+MACHINE_API void machine_wait_group_done(machine_wait_group_t *group);
+MACHINE_API int machine_wait_group_wait(machine_wait_group_t *group,
+					uint32_t timeout_ms);
+
+/* wait flag */
+
+/* 
+A wait flag is a simple synchronization primitive. It is one-shot, in other words, it can't be unset.
+
+It is safe to use from multiple workers. Both set and wait functions can be called multiple times.
+*/
+machine_wait_flag_t *machine_wait_flag_create(void);
+void machine_wait_flag_destroy(machine_wait_flag_t *flag);
+void machine_wait_flag_set(machine_wait_flag_t *flag);
+int machine_wait_flag_wait(machine_wait_flag_t *flag, uint32_t timeout_ms);
+
+/* ring buffer */
+MACHINE_API machine_ring_buffer_t *machine_ring_buffer_create(size_t capacity);
+MACHINE_API void machine_ring_buffer_free(machine_ring_buffer_t *rbuf);
+
+MACHINE_API size_t machine_ring_buffer_read(machine_ring_buffer_t *rbuf,
+					    void *out, size_t count);
+MACHINE_API size_t machine_ring_buffer_drain(machine_ring_buffer_t *rbuf,
+					     size_t count);
+MACHINE_API size_t machine_ring_buffer_write(machine_ring_buffer_t *rbuf,
+					     const void *data, size_t count);
+
+MACHINE_API size_t machine_ring_buffer_size(const machine_ring_buffer_t *rbuf);
+MACHINE_API size_t
+machine_ring_buffer_capacity(const machine_ring_buffer_t *rbuf);
+MACHINE_API size_t
+machine_ring_buffer_available(const machine_ring_buffer_t *rbuf);
+MACHINE_API int machine_ring_buffer_is_full(const machine_ring_buffer_t *rbuf);
+
+#ifdef __cplusplus
+}
+#endif

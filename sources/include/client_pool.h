@@ -1,0 +1,133 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <types.h>
+#include <list.h>
+#include <client.h>
+
+typedef int (*od_client_pool_cb_t)(od_client_t *, void **);
+
+struct od_client_pool {
+	od_list_t active;
+	od_list_t queue;
+	od_list_t pending;
+	int count_active;
+	int count_queue;
+	int count_pending;
+};
+
+static inline void od_client_pool_init(od_client_pool_t *pool)
+{
+	pool->count_active = 0;
+	pool->count_queue = 0;
+	pool->count_pending = 0;
+	od_list_init(&pool->active);
+	od_list_init(&pool->queue);
+	od_list_init(&pool->pending);
+}
+
+static inline void od_client_pool_set(od_client_pool_t *pool,
+				      od_client_t *client,
+				      od_client_state_t state)
+{
+	if (client->state == state) {
+		return;
+	}
+	switch (client->state) {
+	case OD_CLIENT_UNDEF:
+		break;
+	case OD_CLIENT_ACTIVE:
+		pool->count_active--;
+		break;
+	case OD_CLIENT_QUEUE:
+		pool->count_queue--;
+		break;
+	case OD_CLIENT_PENDING:
+		pool->count_pending--;
+		break;
+	}
+	od_list_t *target = NULL;
+	switch (state) {
+	case OD_CLIENT_UNDEF:
+		break;
+	case OD_CLIENT_ACTIVE:
+		target = &pool->active;
+		pool->count_active++;
+		break;
+	case OD_CLIENT_QUEUE:
+		target = &pool->queue;
+		pool->count_queue++;
+		break;
+	case OD_CLIENT_PENDING:
+		target = &pool->pending;
+		pool->count_pending++;
+		break;
+	}
+	od_list_unlink(&client->link_pool);
+	od_list_init(&client->link_pool);
+	if (target) {
+		od_list_append(target, &client->link_pool);
+	}
+	client->state = state;
+}
+
+static inline od_client_t *od_client_pool_foreach(od_client_pool_t *pool,
+						  od_client_state_t state,
+						  od_client_pool_cb_t callback,
+						  void **argv)
+{
+	od_list_t *target = NULL;
+	switch (state) {
+	case OD_CLIENT_ACTIVE:
+		target = &pool->active;
+		break;
+	case OD_CLIENT_QUEUE:
+		target = &pool->queue;
+		break;
+	case OD_CLIENT_PENDING:
+		target = &pool->pending;
+		break;
+	case OD_CLIENT_UNDEF:
+		od_assert(0);
+		break;
+	}
+	od_client_t *client;
+	od_list_t *i, *n;
+	od_list_foreach_safe (target, i, n) {
+		client = od_container_of(i, od_client_t, link_pool);
+		int rc;
+		rc = callback(client, argv);
+		if (rc) {
+			return client;
+		}
+	}
+	return NULL;
+}
+
+static inline int od_client_pool_total(od_client_pool_t *pool)
+{
+	return pool->count_active + pool->count_queue + pool->count_pending;
+}
+
+/* age of the longest-queued client, 0 if none; queue head is the oldest */
+static inline uint64_t od_client_pool_max_queue_time_us(od_client_pool_t *pool,
+							uint64_t now_us)
+{
+	if (pool->count_queue == 0) {
+		return 0;
+	}
+
+	od_client_t *oldest =
+		od_container_of(pool->queue.next, od_client_t, link_pool);
+
+	if (now_us <= oldest->time_queue_start) {
+		return 0;
+	}
+
+	return now_us - oldest->time_queue_start;
+}

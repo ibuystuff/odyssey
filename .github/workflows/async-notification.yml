@@ -1,0 +1,36 @@
+name: Async notification proxy
+on:
+  push:
+    branches: [ master, 'REL_*' ]
+  pull_request:
+    branches: [ master ]
+    paths:
+      - ".github/actions/test-logs/**"
+      - ".github/workflows/async-notification.yml"
+      - "sources/**"
+      - "test/**"
+      - "CMakeLists.txt"
+      - "docker/**"
+      - "modules/**"
+      - "cmake/**"
+      - "!docker/prom-exporter/**"
+      - "!test/prom-exporter/**"
+      - "!sources/machinarium/gdb/**"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  async-notification:
+    name: async-notification
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Test with async notifications against Odyssey
+      shell: bash
+      run: make async-notice-test 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs

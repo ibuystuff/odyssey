@@ -1,790 +1,1059 @@
 
+
 /*
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <assert.h>
+#include <odyssey.h>
 
-#include <machinarium.h>
+#include <unistd.h>
+#include <sys/un.h>
 
-#include "sources/macro.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/config.h"
+#include <machinarium/machinarium.h>
+
+#include <status.h>
+#include <types.h>
+#include <router.h>
+#include <config.h>
+#include <tls.h>
+#include <od_memory.h>
+#include <util.h>
+#include <duration.h>
 
 void od_config_init(od_config_t *config)
 {
 	config->daemonize = 0;
+	config->priority = 0;
+	config->sequential_routing = 0;
 	config->log_debug = 0;
+	config->log_debug_sampling = 100;
+	config->maintain_params = 1;
 	config->log_to_stdout = 1;
 	config->log_config = 0;
 	config->log_session = 1;
 	config->log_query = 0;
+	config->log_query_sampling = 100;
 	config->log_file = NULL;
 	config->log_stats = 1;
+	config->log_async = 1;
+	config->log_queue_depth = 30000;
+	config->log_general_stats_prom = 0;
+	config->log_route_stats_prom = 0;
 	config->stats_interval = 3;
 	config->log_format = NULL;
 	config->pid_file = NULL;
+	config->unix_socket_dir = NULL;
+	config->locks_dir = NULL;
+	config->external_auth_socket_path = NULL;
+	config->enable_online_restart_feature = 1;
+	config->conn_drop_options.drop_enabled = 1;
+	config->conn_drop_options.rate = 1;
+	config->conn_drop_options.interval_ms = 1000; /* 1 sec */
+	config->bindwith_reuseport = 1;
+	config->graceful_die_on_errors = 0;
+	config->unix_socket_mode = NULL;
+
+	config->virtual_transaction = 1;
+
 	config->log_syslog = 0;
 	config->log_syslog_ident = NULL;
 	config->log_syslog_facility = NULL;
-	config->readahead = 8192;
+
+	config->readahead = sysconf(_SC_PAGESIZE);
 	config->nodelay = 1;
-	config->keepalive = 7200;
+	config->disable_nolinger = 0;
+
+	config->keepalive = 15;
+	config->keepalive_keep_interval = 5;
+	config->keepalive_probes = 3;
+	config->keepalive_usr_timeout_ms = 0; /* use sys default */
+
+	config->cpu_affinity = NULL;
+	// od_affinity_config_init(&config->cpu_affinity);
+
 	config->workers = 1;
 	config->resolvers = 1;
 	config->client_max_set = 0;
 	config->client_max = 0;
-	config->cache = 100;
-	config->cache_chunk = 0;
-	config->cache_coroutine = 0;
-	config->pipeline = 32 * 1024;
-	od_list_init(&config->storages);
-	od_list_init(&config->routes);
+	config->client_max_routing = 0;
+	config->accept_rate_limit = 0;
+	config->server_login_retry_ms = 1;
+	config->cache_coroutine = 1024;
+	config->cache_msg_gc_size = 0;
+	config->cache_msg_gc_count = 1024;
+	config->coroutine_stack_size = 16;
+	config->system_coroutine_stack_size = 32;
+	config->hba_file = NULL;
+	config->max_sigterms_to_die = 3;
+	config->group_checker_interval_ms = 7000; /* 7 seconds */
+
+	config->auth_query_cache_ttl_ms = 10 * 1000; /* 10 seconds */
+	config->auth_query_cache_ttl_jitter_ms = 5 * 1000; /* up to 5 seconds */
+	config->auth_query_cache_error_retry_ms = 1000; /* 1 second */
+	config->auth_query_cache_stale_on_error = 1;
+	config->auth_query_timeout_ms = 500; /* 500 ms */
 	od_list_init(&config->listen);
+
+	config->backend_connect_timeout_ms = 30U * 1000U; /* 30 seconds */
+	config->cancel_timeout_ms = 1U * 1000U; /* 1 seconds */
+	config->cancel_queue_timeout_ms = -1;
+	config->cancel_max_inflight = -1;
+	config->cancel_rate_limit = 0;
+	config->ignore_cancel = 0;
+	config->virtual_processing = 0;
+	config->replication_proxy_phys = 0;
+	config->replication_proxy_logic = 0;
+
+	config->graceful_shutdown_timeout_ms = 30 * 1000; /* 30 seconds */
+
+	memset(config->availability_zone, 0, sizeof(config->availability_zone));
+
+	memset(&config->soft_oom, 0, sizeof(config->soft_oom));
+	config->soft_oom.check_interval_ms = 1000;
+	config->soft_oom.drop.enabled = 0;
+	config->soft_oom.drop.max_rate = 3;
+	config->soft_oom.drop.signal = SIGTERM;
+
+	memset(&config->query_parsing, 0, sizeof(config->query_parsing));
+	config->query_parsing.mem_limit_bytes = 5 * 1024 * 1024;
+	config->query_parsing.mode = OD_CONFIG_QUERY_PARSING_MODE_MINIMAL;
+	config->query_parsing.max_query_len = 10000;
+
+	config->host_watcher_enabled = 0;
+
+	config->smart_search_path_enquoting = 0;
+
+	config->dns_cache_ttl_ms = 30 * 1000;
 }
 
-static void
-od_configlisten_free(od_configlisten_t*);
+void od_config_reload(od_config_t *current_config, od_config_t *new_config)
+{
+	current_config->log_debug = new_config->log_debug;
+	current_config->log_debug_sampling = new_config->log_debug_sampling;
+	current_config->maintain_params = new_config->maintain_params;
+	current_config->log_config = new_config->log_config;
+	current_config->log_session = new_config->log_session;
+	current_config->log_query = new_config->log_query;
+	current_config->log_query_sampling = new_config->log_query_sampling;
+	current_config->log_stats = new_config->log_stats;
+	current_config->stats_interval = new_config->stats_interval;
+	current_config->client_max_set = new_config->client_max_set;
+	current_config->client_max = new_config->client_max;
+	current_config->max_sigterms_to_die = new_config->max_sigterms_to_die;
+	current_config->client_max_routing = new_config->client_max_routing;
+	current_config->accept_rate_limit = new_config->accept_rate_limit;
+	current_config->server_login_retry_ms =
+		new_config->server_login_retry_ms;
+	current_config->backend_connect_timeout_ms =
+		new_config->backend_connect_timeout_ms;
+	current_config->cancel_timeout_ms = new_config->cancel_timeout_ms;
+	current_config->ignore_cancel = new_config->ignore_cancel;
+	current_config->smart_search_path_enquoting =
+		new_config->smart_search_path_enquoting;
+	current_config->disable_nolinger = new_config->disable_nolinger;
+	current_config->replication_proxy_phys =
+		new_config->replication_proxy_phys;
+	current_config->replication_proxy_logic =
+		new_config->replication_proxy_logic;
+	current_config->keepalive = new_config->keepalive;
+	current_config->keepalive_keep_interval =
+		new_config->keepalive_keep_interval;
+	current_config->keepalive_probes = new_config->keepalive_probes;
+	current_config->keepalive_usr_timeout_ms =
+		new_config->keepalive_usr_timeout_ms;
+	current_config->graceful_shutdown_timeout_ms =
+		new_config->graceful_shutdown_timeout_ms;
+	current_config->auth_query_cache_ttl_ms =
+		new_config->auth_query_cache_ttl_ms;
+	current_config->auth_query_cache_ttl_jitter_ms =
+		new_config->auth_query_cache_ttl_jitter_ms;
+	current_config->auth_query_cache_error_retry_ms =
+		new_config->auth_query_cache_error_retry_ms;
+	current_config->auth_query_cache_stale_on_error =
+		new_config->auth_query_cache_stale_on_error;
+	current_config->auth_query_timeout_ms =
+		new_config->auth_query_timeout_ms;
+}
+
+static void od_config_listen_free(od_config_listen_t *);
 
 void od_config_free(od_config_t *config)
 {
 	od_list_t *i, *n;
-	od_list_foreach_safe(&config->routes, i, n) {
-		od_configroute_t *route;
-		route = od_container_of(i, od_configroute_t, link);
-		od_configroute_free(route);
+	od_list_foreach_safe (&config->listen, i, n) {
+		od_config_listen_t *listen;
+		listen = od_container_of(i, od_config_listen_t, link);
+		od_config_listen_free(listen);
 	}
-	od_list_foreach_safe(&config->listen, i, n) {
-		od_configlisten_t *listen;
-		listen = od_container_of(i, od_configlisten_t, link);
-		od_configlisten_free(listen);
+	if (config->unix_socket_mode) {
+		od_free(config->unix_socket_mode);
 	}
-	if (config->log_file)
-		free(config->log_file);
-	if (config->log_format)
-		free(config->log_format);
-	if (config->pid_file)
-		free(config->pid_file);
-	if (config->log_syslog_ident)
-		free(config->log_syslog_ident);
-	if (config->log_syslog_facility)
-		free(config->log_syslog_facility);
+	if (config->log_file) {
+		od_free(config->log_file);
+	}
+	if (config->log_format) {
+		od_free(config->log_format);
+	}
+	if (config->pid_file) {
+		od_free(config->pid_file);
+	}
+	if (config->unix_socket_dir) {
+		od_free(config->unix_socket_dir);
+	}
+	if (config->log_syslog_ident) {
+		od_free(config->log_syslog_ident);
+	}
+	if (config->log_syslog_facility) {
+		od_free(config->log_syslog_facility);
+	}
+	if (config->locks_dir) {
+		od_free(config->locks_dir);
+		if (config->hba_file) {
+			od_free(config->hba_file);
+		}
+	}
+	if (config->external_auth_socket_path) {
+		od_free(config->external_auth_socket_path);
+	}
+	if (config->cpu_affinity) {
+		od_free(config->cpu_affinity);
+	}
+
+	od_config_query_parsing_t *qp = &config->query_parsing;
+	for (size_t i = 0; i < qp->standby_function_names_count; ++i) {
+		od_free(qp->standby_function_names[i]);
+	}
+	if (qp->standby_function_names) {
+		od_free(qp->standby_function_names);
+	}
 }
 
-od_configlisten_t*
-od_configlisten_add(od_config_t *config)
+od_config_listen_t *od_config_listen_add(od_config_t *config)
 {
-	od_configlisten_t *listen;
-	listen = (od_configlisten_t*)malloc(sizeof(*config));
-	if (listen == NULL)
+	od_config_listen_t *listen =
+		(od_config_listen_t *)od_malloc(sizeof(od_config_listen_t));
+	if (listen == NULL) {
 		return NULL;
+	}
+
 	memset(listen, 0, sizeof(*listen));
+
+	listen->tls_opts = od_tls_opts_alloc();
+	if (listen->tls_opts == NULL) {
+		od_free(listen);
+		return NULL;
+	}
+
 	listen->port = 6432;
 	listen->backlog = 128;
+	listen->client_login_timeout_ms = 15000;
+	listen->reserved_clients = -1; /* disabled */
+	listen->target_session_attrs = OD_TARGET_SESSION_ATTRS_UNDEF;
+	listen->auto_route_ro_on_standby = 0;
+	listen->balancing_override_set = 0;
+	od_storage_balancing_init(&listen->balancing_override);
+
 	od_list_init(&listen->link);
 	od_list_append(&config->listen, &listen->link);
+
 	return listen;
 }
 
-static void
-od_configlisten_free(od_configlisten_t *config)
+static void od_config_listen_free(od_config_listen_t *config)
 {
-	if (config->host)
-		free(config->host);
-	if (config->tls)
-		free(config->tls);
-	if (config->tls_ca_file)
-		free(config->tls_ca_file);
-	if (config->tls_key_file)
-		free(config->tls_key_file);
-	if (config->tls_cert_file)
-		free(config->tls_cert_file);
-	if (config->tls_protocols)
-		free(config->tls_protocols);
-	free(config);
-}
-
-static inline od_configstorage_t*
-od_configstorage_allocate(void)
-{
-	od_configstorage_t *storage;
-	storage = (od_configstorage_t*)malloc(sizeof(*storage));
-	if (storage == NULL)
-		return NULL;
-	memset(storage, 0, sizeof(*storage));
-	od_list_init(&storage->link);
-	return storage;
-}
-
-void
-od_configstorage_free(od_configstorage_t *storage)
-{
-	if (storage->name)
-		free(storage->name);
-	if (storage->type)
-		free(storage->type);
-	if (storage->host)
-		free(storage->host);
-	if (storage->tls)
-		free(storage->tls);
-	if (storage->tls_ca_file)
-		free(storage->tls_ca_file);
-	if (storage->tls_key_file)
-		free(storage->tls_key_file);
-	if (storage->tls_cert_file)
-		free(storage->tls_cert_file);
-	if (storage->tls_protocols)
-		free(storage->tls_protocols);
-	od_list_unlink(&storage->link);
-	free(storage);
-}
-
-od_configstorage_t*
-od_configstorage_add(od_config_t *config)
-{
-	od_configstorage_t *storage;
-	storage = od_configstorage_allocate();
-	if (storage == NULL)
-		return NULL;
-	od_list_append(&config->storages, &storage->link);
-	return storage;
-}
-
-od_configstorage_t*
-od_configstorage_match(od_config_t *config, char *name)
-{
-	od_list_t *i;
-	od_list_foreach(&config->storages, i) {
-		od_configstorage_t *storage;
-		storage = od_container_of(i, od_configstorage_t, link);
-		if (strcmp(storage->name, name) == 0)
-			return storage;
-	}
-	return NULL;
-}
-
-od_configstorage_t*
-od_configstorage_copy(od_configstorage_t *storage)
-{
-	od_configstorage_t *copy;
-	copy = od_configstorage_allocate();
-	if (copy == NULL)
-		return NULL;
-	copy->storage_type = storage->storage_type;
-	copy->name = strdup(storage->name);
-	if (copy->name == NULL)
-		goto error;
-	copy->type = strdup(storage->type);
-	if (copy->type == NULL)
-		goto error;
-	if (storage->host) {
-		copy->host = strdup(storage->host);
-		if (copy->host == NULL)
-			goto error;
-	}
-	copy->port = storage->port;
-	copy->tls_mode = storage->tls_mode;
-	if (storage->tls) {
-		copy->tls = strdup(storage->tls);
-		if (copy->tls == NULL)
-			goto error;
-	}
-	if (storage->tls_ca_file) {
-		copy->tls_ca_file = strdup(storage->tls_ca_file);
-		if (copy->tls_ca_file == NULL)
-			goto error;
-	}
-	if (storage->tls_key_file) {
-		copy->tls_key_file = strdup(storage->tls_key_file);
-		if (copy->tls_key_file == NULL)
-			goto error;
-	}
-	if (storage->tls_cert_file) {
-		copy->tls_cert_file = strdup(storage->tls_cert_file);
-		if (copy->tls_cert_file == NULL)
-			goto error;
-	}
-	if (storage->tls_protocols) {
-		copy->tls_protocols = strdup(storage->tls_protocols);
-		if (copy->tls_protocols == NULL)
-			goto error;
-	}
-	return copy;
-error:
-	od_configstorage_free(copy);
-	return NULL;
-}
-
-od_configauth_t*
-od_configauth_add(od_configroute_t *route)
-{
-	od_configauth_t *auth;
-	auth = (od_configauth_t*)malloc(sizeof(*auth));
-	if (auth == NULL)
-		return NULL;
-	memset(auth, 0, sizeof(*auth));
-	od_list_init(&auth->link);
-	od_list_append(&route->auth_common_names, &auth->link);
-	return auth;
-}
-
-void
-od_configauth_free(od_configauth_t *auth)
-{
-	if (auth->common_name)
-		free(auth->common_name);
-	free(auth);
-}
-
-od_configroute_t*
-od_configroute_add(od_config_t *config)
-{
-	od_configroute_t *route;
-	route = (od_configroute_t*)malloc(sizeof(*route));
-	if (route == NULL)
-		return NULL;
-	memset(route, 0, sizeof(*route));
-	route->pool_size = 0;
-	route->pool_timeout = 0;
-	route->pool_cancel = 1;
-	route->pool_rollback = 1;
-	route->auth_common_name_default = 0;
-	od_list_init(&route->auth_common_names);
-	od_list_init(&route->link);
-	od_list_append(&config->routes, &route->link);
-	return route;
-}
-
-void od_configroute_free(od_configroute_t *route)
-{
-	if (route->db_name)
-		free(route->db_name);
-	if (route->user_name)
-		free(route->user_name);
-	if (route->password)
-		free(route->password);
-	if (route->auth)
-		free(route->auth);
-	if (route->auth_query)
-		free(route->auth_query);
-	if (route->auth_query_db)
-		free(route->auth_query_db);
-	if (route->auth_query_user)
-		free(route->auth_query_user);
-	if (route->storage)
-		od_configstorage_free(route->storage);
-	if (route->storage_name)
-		free(route->storage_name);
-	if (route->storage_db)
-		free(route->storage_db);
-	if (route->storage_user)
-		free(route->storage_user);
-	if (route->storage_password)
-		free(route->storage_password);
-	if (route->pool_sz)
-		free(route->pool_sz);
-	od_list_t *i, *n;
-	od_list_foreach_safe(&route->auth_common_names, i, n) {
-		od_configauth_t *auth;
-		auth = od_container_of(i, od_configauth_t, link);
-		od_configauth_free(auth);
-	}
-	od_list_unlink(&route->link);
-	free(route);
-}
-
-static inline void
-od_configroute_cmpswap(od_configroute_t **dest, od_configroute_t *next)
-{
-	*dest = next;
-}
-
-od_configroute_t*
-od_configroute_forward(od_config_t *config, char *db_name, char *user_name)
-{
-	od_configroute_t *route_db_user = NULL;
-	od_configroute_t *route_db_default = NULL;
-	od_configroute_t *route_default_user = NULL;
-	od_configroute_t *route_default_default = NULL;
-
-	od_list_t *i;
-	od_list_foreach(&config->routes, i) {
-		od_configroute_t *route;
-		route = od_container_of(i, od_configroute_t, link);
-		if (route->db_is_default) {
-			if (route->user_is_default)
-				od_configroute_cmpswap(&route_default_default, route);
-			else
-			if (strcmp(route->user_name, user_name) == 0)
-				od_configroute_cmpswap(&route_default_user, route);
-		} else
-		if (strcmp(route->db_name, db_name) == 0) {
-			if (route->user_is_default)
-				od_configroute_cmpswap(&route_db_default, route);
-			else
-			if (strcmp(route->user_name, user_name) == 0)
-				od_configroute_cmpswap(&route_db_user, route);
-		}
+	if (config->host) {
+		od_free(config->host);
 	}
 
-	if (route_db_user)
-		return route_db_user;
-
-	if (route_db_default)
-		return route_db_default;
-
-	if (route_default_user)
-		return route_default_user;
-
-	return route_default_default;
-}
-
-od_configroute_t*
-od_configroute_match(od_config_t *config, char *db_name, char *user_name)
-{
-	od_list_t *i;
-	od_list_foreach(&config->routes, i) {
-		od_configroute_t *route;
-		route = od_container_of(i, od_configroute_t, link);
-		if (strcmp(route->db_name, db_name) == 0 &&
-		    strcmp(route->user_name, user_name) == 0)
-			return route;
+	if (config->tls_opts) {
+		od_tls_opts_free(config->tls_opts);
 	}
-	return NULL;
+
+	od_storage_balancing_destroy(&config->balancing_override);
+
+	for (size_t i = 0; i < config->storage_count; ++i) {
+		od_free(config->storage_names[i]);
+	}
+	od_free(config->storage_names);
+
+	od_free(config);
 }
 
 int od_config_validate(od_config_t *config, od_logger_t *logger)
 {
-	/* workers */
-	if (config->workers == 0) {
-		od_error(logger, "config", NULL, NULL, "bad workers number");
+	if (config->workers <= 0) {
+		od_error(logger, NULL, NULL, "bad workers number");
 		return -1;
 	}
 
-	/* resolvers */
-	if (config->resolvers == 0) {
-		od_error(logger, "config", NULL, NULL, "bad resolvers number");
+	if (config->resolvers <= 0) {
+		od_error(logger, NULL, NULL, "bad resolvers number");
 		return -1;
 	}
 
-	/* log format */
+	if (config->coroutine_stack_size < 4) {
+		od_error(logger, NULL, NULL, "bad coroutine_stack_size number");
+		return -1;
+	}
+
+	if (config->system_coroutine_stack_size < 4) {
+		od_error(logger, NULL, NULL,
+			 "bad system_coroutine_stack_size number");
+		return -1;
+	}
+
 	if (config->log_format == NULL) {
-		od_error(logger, "config", NULL, NULL, "log is not defined");
+		od_error(logger, NULL, NULL, "log_format is not defined");
 		return -1;
+	}
+
+	/* unix_socket_mode */
+	if (config->unix_socket_dir) {
+		if (config->unix_socket_mode == NULL) {
+			od_error(logger, NULL, NULL,
+				 "unix_socket_mode is not set");
+			return -1;
+		}
 	}
 
 	/* listen */
 	if (od_list_empty(&config->listen)) {
-		od_error(logger, "config", NULL, NULL, "no listen servers defined");
+		od_error(logger, NULL, NULL, "no listen servers defined");
 		return -1;
 	}
+
 	od_list_t *i;
-	od_list_foreach(&config->listen, i) {
-		od_configlisten_t *listen;
-		listen = od_container_of(i, od_configlisten_t, link);
+	od_list_foreach (&config->listen, i) {
+		od_config_listen_t *listen;
+		listen = od_container_of(i, od_config_listen_t, link);
 		if (listen->host == NULL) {
-			od_error(logger, "config", NULL, NULL, "listen host is not defined");
-			return -1;
+			if (config->unix_socket_dir == NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"listen host is not set and no unix_socket_dir is specified");
+				return -1;
+			}
+
+			/*
+			 * unix socket path must fit into sockaddr_un.sun_path
+			 */
+			char sock_path[sizeof(
+				((struct sockaddr_un *)0)->sun_path)];
+			if (od_unix_socket_path(sock_path, sizeof(sock_path),
+						config->unix_socket_dir,
+						listen->port) == -1) {
+				od_error(logger, NULL, NULL,
+					 "unix socket path '%s/.s.PGSQL.%d' is "
+					 "too long (maximum %d characters)",
+					 config->unix_socket_dir, listen->port,
+					 (int)sizeof(sock_path) - 1);
+				return -1;
+			}
 		}
-		/* tls */
-		if (listen->tls) {
-			if (strcmp(listen->tls, "disable") == 0) {
-				listen->tls_mode = OD_TLS_DISABLE;
-			} else
-			if (strcmp(listen->tls, "allow") == 0) {
-				listen->tls_mode = OD_TLS_ALLOW;
-			} else
-			if (strcmp(listen->tls, "require") == 0) {
-				listen->tls_mode = OD_TLS_REQUIRE;
-			} else
-			if (strcmp(listen->tls, "verify_ca") == 0) {
-				listen->tls_mode = OD_TLS_VERIFY_CA;
-			} else
-			if (strcmp(listen->tls, "verify_full") == 0) {
-				listen->tls_mode = OD_TLS_VERIFY_FULL;
+
+		/* tls options */
+		if (listen->tls_opts->tls) {
+			if (strcmp(listen->tls_opts->tls, "disable") == 0) {
+				listen->tls_opts->tls_mode =
+					OD_CONFIG_TLS_DISABLE;
+			} else if (strcmp(listen->tls_opts->tls, "allow") ==
+				   0) {
+				listen->tls_opts->tls_mode =
+					OD_CONFIG_TLS_ALLOW;
+			} else if (strcmp(listen->tls_opts->tls, "prefer") ==
+				   0) {
+				listen->tls_opts->tls_mode =
+					OD_CONFIG_TLS_PREFER;
+			} else if (strcmp(listen->tls_opts->tls, "require") ==
+				   0) {
+				listen->tls_opts->tls_mode =
+					OD_CONFIG_TLS_REQUIRE;
+			} else if (strcmp(listen->tls_opts->tls, "verify_ca") ==
+				   0) {
+				listen->tls_opts->tls_mode =
+					OD_CONFIG_TLS_VERIFY_CA;
+			} else if (strcmp(listen->tls_opts->tls,
+					  "verify_full") == 0) {
+				listen->tls_opts->tls_mode =
+					OD_CONFIG_TLS_VERIFY_FULL;
 			} else {
-				od_error(logger, "config", NULL, NULL, "unknown tls mode");
+				od_error(logger, NULL, NULL,
+					 "unknown tls_opts->tls mode");
+				return -1;
+			}
+		}
+
+		/*
+		 * Report a broken certificate up front instead of failing
+		 * every connection later. With "allow" and "prefer" the
+		 * listener still serves plaintext clients, so only a mandatory
+		 * tls mode is a fatal config error.
+		 */
+		char tls_error[256];
+		if (listen->tls_opts->tls_mode != OD_CONFIG_TLS_DISABLE &&
+		    od_tls_frontend_validate(listen, tls_error,
+					     sizeof(tls_error)) !=
+			    OK_RESPONSE) {
+			int tls_optional = listen->tls_opts->tls_mode ==
+						   OD_CONFIG_TLS_ALLOW ||
+					   listen->tls_opts->tls_mode ==
+						   OD_CONFIG_TLS_PREFER;
+
+			od_error(
+				logger, NULL, NULL,
+				"failed to load tls certificate for %s:%d%s: %s",
+				od_config_listen_host_name(listen),
+				listen->port,
+				tls_optional ? ", serving plaintext only" : "",
+				tls_error);
+
+			if (!tls_optional) {
 				return -1;
 			}
 		}
 	}
 
-	/* storages */
-	if (od_list_empty(&config->storages)) {
-		od_error(logger, "config", NULL, NULL, "no storages defined");
-		return -1;
-	}
-	od_list_foreach(&config->storages, i) {
-		od_configstorage_t *storage;
-		storage = od_container_of(i, od_configstorage_t, link);
-		if (storage->type == NULL) {
-			od_error(logger, "config", NULL, NULL,
-			         "storage '%s': no type is specified",
-			         storage->name);
-			return -1;
-		}
-		if (strcmp(storage->type, "remote") == 0) {
-			storage->storage_type = OD_STORAGETYPE_REMOTE;
-		} else
-		if (strcmp(storage->type, "local") == 0) {
-			storage->storage_type = OD_STORAGETYPE_LOCAL;
-		} else {
-			od_error(logger, "config", NULL, NULL, "unknown storage type");
-			return -1;
-		}
-		if (storage->storage_type == OD_STORAGETYPE_REMOTE &&
-		    storage->host == NULL) {
-			od_error(logger, "config", NULL, NULL,
-			         "storage '%s': no remote host is specified",
-			         storage->name);
-			return -1;
-		}
-		if (storage->tls) {
-			if (strcmp(storage->tls, "disable") == 0) {
-				storage->tls_mode = OD_TLS_DISABLE;
-			} else
-			if (strcmp(storage->tls, "allow") == 0) {
-				storage->tls_mode = OD_TLS_ALLOW;
-			} else
-			if (strcmp(storage->tls, "require") == 0) {
-				storage->tls_mode = OD_TLS_REQUIRE;
-			} else
-			if (strcmp(storage->tls, "verify_ca") == 0) {
-				storage->tls_mode = OD_TLS_VERIFY_CA;
-			} else
-			if (strcmp(storage->tls, "verify_full") == 0) {
-				storage->tls_mode = OD_TLS_VERIFY_FULL;
-			} else {
-				od_error(logger, "config", NULL, NULL, "unknown storage tls mode");
-				return -1;
-			}
-		}
+	if (config->enable_online_restart_feature &&
+	    !config->bindwith_reuseport) {
+		od_error(
+			logger, NULL, NULL,
+			"online restart feature works only with SO_REUSEPORT. Disable "
+			"online restart or/and enable bindwith_reuseport");
+		return NOT_OK_RESPONSE;
 	}
 
-	/* routes */
-	if (od_list_empty(&config->routes)) {
-		od_error(logger, "config", NULL, NULL, "no routes defined");
-		return -1;
-	}
-	od_configroute_t *route_default_default = NULL;
-	od_list_foreach(&config->routes, i) {
-		od_configroute_t *route;
-		route = od_container_of(i, od_configroute_t, link);
-
-		/* ensure route default.default exists */
-		if (route->db_is_default && route->user_is_default) {
-			assert(! route_default_default);
-			route_default_default = route;
-		}
-
-		/* match storage and make a copy of in the user config */
-		if (route->storage_name == NULL) {
-			od_error(logger, "config", NULL, NULL,
-			         "route '%s.%s': no route storage is specified",
-			         route->db_name, route->user_name);
-			return -1;
-		}
-		od_configstorage_t *storage;
-		storage = od_configstorage_match(config, route->storage_name);
-		if (storage == NULL) {
-			od_error(logger, "config", NULL, NULL,
-			         "route '%s.%s': no route storage '%s' found",
-			         route->db_name, route->user_name);
-			return -1;
-		}
-		route->storage = od_configstorage_copy(storage);
-		if (route->storage == NULL)
-			return -1;
-
-		/* pooling mode */
-		if (! route->pool_sz) {
-			od_error(logger, "config", NULL, NULL,
-			         "route '%s.%s': pooling mode is not set",
-			         route->db_name, route->user_name);
-			return -1;
-		}
-		if (strcmp(route->pool_sz, "session") == 0) {
-			route->pool = OD_POOLING_SESSION;
-		} else
-		if (strcmp(route->pool_sz, "transaction") == 0) {
-			route->pool = OD_POOLING_TRANSACTION;
-		} else {
-			od_error(logger, "config", NULL, NULL,
-			         "route '%s.%s': unknown pooling mode",
-			         route->db_name, route->user_name);
-			return -1;
-		}
-
-		/* auth */
-		if (! route->auth) {
-			od_error(logger, "config", NULL, NULL,
-			         "route '%s.%s': authentication mode is not defined",
-			         route->db_name, route->user_name);
-			return -1;
-		}
-		if (strcmp(route->auth, "none") == 0) {
-			route->auth_mode = OD_AUTH_NONE;
-		} else
-		if (strcmp(route->auth, "block") == 0) {
-			route->auth_mode = OD_AUTH_BLOCK;
-		} else
-		if (strcmp(route->auth, "clear_text") == 0) {
-			route->auth_mode = OD_AUTH_CLEAR_TEXT;
-			if (route->password == NULL && route->auth_query == NULL) {
-				od_error(logger, "config", NULL, NULL,
-				         "route '%s.%s': password is not set",
-				         route->db_name, route->user_name);
-				return -1;
-			}
-		} else
-		if (strcmp(route->auth, "md5") == 0) {
-			route->auth_mode = OD_AUTH_MD5;
-			if (route->password == NULL && route->auth_query == NULL) {
-				od_error(logger, "config", NULL, NULL,
-				         "route '%s.%s': password is not set",
-				         route->db_name, route->user_name);
-				return -1;
-			}
-		} else
-		if (strcmp(route->auth, "cert") == 0) {
-			route->auth_mode = OD_AUTH_CERT;
-		} else {
-			od_error(logger, "config", NULL, NULL,
-			         "route '%s.%s': has unknown authentication mode",
-			         route->db_name, route->user_name);
-			return -1;
-		}
-
-		/* auth_query */
-		if (route->auth_query) {
-			if (route->auth_query_user == NULL) {
-				od_error(logger, "config", NULL, NULL,
-				         "route '%s.%s': auth_query_user is not set",
-				         route->db_name, route->user_name);
-				return -1;
-			}
-			if (route->auth_query_db == NULL) {
-				od_error(logger, "config", NULL, NULL,
-				         "route '%s.%s': auth_query_db is not set",
-				         route->db_name, route->user_name);
-				return -1;
-			}
-		}
-	}
-
-	if (! route_default_default) {
-		od_error(logger, "config", NULL, NULL,
-		         "route 'default.default': not defined");
-		return -1;
-	}
-
-	/* cleanup declarative storages config data */
-	od_list_t *n;
-	od_list_foreach_safe(&config->storages, i, n) {
-		od_configstorage_t *storage;
-		storage = od_container_of(i, od_configstorage_t, link);
-		od_configstorage_free(storage);
-	}
-	od_list_init(&config->storages);
-	return 0;
+	return OK_RESPONSE;
 }
 
-static inline char*
-od_config_yes_no(int value) {
+static inline char *od_config_yes_no(int value)
+{
 	return value ? "yes" : "no";
 }
 
-void od_config_print(od_config_t *config, od_logger_t *logger, int routes_only)
+static const char *
+od_config_query_parsing_mode_to_str(od_config_query_parsing_mode_t mode)
 {
-	od_log(logger, "config", NULL, NULL,
-	       "daemonize           %s",
-	       od_config_yes_no(config->daemonize));
-	if (config->pid_file)
-		od_log(logger, "config", NULL, NULL,
-		       "pid_file            %s", config->pid_file);
-	if (routes_only)
-		goto log_routes;
-	if (config->log_format)
-		od_log(logger, "config", NULL, NULL,
-		       "log_format          %s", config->log_format);
-	if (config->log_file)
-		od_log(logger, "config", NULL, NULL,
-		       "log_file            %s", config->log_file);
-	od_log(logger, "config", NULL, NULL,
-	       "log_to_stdout       %s",
-	       od_config_yes_no(config->log_to_stdout));
-	od_log(logger, "config", NULL, NULL,
-	       "log_syslog          %s",
-	       od_config_yes_no(config->log_syslog));
-	if (config->log_syslog_ident)
-		od_log(logger, "config", NULL, NULL,
-		       "log_syslog_ident    %s", config->log_syslog_ident);
-	if (config->log_syslog_facility)
-		od_log(logger, "config", NULL, NULL,
-		       "log_syslog_facility %s", config->log_syslog_facility);
-	od_log(logger, "config", NULL, NULL,
-	       "log_debug           %s",
-	       od_config_yes_no(config->log_debug));
-	od_log(logger, "config", NULL, NULL,
-	       "log_config          %s",
-	       od_config_yes_no(config->log_config));
-	od_log(logger, "config", NULL, NULL,
-	       "log_session         %s",
-	       od_config_yes_no(config->log_session));
-	od_log(logger, "config", NULL, NULL,
-	       "log_query           %s",
-	       od_config_yes_no(config->log_query));
-	od_log(logger, "config", NULL, NULL,
-	       "log_stats           %s",
-	       od_config_yes_no(config->log_stats));
-	od_log(logger, "config", NULL, NULL,
-	       "stats_interval      %d", config->stats_interval);
-	od_log(logger, "config", NULL, NULL,
-	       "readahead           %d", config->readahead);
-	od_log(logger, "config", NULL, NULL,
-	       "nodelay             %s",
-	       od_config_yes_no(config->nodelay));
-	od_log(logger, "config", NULL, NULL,
-	       "keepalive           %d", config->keepalive);
-	if (config->client_max_set)
-		od_log(logger, "config", NULL, NULL,
-		       "client_max          %d", config->client_max);
-	od_log(logger, "config", NULL, NULL,
-	       "pipeline            %d", config->pipeline);
-	od_log(logger, "config", NULL, NULL,
-	       "cache               %d", config->cache);
-	od_log(logger, "config", NULL, NULL,
-	       "cache_chunk         %d", config->cache_chunk);
-	od_log(logger, "config", NULL, NULL,
-	       "cache_coroutine     %d", config->cache_coroutine);
-	od_log(logger, "config", NULL, NULL,
-	       "workers             %d", config->workers);
-	od_log(logger, "config", NULL, NULL,
-	       "resolvers           %d", config->resolvers);
-	od_log(logger, "config", NULL, NULL, "");
-	od_list_t *i;
-	od_list_foreach(&config->listen, i)
-	{
-		od_configlisten_t *listen;
-		listen = od_container_of(i, od_configlisten_t, link);
-		od_log(logger, "config", NULL, NULL, "listen");
-		od_log(logger, "config", NULL, NULL,
-		       "  host             %s", listen->host);
-		od_log(logger, "config", NULL, NULL,
-		       "  port             %d", listen->port);
-		od_log(logger, "config", NULL, NULL,
-		       "  backlog          %d", listen->backlog);
-		if (listen->tls)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls              %s", listen->tls);
-		if (listen->tls_ca_file)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_ca_file      %s", listen->tls_ca_file);
-		if (listen->tls_key_file)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_key_file     %s", listen->tls_key_file);
-		if (listen->tls_cert_file)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_cert_file    %s", listen->tls_cert_file);
-		if (listen->tls_protocols)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_protocols    %s", listen->tls_protocols);
-		od_log(logger, "config", NULL, NULL, "");
+	switch (mode) {
+	case OD_CONFIG_QUERY_PARSING_MODE_DISABLED:
+		return "disabled";
+	case OD_CONFIG_QUERY_PARSING_MODE_MINIMAL:
+		return "minimal";
+	case OD_CONFIG_QUERY_PARSING_MODE_FULL:
+		return "full";
 	}
-log_routes:;
-	od_list_foreach(&config->routes, i) {
-		od_configroute_t *route;
-		route = od_container_of(i, od_configroute_t, link);
-		od_log(logger, "config", NULL, NULL, "route %s.%s",
-		       route->db_name,
-		       route->user_name);
-		od_log(logger, "config", NULL, NULL,
-		       "  authentication   %s", route->auth);
-		if (route->auth_common_name_default)
-			od_log(logger, "config", NULL, NULL,
-			       "  auth_common_name default");
-		od_list_t *j;
-		od_list_foreach(&route->auth_common_names, j) {
-			od_configauth_t *auth;
-			auth = od_container_of(j, od_configauth_t, link);
-			od_log(logger, "config", NULL, NULL,
-			       "  auth_common_name %s", auth->common_name);
+	return "unknown";
+}
+
+/*
+ * Description of the global configuration for SHOW CONFIG.
+ *
+ * The default column is not stored here on purpose: od_config_field_default()
+ * initializes a throwaway od_config_t through od_config_init() and reads the
+ * same offset, so the reported defaults cannot drift away from the real ones.
+ *
+ * The reloadable flag has no such source and must be kept in sync with
+ * od_config_reload() by hand.
+ */
+
+#define OD_CONFIG_FIELD_NOT_SET "(not set)"
+
+static const od_config_field_t od_config_fields[] = {
+	{ "daemonize", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, daemonize),
+	  0 },
+	{ "priority", OD_CONFIG_FIELD_INT, offsetof(od_config_t, priority), 0 },
+	{ "sequential_routing", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, sequential_routing), 0 },
+	{ "log_to_stdout", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, log_to_stdout), 0 },
+	{ "log_debug", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, log_debug),
+	  1 },
+	{ "log_debug_sampling", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, log_debug_sampling), 1 },
+	{ "maintain_params", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, maintain_params), 0 },
+	{ "log_config", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, log_config),
+	  1 },
+	{ "log_session", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, log_session), 1 },
+	{ "log_query", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, log_query),
+	  1 },
+	{ "log_query_sampling", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, log_query_sampling), 1 },
+	{ "log_queue_depth", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, log_queue_depth), 0 },
+	{ "log_async", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, log_async),
+	  0 },
+	{ "log_file", OD_CONFIG_FIELD_STRING, offsetof(od_config_t, log_file),
+	  0 },
+	{ "log_format", OD_CONFIG_FIELD_STRING,
+	  offsetof(od_config_t, log_format), 0 },
+	{ "log_stats", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, log_stats),
+	  1 },
+	{ "log_general_stats_prom", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, log_general_stats_prom), 0 },
+	{ "log_route_stats_prom", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, log_route_stats_prom), 0 },
+	{ "log_syslog", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, log_syslog),
+	  0 },
+	{ "log_syslog_ident", OD_CONFIG_FIELD_STRING,
+	  offsetof(od_config_t, log_syslog_ident), 0 },
+	{ "log_syslog_facility", OD_CONFIG_FIELD_STRING,
+	  offsetof(od_config_t, log_syslog_facility), 0 },
+	{ "stats_interval", OD_CONFIG_FIELD_DURATION_INT,
+	  offsetof(od_config_t, stats_interval), 1 },
+	{ "pid_file", OD_CONFIG_FIELD_STRING, offsetof(od_config_t, pid_file),
+	  0 },
+	{ "unix_socket_dir", OD_CONFIG_FIELD_STRING,
+	  offsetof(od_config_t, unix_socket_dir), 0 },
+	{ "unix_socket_mode", OD_CONFIG_FIELD_STRING,
+	  offsetof(od_config_t, unix_socket_mode), 0 },
+	{ "locks_dir", OD_CONFIG_FIELD_STRING, offsetof(od_config_t, locks_dir),
+	  0 },
+	{ "external_auth_socket_path", OD_CONFIG_FIELD_STRING,
+	  offsetof(od_config_t, external_auth_socket_path), 0 },
+	{ "graceful_die_on_errors", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, graceful_die_on_errors), 0 },
+	{ "graceful_shutdown_timeout_ms", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, graceful_shutdown_timeout_ms), 1 },
+	{ "enable_online_restart", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, enable_online_restart_feature), 0 },
+	{ "bindwith_reuseport", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, bindwith_reuseport), 0 },
+	{ "readahead", OD_CONFIG_FIELD_INT, offsetof(od_config_t, readahead),
+	  0 },
+	{ "nodelay", OD_CONFIG_FIELD_BOOL, offsetof(od_config_t, nodelay), 0 },
+	{ "disable_nolinger", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, disable_nolinger), 1 },
+	{ "keepalive", OD_CONFIG_FIELD_DURATION_INT,
+	  offsetof(od_config_t, keepalive), 1 },
+	{ "keepalive_keep_interval", OD_CONFIG_FIELD_DURATION_INT,
+	  offsetof(od_config_t, keepalive_keep_interval), 1 },
+	{ "keepalive_probes", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, keepalive_probes), 1 },
+	{ "keepalive_usr_timeout", OD_CONFIG_FIELD_DURATION_I64,
+	  offsetof(od_config_t, keepalive_usr_timeout_ms), 1 },
+	{ "workers", OD_CONFIG_FIELD_INT, offsetof(od_config_t, workers), 0 },
+	{ "resolvers", OD_CONFIG_FIELD_INT, offsetof(od_config_t, resolvers),
+	  0 },
+	{ "client_max", OD_CONFIG_FIELD_INT, offsetof(od_config_t, client_max),
+	  1 },
+	{ "client_max_routing", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, client_max_routing), 1 },
+	{ "accept_rate_limit", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, accept_rate_limit), 1 },
+	{ "server_login_retry", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, server_login_retry_ms), 1 },
+	{ "cache_coroutine", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, cache_coroutine), 0 },
+	{ "cache_msg_gc_size", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, cache_msg_gc_size), 0 },
+	{ "cache_msg_gc_count", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, cache_msg_gc_count), 0 },
+	{ "coroutine_stack_size", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, coroutine_stack_size), 0 },
+	{ "system_coroutine_stack_size", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, system_coroutine_stack_size), 0 },
+	{ "dns_cache_ttl", OD_CONFIG_FIELD_DURATION_INT,
+	  offsetof(od_config_t, dns_cache_ttl_ms), 0 },
+	{ "hba_file", OD_CONFIG_FIELD_STRING, offsetof(od_config_t, hba_file),
+	  0 },
+	{ "group_checker_interval", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, group_checker_interval_ms), 0 },
+	{ "auth_query_cache_ttl", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, auth_query_cache_ttl_ms), 1 },
+	{ "auth_query_cache_ttl_jitter", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, auth_query_cache_ttl_jitter_ms), 1 },
+	{ "auth_query_cache_error_retry", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, auth_query_cache_error_retry_ms), 1 },
+	{ "auth_query_cache_stale_on_error", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, auth_query_cache_stale_on_error), 1 },
+	{ "auth_query_timeout", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, auth_query_timeout_ms), 1 },
+	{ "backend_connect_timeout_ms", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, backend_connect_timeout_ms), 1 },
+	{ "cancel_timeout_ms", OD_CONFIG_FIELD_DURATION_U64,
+	  offsetof(od_config_t, cancel_timeout_ms), 1 },
+	{ "cancel_queue_timeout_ms", OD_CONFIG_FIELD_DURATION_I64,
+	  offsetof(od_config_t, cancel_queue_timeout_ms), 0 },
+	{ "cancel_max_inflight", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, cancel_max_inflight), 0 },
+	{ "ignore_cancel", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, ignore_cancel), 1 },
+	{ "virtual_processing", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, virtual_processing), 0 },
+	{ "virtual_transaction", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, virtual_transaction), 0 },
+	{ "availability_zone", OD_CONFIG_FIELD_STRING_INLINE,
+	  offsetof(od_config_t, availability_zone), 0 },
+	{ "max_sigterms_to_die", OD_CONFIG_FIELD_INT,
+	  offsetof(od_config_t, max_sigterms_to_die), 1 },
+	{ "enable_host_watcher", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, host_watcher_enabled), 0 },
+	{ "smart_search_path_enquoting", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, smart_search_path_enquoting), 1 },
+	{ "replication_proxy_phys", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, replication_proxy_phys), 1 },
+	{ "replication_proxy_logic", OD_CONFIG_FIELD_BOOL,
+	  offsetof(od_config_t, replication_proxy_logic), 1 },
+};
+
+size_t od_config_fields_count(void)
+{
+	return sizeof(od_config_fields) / sizeof(od_config_fields[0]);
+}
+
+const od_config_field_t *od_config_field_at(size_t index)
+{
+	if (index >= od_config_fields_count()) {
+		return NULL;
+	}
+	return &od_config_fields[index];
+}
+
+/* listed for SHOW CONFIG, but the parser accepts them only to ignore them */
+static const char *od_config_deprecated_keys[] = { "graceful_die_on_errors",
+						   NULL };
+
+int od_config_field_deprecated(const od_config_field_t *field)
+{
+	for (size_t i = 0; od_config_deprecated_keys[i] != NULL; i++) {
+		if (strcmp(field->key, od_config_deprecated_keys[i]) == 0) {
+			return 1;
 		}
-		if (route->auth_query)
-			od_log(logger, "config", NULL, NULL,
-			       "  auth_query       %s", route->auth_query);
-		if (route->auth_query_db)
-			od_log(logger, "config", NULL, NULL,
-			       "  auth_query_db    %s", route->auth_query_db);
-		if (route->auth_query_user)
-			od_log(logger, "config", NULL, NULL,
-			       "  auth_query_user  %s", route->auth_query_user);
-		od_log(logger, "config", NULL, NULL,
-		       "  pool             %s", route->pool_sz);
-		od_log(logger, "config", NULL, NULL,
-		       "  pool_size        %d", route->pool_size);
-		od_log(logger, "config", NULL, NULL,
-		       "  pool_timeout     %d", route->pool_timeout);
-		od_log(logger, "config", NULL, NULL,
-		       "  pool_ttl         %d", route->pool_ttl);
-		od_log(logger, "config", NULL, NULL,
-		       "  pool_cancel      %s",
-			   route->pool_cancel ? "yes" : "no");
-		od_log(logger, "config", NULL, NULL,
-		       "  pool_rollback    %s",
-			   route->pool_rollback ? "yes" : "no");
-		if (route->client_max_set)
-			od_log(logger, "config", NULL, NULL,
-			       "  client_max       %d", route->client_max);
-		od_log(logger, "config", NULL, NULL,
-		       "  client_fwd_error %s",
-		       od_config_yes_no(route->client_fwd_error));
-		od_log(logger, "config", NULL, NULL,
-		       "  storage          %s", route->storage_name);
-		od_log(logger, "config", NULL, NULL,
-		       "  type             %s", route->storage->type);
-		if (route->storage->host)
-			od_log(logger, "config", NULL, NULL,
-			       "  host             %s", route->storage->host);
-		if (route->storage->port)
-			od_log(logger, "config", NULL, NULL,
-			       "  port             %d", route->storage->port);
-		if (route->storage->tls)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls              %s", route->storage->tls);
-		if (route->storage->tls_ca_file)
-			od_log(logger,"config", NULL, NULL,
-			       "  tls_ca_file      %s", route->storage->tls_ca_file);
-		if (route->storage->tls_key_file)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_key_file     %s", route->storage->tls_key_file);
-		if (route->storage->tls_cert_file)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_cert_file    %s", route->storage->tls_cert_file);
-		if (route->storage->tls_protocols)
-			od_log(logger, "config", NULL, NULL,
-			       "  tls_protocols    %s", route->storage->tls_protocols);
-		if (route->storage_db)
-			od_log(logger, "config", NULL, NULL,
-			       "  storage_db       %s", route->storage_db);
-		if (route->storage_user)
-			od_log(logger, "config", NULL, NULL,
-			       "  storage_user     %s", route->storage_user);
-		od_log(logger, "config", NULL, NULL,
-		       "  log_debug        %s",
-		       od_config_yes_no(route->log_debug));
-		od_log(logger, "config", NULL, NULL, "");
+	}
+	return 0;
+}
+
+const od_config_field_t *od_config_field_by_key(const char *key)
+{
+	for (size_t i = 0; i < od_config_fields_count(); ++i) {
+		const od_config_field_t *field = &od_config_fields[i];
+		if (strcmp(field->key, key) == 0) {
+			return field;
+		}
+	}
+	return NULL;
+}
+
+/* -?[0-9]+, the only integer form the configuration grammar accepts */
+static int od_config_field_is_int(const char *value)
+{
+	const char *p = value;
+	if (*p == '-') {
+		p++;
+	}
+	if (*p == '\0') {
+		return 0;
+	}
+	for (; *p; p++) {
+		if (*p < '0' || *p > '9') {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/*
+ * The configuration lexer knows a single escape sequence inside a string:
+ * \" for a quote. Line breaks are rejected because the autoconf file is
+ * edited line by line, and a trailing backslash is rejected because it
+ * would escape the closing quote.
+ */
+static int od_config_field_format_string(const char *key, const char *value,
+					 char *buf, size_t size)
+{
+	size_t len = strlen(value);
+	if (len > 0 && value[len - 1] == '\\') {
+		return -1;
+	}
+
+	int n = snprintf(buf, size, "%s \"", key);
+	if (n < 0 || (size_t)n >= size) {
+		return -1;
+	}
+
+	/* every write below keeps at least one byte free for the terminator */
+	size_t pos = (size_t)n;
+	for (const char *p = value; *p; p++) {
+		if (*p == '\n' || *p == '\r') {
+			return -1;
+		}
+		if (*p == '"') {
+			if (pos + 2 >= size) {
+				return -1;
+			}
+			buf[pos++] = '\\';
+		} else if (pos + 1 >= size) {
+			return -1;
+		}
+		buf[pos++] = *p;
+	}
+
+	if (pos + 1 >= size) {
+		return -1;
+	}
+	buf[pos++] = '"';
+	buf[pos] = '\0';
+	return 0;
+}
+
+int od_config_field_format(const od_config_field_t *field, const char *value,
+			   char *buf, size_t size)
+{
+	int n;
+
+	switch (field->type) {
+	case OD_CONFIG_FIELD_DURATION_INT:
+	case OD_CONFIG_FIELD_DURATION_I64:
+	case OD_CONFIG_FIELD_DURATION_U64: {
+		od_duration_value_t parsed;
+		if (!od_duration_parse_value(value, &parsed, NULL)) {
+			return -1;
+		}
+		/* Keep the text: the config grammar applies the option's unit/range. */
+		return od_config_field_format_string(field->key, value, buf,
+						     size);
+	}
+	case OD_CONFIG_FIELD_INT:
+		/* workers "auto" means half of the CPUs, see cfg/parse.y */
+		if (strcmp(field->key, "workers") == 0 &&
+		    strcmp(value, "auto") == 0) {
+			n = snprintf(buf, size, "%s \"auto\"", field->key);
+			break;
+		}
+		if (!od_config_field_is_int(value)) {
+			return -1;
+		}
+		n = snprintf(buf, size, "%s %s", field->key, value);
+		break;
+	case OD_CONFIG_FIELD_BOOL:
+		if (strcasecmp(value, "yes") == 0) {
+			n = snprintf(buf, size, "%s yes", field->key);
+		} else if (strcasecmp(value, "no") == 0) {
+			n = snprintf(buf, size, "%s no", field->key);
+		} else {
+			return -1;
+		}
+		break;
+	case OD_CONFIG_FIELD_STRING:
+	case OD_CONFIG_FIELD_STRING_INLINE:
+		return od_config_field_format_string(field->key, value, buf,
+						     size);
+	default:
+		return -1;
+	}
+
+	/* od_snprintf() hides truncation, plain snprintf() reports it */
+	if (n < 0 || (size_t)n >= size) {
+		return -1;
+	}
+	return 0;
+}
+
+void od_config_field_value(od_config_t *config, const od_config_field_t *field,
+			   char *buf, size_t size)
+{
+	char *at = (char *)config + field->offset;
+
+	switch (field->type) {
+	case OD_CONFIG_FIELD_INT:
+	case OD_CONFIG_FIELD_DURATION_INT:
+		od_snprintf(buf, size, "%d", *(int *)at);
+		break;
+	case OD_CONFIG_FIELD_I64:
+	case OD_CONFIG_FIELD_DURATION_I64:
+		od_snprintf(buf, size, "%" PRId64, *(int64_t *)at);
+		break;
+	case OD_CONFIG_FIELD_U64:
+	case OD_CONFIG_FIELD_DURATION_U64:
+		od_snprintf(buf, size, "%" PRIu64, *(uint64_t *)at);
+		break;
+	case OD_CONFIG_FIELD_BOOL:
+		od_snprintf(buf, size, "%s", *(int *)at ? "yes" : "no");
+		break;
+	case OD_CONFIG_FIELD_STRING: {
+		char *value = *(char **)at;
+		od_snprintf(buf, size, "%s",
+			    value ? value : OD_CONFIG_FIELD_NOT_SET);
+		break;
+	}
+	case OD_CONFIG_FIELD_STRING_INLINE:
+		od_snprintf(buf, size, "%s",
+			    at[0] ? at : OD_CONFIG_FIELD_NOT_SET);
+		break;
+	default:
+		od_snprintf(buf, size, "%s", OD_CONFIG_FIELD_NOT_SET);
+		break;
+	}
+}
+
+/*
+ * Defaults are shared by every caller and never change, so they are built
+ * once per process. od_config_t is too large to keep on a coroutine stack,
+ * and od_config_init() allocates nothing, so this instance needs no
+ * matching od_config_free().
+ */
+static od_config_t od_config_defaults;
+static pthread_once_t od_config_defaults_ctrl = PTHREAD_ONCE_INIT;
+
+static void od_config_defaults_build(void)
+{
+	od_config_init(&od_config_defaults);
+}
+
+void od_config_field_default(const od_config_field_t *field, char *buf,
+			     size_t size)
+{
+	pthread_once(&od_config_defaults_ctrl, od_config_defaults_build);
+	od_config_field_value(&od_config_defaults, field, buf, size);
+}
+
+void od_config_print(od_config_t *config, od_logger_t *logger)
+{
+	od_log(logger, NULL, NULL, "daemonize               %s",
+	       od_config_yes_no(config->daemonize));
+	od_log(logger, NULL, NULL, "priority                %d",
+	       config->priority);
+	od_log(logger, NULL, NULL, "sequential_routing      %s",
+	       od_config_yes_no(config->sequential_routing));
+	if (config->pid_file) {
+		od_log(logger, NULL, NULL, "pid_file                %s",
+		       config->pid_file);
+	}
+	if (config->unix_socket_dir) {
+		od_log(logger, NULL, NULL, "unix_socket_dir         %s",
+		       config->unix_socket_dir);
+		od_log(logger, NULL, NULL, "unix_socket_mode        %s",
+		       config->unix_socket_mode);
+	}
+	if (config->log_format) {
+		od_log(logger, NULL, NULL, "log_format              %s",
+		       config->log_format);
+	}
+	if (config->log_file) {
+		od_log(logger, NULL, NULL, "log_file                %s",
+		       config->log_file);
+	}
+	od_log(logger, NULL, NULL, "log_to_stdout           %s",
+	       od_config_yes_no(config->log_to_stdout));
+	od_log(logger, NULL, NULL, "log_syslog              %s",
+	       od_config_yes_no(config->log_syslog));
+	if (config->log_syslog_ident) {
+		od_log(logger, NULL, NULL, "log_syslog_ident        %s",
+		       config->log_syslog_ident);
+	}
+	if (config->log_syslog_facility) {
+		od_log(logger, NULL, NULL, "log_syslog_facility     %s",
+		       config->log_syslog_facility);
+	}
+	od_log(logger, NULL, NULL, "log_debug               %s",
+	       od_config_yes_no(config->log_debug));
+	od_log(logger, NULL, NULL, "log_debug_sampling      %d",
+	       config->log_debug_sampling);
+	od_log(logger, NULL, NULL, "maintain_params         %s",
+	       od_config_yes_no(config->maintain_params));
+	od_log(logger, NULL, NULL, "log_config              %s",
+	       od_config_yes_no(config->log_config));
+	od_log(logger, NULL, NULL, "log_session             %s",
+	       od_config_yes_no(config->log_session));
+	od_log(logger, NULL, NULL, "log_query               %s",
+	       od_config_yes_no(config->log_query));
+	od_log(logger, NULL, NULL, "log_query_sampling      %d",
+	       config->log_query_sampling);
+	od_log(logger, NULL, NULL, "log_stats               %s",
+	       od_config_yes_no(config->log_stats));
+	od_log(logger, NULL, NULL, "log_general_stats_prom  %s",
+	       od_config_yes_no(config->log_general_stats_prom));
+	od_log(logger, NULL, NULL, "log_route_stats_prom    %s",
+	       od_config_yes_no(config->log_route_stats_prom));
+	od_log(logger, NULL, NULL, "log_queue_depth         %d",
+	       config->log_queue_depth);
+	od_log(logger, NULL, NULL, "stats_interval          %d",
+	       config->stats_interval);
+	od_log(logger, NULL, NULL, "readahead               %d",
+	       config->readahead);
+	od_log(logger, NULL, NULL, "nodelay                 %s",
+	       od_config_yes_no(config->nodelay));
+	od_log(logger, NULL, NULL, "disable_nolinger        %s",
+	       od_config_yes_no(config->disable_nolinger));
+	od_log(logger, NULL, NULL, "keepalive               %d",
+	       config->keepalive);
+	od_log(logger, NULL, NULL, "keepalive_keep_interval %d",
+	       config->keepalive_keep_interval);
+	od_log(logger, NULL, NULL, "keepalive_probes        %d",
+	       config->keepalive_probes);
+	od_log(logger, NULL, NULL, "keepalive_usr_timeout   %" PRId64,
+	       config->keepalive_usr_timeout_ms);
+	if (config->client_max_set) {
+		od_log(logger, NULL, NULL, "client_max              %d",
+		       config->client_max);
+	}
+	od_log(logger, NULL, NULL, "client_max_routing      %d",
+	       config->client_max_routing);
+	od_log(logger, NULL, NULL, "server_login_retry      %" PRIu64,
+	       config->server_login_retry_ms);
+	od_log(logger, NULL, NULL, "cache_msg_gc_size       %d",
+	       config->cache_msg_gc_size);
+	od_log(logger, NULL, NULL, "cache_msg_gc_count      %d",
+	       config->cache_msg_gc_count);
+	od_log(logger, NULL, NULL, "cache_coroutine         %d",
+	       config->cache_coroutine);
+	od_log(logger, NULL, NULL, "coroutine_stack_size    %d",
+	       config->coroutine_stack_size);
+	od_log(logger, NULL, NULL, "system_coroutine_stack_size %d",
+	       config->system_coroutine_stack_size);
+	od_log(logger, NULL, NULL, "workers                 %d",
+	       config->workers);
+	od_log(logger, NULL, NULL, "resolvers               %d",
+	       config->resolvers);
+	od_log(logger, NULL, NULL, "backend_connect_timeout_ms %" PRIu64,
+	       config->backend_connect_timeout_ms);
+	od_log(logger, NULL, NULL, "cancel_timeout_ms         %" PRIu64,
+	       config->cancel_timeout_ms);
+	od_log(logger, NULL, NULL, "cancel_queue_timeout_ms   %" PRId64,
+	       config->cancel_queue_timeout_ms);
+	od_log(logger, NULL, NULL, "cancel_max_inflight       %d",
+	       config->cancel_max_inflight);
+	od_log(logger, NULL, NULL, "cancel_rate_limit         %d",
+	       config->cancel_rate_limit);
+	od_log(logger, NULL, NULL, "ignore_cancel            %s",
+	       od_config_yes_no(config->ignore_cancel));
+	od_log(logger, NULL, NULL, "dns_ttl_ms              %d",
+	       config->dns_cache_ttl_ms);
+	od_log(logger, NULL, NULL, "group_checker_interval  %" PRIu64,
+	       config->group_checker_interval_ms);
+	od_log(logger, NULL, NULL, "auth_query_cache_ttl            %" PRIu64,
+	       config->auth_query_cache_ttl_ms);
+	od_log(logger, NULL, NULL, "auth_query_cache_ttl_jitter     %" PRIu64,
+	       config->auth_query_cache_ttl_jitter_ms);
+	od_log(logger, NULL, NULL, "auth_query_cache_error_retry    %" PRIu64,
+	       config->auth_query_cache_error_retry_ms);
+	od_log(logger, NULL, NULL, "auth_query_cache_stale_on_error %s",
+	       od_config_yes_no(config->auth_query_cache_stale_on_error));
+	od_log(logger, NULL, NULL, "auth_query_timeout              %" PRIu64,
+	       config->auth_query_timeout_ms);
+	od_log(logger, NULL, NULL, "max_sigterms_to_die     %d",
+	       config->max_sigterms_to_die);
+	od_log(logger, NULL, NULL, "virtual_processing      %s",
+	       od_config_yes_no(config->virtual_processing));
+	od_log(logger, NULL, NULL, "virtual_transaction     %s",
+	       od_config_yes_no(config->virtual_transaction));
+	od_log(logger, NULL, NULL, "replication_proxy_phys     %s",
+	       od_config_yes_no(config->replication_proxy_phys));
+	od_log(logger, NULL, NULL, "replication_proxy_logic    %s",
+	       od_config_yes_no(config->replication_proxy_logic));
+	od_log(logger, NULL, NULL, "smart_search_path_enquoting %s",
+	       od_config_yes_no(config->smart_search_path_enquoting));
+	od_log(logger, NULL, NULL, "query_parsing_mode      %s",
+	       od_config_query_parsing_mode_to_str(config->query_parsing.mode));
+	od_log(logger, NULL, NULL, "query_parsing_max_query_len %zu",
+	       config->query_parsing.max_query_len);
+	od_log(logger, NULL, NULL, "query_parsing_mem_limit %zu",
+	       config->query_parsing.mem_limit_bytes);
+	od_log(logger, NULL, NULL,
+	       "query_parsing_standby_function_list extra functions %zu",
+	       config->query_parsing.standby_function_names_count);
+	if (config->availability_zone[0]) {
+		od_log(logger, NULL, NULL, "availability_zone       %s",
+		       config->availability_zone);
+	}
+	od_log(logger, NULL, NULL, "enable_host_watcher:    %d",
+	       config->host_watcher_enabled);
+
+	od_log(logger, NULL, NULL, "online restart enabled: %d",
+	       config->enable_online_restart_feature);
+
+	od_log(logger, NULL, NULL, "graceful die enabled:   %d",
+	       config->graceful_die_on_errors);
+
+	od_log(logger, NULL, NULL, "bindwith_reuseport:     %d",
+	       config->bindwith_reuseport);
+
+	if (config->hba_file) {
+		od_log(logger, NULL, NULL, "hba_file                %s",
+		       config->hba_file);
+	}
+
+	if (config->conn_drop_options.drop_enabled) {
+		od_log(logger, NULL, NULL,
+		       "conn_drop_options: enabled, rate %d, interval_ms %d",
+		       config->conn_drop_options.rate,
+		       config->conn_drop_options.interval_ms);
+	}
+
+	if (config->soft_oom.enabled) {
+		od_log(logger, NULL, NULL,
+		       "soft_oom: check '%s' every %dms with limit %" PRIu64
+		       " bytes",
+		       config->soft_oom.process,
+		       config->soft_oom.check_interval_ms,
+		       config->soft_oom.limit_bytes);
+		if (config->soft_oom.drop.enabled) {
+			od_log(logger, NULL, NULL,
+			       "soft_oom drop: signal %d, max_rate %d",
+			       config->soft_oom.drop.signal,
+			       config->soft_oom.drop.max_rate);
+		}
+	} else {
+		od_log(logger, NULL, NULL, "soft_oom:         DISABLED");
+	}
+
+	od_list_t *i;
+	od_list_foreach (&config->listen, i) {
+		od_config_listen_t *listen;
+		listen = od_container_of(i, od_config_listen_t, link);
+		od_log(logger, NULL, NULL, "listen");
+		od_log(logger, NULL, NULL, "  host          %s",
+		       listen->host ? listen->host : "<unix socket>");
+		od_log(logger, NULL, NULL, "  port          %d", listen->port);
+		od_log(logger, NULL, NULL, "  backlog       %d",
+		       listen->backlog);
+		od_log(logger, NULL, NULL, "  client_login_timeout %d",
+		       listen->client_login_timeout_ms);
+		od_log(logger, NULL, NULL, "  reserved_clients %d",
+		       listen->reserved_clients);
+		od_log(logger, NULL, NULL, "  target_session_attrs %s",
+		       od_target_session_attrs_to_str(
+			       listen->target_session_attrs));
+		od_log(logger, NULL, NULL, "  auto_route_ro_on_standby %s",
+		       listen->auto_route_ro_on_standby ? "yes" : "no");
+		if (listen->balancing_override_set) {
+			od_log(logger, NULL, NULL,
+			       "  balancing override: method %s, az_aware %d",
+			       od_balancing_method_to_str(
+				       listen->balancing_override.method.type),
+			       listen->balancing_override.method.az_aware);
+		}
+		if (listen->catchup_timeout) {
+			od_log(logger, NULL, NULL, "  catchup_timeout %d",
+			       listen->catchup_timeout);
+		}
+		if (listen->tls_opts->tls) {
+			od_log(logger, NULL, NULL, "  tls           %s",
+			       listen->tls_opts->tls);
+		}
+		if (listen->tls_opts->tls_ca_file) {
+			od_log(logger, NULL, NULL, "  tls_ca_file   %s",
+			       listen->tls_opts->tls_ca_file);
+		}
+		if (listen->tls_opts->tls_key_file) {
+			od_log(logger, NULL, NULL, "  tls_key_file  %s",
+			       listen->tls_opts->tls_key_file);
+		}
+		if (listen->tls_opts->tls_cert_file) {
+			od_log(logger, NULL, NULL, "  tls_cert_file %s",
+			       listen->tls_opts->tls_cert_file);
+		}
+		if (listen->tls_opts->tls_protocols) {
+			od_log(logger, NULL, NULL, "  tls_protocols %s",
+			       listen->tls_opts->tls_protocols);
+		}
+
+		for (size_t i = 0; i < listen->storage_count; ++i) {
+			od_log(logger, NULL, NULL, "  storage       %s",
+			       listen->storage_names[i]);
+		}
 	}
 }

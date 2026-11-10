@@ -1,5 +1,5 @@
 Name:		odyssey
-Version:	1.0beta
+Version:	1.0
 Release:	1%{?dist}
 Summary:	Advanced multi-threaded PostgreSQL connection pooler and request router
 
@@ -12,6 +12,8 @@ BuildRequires:	cmake
 BuildRequires: openssl-devel
 BuildRequires: zlib-devel
 BuildRequires: gcc
+BuildRequires: flex
+BuildRequires: bison
 
 %description
 Advanced multi-threaded PostgreSQL connection pooler and request router

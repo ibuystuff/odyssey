@@ -1,0 +1,129 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <machinarium/machinarium.h>
+
+#include <types.h>
+#include <common_const.h>
+#include <client.h>
+#include <util.h>
+#include <storage.h>
+#include <tsa.h>
+#include <od_memory.h>
+
+#define MAX_STARTUP_ATTEMPTS 7
+
+static inline machine_msg_t *od_frontend_error_msg(od_client_t *client,
+						   machine_msg_t *stream,
+						   char *code, int position,
+						   char *fmt, va_list args)
+{
+	char msg[OD_QRY_MAX_SZ];
+	int msg_len;
+	int show_id = client != NULL;
+	if (client != NULL && client->rule != NULL) {
+		show_id = client->rule->client_show_id;
+	}
+
+	if (show_id) {
+		msg_len = od_snprintf(msg, sizeof(msg),
+				      "odyssey: %s%.*s: ", client->id.id_prefix,
+				      (signed)sizeof(client->id.id),
+				      client->id.id);
+	} else {
+		msg_len = od_snprintf(msg, sizeof(msg), "odyssey: ");
+	}
+	msg_len +=
+		od_vsnprintf(msg + msg_len, sizeof(msg) - msg_len, fmt, args);
+	return kiwi_be_write_error_pos(stream, code, msg, msg_len, position);
+}
+
+static inline machine_msg_t *
+od_frontend_fatal_msg(od_client_t *client, machine_msg_t *stream,
+		      const char *code, const char *detail, const char *hint,
+		      const char *msg_fmt, va_list args)
+{
+	char msg[OD_QRY_MAX_SZ];
+	int msg_len;
+	int show_id = 1;
+	if (client->rule != NULL) {
+		show_id = client->rule->client_show_id;
+	}
+
+	if (show_id) {
+		msg_len = od_snprintf(msg, sizeof(msg),
+				      "odyssey: %s%.*s: ", client->id.id_prefix,
+				      (signed)sizeof(client->id.id),
+				      client->id.id);
+	} else {
+		msg_len = od_snprintf(msg, sizeof(msg), "odyssey: ");
+	}
+	msg_len += od_vsnprintf(msg + msg_len, sizeof(msg) - msg_len, msg_fmt,
+				args);
+
+	return kiwi_be_write_error_fatal(stream, code, detail, strlen(detail),
+					 hint, strlen(hint), msg, msg_len);
+}
+
+static inline machine_msg_t *od_frontend_errorf(od_client_t *client,
+						machine_msg_t *stream,
+						char *code, char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	machine_msg_t *msg;
+	msg = od_frontend_error_msg(client, stream, code, 0, fmt, args);
+	va_end(args);
+	return msg;
+}
+
+/*
+ * same as od_frontend_errorf(), but also sets the error cursor
+ * position (1-based index into the query string, 0 means none)
+ */
+static inline machine_msg_t *od_frontend_errorf_pos(od_client_t *client,
+						    machine_msg_t *stream,
+						    char *code, int position,
+						    char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	machine_msg_t *msg;
+	msg = od_frontend_error_msg(client, stream, code, position, fmt, args);
+	va_end(args);
+	return msg;
+}
+
+int od_frontend_error(od_client_t *, char *, char *, ...);
+int od_frontend_fatal(od_client_t *, char *, char *, ...);
+int od_frontend_fatal_no_startup(mm_io_t *, char *, char *, ...);
+int od_frontend_fatal_detailed(od_client_t *client, const char *code,
+			       const char *detail, const char *hint,
+			       const char *fmt, ...);
+void od_frontend(void *);
+
+typedef struct {
+	od_storage_endpoint_t *endpoint;
+	int priority;
+} od_endpoint_attach_candidate_t;
+
+void od_frontend_attach_init_candidates(
+	od_instance_t *instance, od_rule_storage_t *storage,
+	od_endpoint_attach_candidate_t *candidates,
+	od_target_session_attrs_t tsa, int prefer_localhost);
+
+/*
+ * check that address (host:port, see SET odyssey.execute_on_host) is one of the
+ * endpoints of the storages the client can be attached to
+ */
+int od_frontend_host_is_known(od_client_t *client, const od_address_t *address);
+
+od_frontend_status_t od_frontend_attach(od_client_t *client,
+					kiwi_params_t *route_params);
+
+od_frontend_status_t od_frontend_attach_and_deploy(od_client_t *client);

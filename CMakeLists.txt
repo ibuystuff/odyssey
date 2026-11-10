@@ -1,62 +1,330 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.16)
 
-project(odyssey)
+project(odyssey C)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH}
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-execute_process(COMMAND git describe --always OUTPUT_VARIABLE OD_VERSION_GIT
-                OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(CMAKE_C_STANDARD 11)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(ODYSSEY_NAME "odyssey")
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/VERSION")
+    file(READ "${CMAKE_SOURCE_DIR}/VERSION" ODYSSEY_VERSION_NUMBER)
+    string(STRIP "${ODYSSEY_VERSION_NUMBER}" ODYSSEY_VERSION_NUMBER)
+    message(STATUS "Version from VERSION file: ${ODYSSEY_VERSION_NUMBER}")
+else()
+    set(ODYSSEY_VERSION_NUMBER "unknown")
+    message(WARNING "VERSION file not found, using 'unknown'")
+endif()
+
+find_package(BISON REQUIRED)
+find_package(FLEX REQUIRED)
+
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE ODYSSEY_VERSION_GIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+
+if(DEFINED ENV{ODYSSEY_NAME})
+    set(ODYSSEY_NAME $ENV{ODYSSEY_NAME})
+endif()
+
+if(DEFINED ENV{ODYSSEY_VERSION})
+    set(ODYSSEY_VERSION_NUMBER $ENV{ODYSSEY_VERSION})
+endif()
+
+if(DEFINED ENV{ODYSSEY_GIT_HASH})
+    set(ODYSSEY_VERSION_GIT $ENV{ODYSSEY_GIT_HASH})
+endif()
+
+if("${ODYSSEY_VERSION_GIT}" STREQUAL "")
+    set(ODYSSEY_VERSION_FULL "${ODYSSEY_VERSION_NUMBER}")
+else()
+    set(ODYSSEY_VERSION_FULL "${ODYSSEY_VERSION_NUMBER}-${ODYSSEY_VERSION_GIT}")
+endif()
+
+message(STATUS "")
+message(STATUS "Odyssey version configuration:")
+message(STATUS "  Name:           ${ODYSSEY_NAME}")
+message(STATUS "  Version number: ${ODYSSEY_VERSION_NUMBER}")
+message(STATUS "  Git hash:       ${ODYSSEY_VERSION_GIT}")
+message(STATUS "  Full version:   ${ODYSSEY_VERSION_FULL}")
+message(STATUS "")
+
+# Extract compiler name and version separately for clean metrics
+# Use CMAKE_C_COMPILER_ID for reliable detection (GNU, Clang, MSVC, etc.)
+if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
+    set(ODYSSEY_COMPILER_NAME "gcc")
+elseif("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_C_COMPILER_ID}" STREQUAL "AppleClang")
+    set(ODYSSEY_COMPILER_NAME "clang")
+else()
+    # Fallback to the compiler executable name
+    get_filename_component(ODYSSEY_COMPILER_NAME ${CMAKE_C_COMPILER} NAME)
+endif()
+
+set(ODYSSEY_COMPILER_VERSION "${CMAKE_C_COMPILER_VERSION}")
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(BUILD_BITS "64-bit")
+else()
+    set(BUILD_BITS "32-bit")
+endif()
+
+# Keep full string for backward compatibility in logs
+set(ODYSSEY_COMPILER_STRING "${ODYSSEY_COMPILER_NAME}-${ODYSSEY_COMPILER_VERSION}, ${BUILD_BITS}")
+
+set(OD_DEVEL_LVL -1)
+
+set(COMMON_CFLAGS "-pedantic -Wall -Wextra -Werror -Wstrict-aliasing -pthread -g")
+
+# enable 128-bit CAS (cmpxchg16b) on x86-64 for lock-free 16-byte atomics.
+# On aarch64 it is available without any flag.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    set(COMMON_CFLAGS "${COMMON_CFLAGS} -mcx16")
+endif()
+
+# The lf-stack uses __sync builtins for 128-bit CAS and must not depend on
+# libatomic. Some targets (e.g. s390x) define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_16
+# but still emit an unresolvable __sync_val_compare_and_swap_16 call, so check
+# that the builtin actually links. Otherwise lf-stack falls back to a spinlock.
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "${COMMON_CFLAGS}")
+check_c_source_compiles("
+static __int128_t v;
+int main(void)
+{
+	return (int)__sync_val_compare_and_swap(&v, (__int128_t)0, (__int128_t)1);
+}" MM_HAVE_SYNC_CAS_16)
+unset(CMAKE_REQUIRED_FLAGS)
+if(MM_HAVE_SYNC_CAS_16)
+    add_definitions(-DMM_HAVE_SYNC_CAS_16)
+endif()
+
+# sigsetjmp(env, 0) lets us skip saving the signal mask, which plain setjmp()
+# does on macOS/BSD at the cost of a couple of syscalls per call. It is POSIX,
+# but check anyway and fall back to setjmp() (see machinarium/setjmp.h).
+include(CheckSymbolExists)
+check_symbol_exists(sigsetjmp "setjmp.h" MM_HAVE_SIGSETJMP)
+if(MM_HAVE_SIGSETJMP)
+    add_definitions(-DMM_HAVE_SIGSETJMP)
+endif()
+
+# WORDS_BIGENDIAN is expected by the code borrowed from postgres
+# (sources/common/md5.c, port/pg_bswap.h)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.20)
+    if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+        set(OD_BIG_ENDIAN TRUE)
+    endif()
+else()
+    include(TestBigEndian)
+    test_big_endian(OD_BIG_ENDIAN)
+endif()
+if(OD_BIG_ENDIAN)
+    add_definitions(-DWORDS_BIGENDIAN)
+endif()
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "")
     set(CMAKE_BUILD_TYPE "Debug")
+    set(OD_DEVEL_LVL 1)
 endif()
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
-    set(CMAKE_C_FLAGS "-std=gnu99 -pedantic -Wall -Wextra -Wstrict-aliasing -g -O2")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_CFLAGS} -O2")
+    set(OD_DEVEL_LVL -1)
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDbgInfo")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_CFLAGS} -O2 -fno-omit-frame-pointer")
+    set(OD_DEVEL_LVL -1)
 elseif("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
-    set(CMAKE_C_FLAGS "-std=gnu99 -pedantic -Wall -Wextra -Wstrict-aliasing -g -O0")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_CFLAGS} -O0")
+    set(OD_DEVEL_LVL 1)
+elseif("${CMAKE_BUILD_TYPE}" STREQUAL "ASAN")
+    if (APPLE)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_CFLAGS} -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -O0")
+    else()
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_CFLAGS} -fsanitize=address,undefined,leak -fno-sanitize-recover=all -fno-omit-frame-pointer -O0")
+    endif()
+    set(HAVE_ASAN 1)
+elseif("${CMAKE_BUILD_TYPE}" STREQUAL "TSAN")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_CFLAGS} -fsanitize=thread -fno-sanitize-recover=all -fno-omit-frame-pointer -O0")
+    set(HAVE_TSAN 1)
+else()
+    message(FATAL_ERROR "Unknown build type ${CMAKE_BUILD_TYPE}")
 endif()
 
-string(TOLOWER ${CMAKE_BUILD_TYPE} OD_VERSION_BUILD)
+string(TOLOWER "${CMAKE_BUILD_TYPE}" ODYSSEY_BUILD_TYPE)
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CC_FLAGS}")
 
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 find_package(Threads REQUIRED)
 
 add_custom_target(build_libs)
-set(od_libraries "rt")
-
-# machinarium
-include(BuildMachinarium)
-build_machinarium()
-set(od_libraries ${od_libraries} ${MACHINARIUM_LIBRARIES})
-include_directories(${MACHINARIUM_INCLUDE_DIRS})
-
-# openssl
-find_package(OpenSSL)
-if (NOT OPENSSL_FOUND)
+if (APPLE)
+    # macOS: librt/libdl functionality is part of the base libSystem,
+    # there are no separate librt.dylib / libdl.dylib to link against.
+    set(od_libraries "")
+else()
+    set(od_libraries "rt" "dl")
 endif()
-set(od_libraries ${od_libraries} ${OPENSSL_LIBRARIES} "-ldl")
-include_directories("${OPENSSL_INCLUDE_DIR}")
 
-# shapito
-include(BuildShapito)
-build_shapito()
-set(od_libraries ${od_libraries} ${SHAPITO_LIBRARIES})
-include_directories(${SHAPITO_INCLUDE_DIRS})
+set(OPENSSL_INCLUDE_DIR $ENV{OPENSSL_INCLUDE_DIR})
+set(OPENSSL_LIBRARIES $ENV{OPENSSL_LIBRARIES})
+set(OPENSSL_VERSION $ENV{OPENSSL_VERSION})
 
-message (STATUS "")
-message (STATUS "Odyssey (version: ${OD_VERSION_GIT} ${OD_VERSION_BUILD})")
-message (STATUS "")
-message (STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
-message (STATUS "BUILD_DEBIAN:     ${BUILD_DEBIAN}")
-message (STATUS "")
+# use BoringSSL or OpenSSL
+option(USE_BORINGSSL "Use BoringSSL" OFF)
+if (USE_BORINGSSL)
+    find_package(BoringSSL REQUIRED)
+    if (BORINGSSL_FOUND)
+        set(od_ssl ${BORINGSSL_LIBRARIES})
+        include_directories(${BORINGSSL_INCLUDE_DIR})
+    endif ()
+elseif ("${OPENSSL_LIBRARIES}" STREQUAL "")
+    find_package(OpenSSL REQUIRED)
+    set(od_ssl ${OPENSSL_LIBRARIES})
+    include_directories(${OPENSSL_INCLUDE_DIR})
+    add_definitions(-DUSE_SSL)
+else ()	
+    set(od_ssl ${OPENSSL_LIBRARIES})
+    include_directories(${OPENSSL_INCLUDE_DIR})
+    add_definitions(-DUSE_SSL)
+endif ()
+
+# use PAM
+find_package(PAM)
+if (PAM_FOUND)
+    set(od_pam ${PAM_LIBRARY})
+    include_directories(${PAM_INCLUDE_DIR})
+endif()
+
+set(od_libraries ${od_libraries} ${od_pam})
+
+# use LDAP
+find_package(LDAP)
+if (LDAP_FOUND)
+    set(od_ldap ${LDAP_LIBRARY})
+    include_directories(${LDAP_INCLUDE_DIR})
+endif()
+
+set(od_libraries ${od_libraries} ${od_ldap})
+
+# use systemd (for sd_notify support)
+find_path(SYSTEMD_INCLUDE_DIR
+    NAMES systemd/sd-daemon.h
+    HINTS /usr/include /usr/local/include
+)
+find_library(SYSTEMD_LIBRARY
+    NAMES systemd
+    HINTS /usr/lib /usr/local/lib
+)
+if (SYSTEMD_INCLUDE_DIR AND SYSTEMD_LIBRARY)
+    set(od_systemd ${SYSTEMD_LIBRARY})
+    include_directories(${SYSTEMD_INCLUDE_DIR})
+    add_definitions(-DHAVE_SYSTEMD)
+    set(SYSTEMD_FOUND TRUE)
+else()
+    message(WARNING "SYSTEMD library not found!!!")
+    set(SYSTEMD_FOUND FALSE)
+endif()
+
+set(od_libraries ${od_libraries} ${od_systemd})
+
+
+
+# use Prom
+find_package(Prom)
+find_package(Promhttp)
+
+if (PROM_FOUND AND PROMHTTP_FOUND)
+    set(od_prom ${PROM_LIBRARY})
+    include_directories(${PROM_INCLUDE_DIR})
+    set(od_promhttp ${PROMHTTP_LIBRARY})
+    include_directories(${PROMHTTP_INCLUDE_DIR})
+endif()
+
+set(od_libraries ${od_libraries} ${od_prom})
+set(od_libraries ${od_libraries} ${od_promhttp})
+set(od_libraries ${od_libraries} ${od_ssl})
+
+#compression
+option(BUILD_COMPRESSION "Build with compression support" OFF)
+if(BUILD_COMPRESSION)
+    set(compression_libraries "")
+    add_definitions(-DMM_BUILD_COMPRESSION)
+    # use zstd
+    find_package(Zstd)
+    if(ZSTD_FOUND)
+        include_directories(${ZSTD_INCLUDE_DIR})
+        set(compression_libraries ${compression_libraries} ${ZSTD_LIBRARY})
+        add_definitions(-DMM_HAVE_ZSTD)
+    endif()
+
+    # use zlib
+    find_package(ZLIB)
+    if(ZLIB_FOUND)
+        include_directories(${ZLIB_INCLUDE_DIRS})
+        set(compression_libraries ${compression_libraries} ${ZLIB_LIBRARIES})
+        add_definitions(-DMM_HAVE_ZLIB)
+    endif()
+endif()
+
+message(STATUS "")
+message(STATUS "================================================================")
+message(STATUS "Odyssey ${ODYSSEY_VERSION_FULL}")
+message(STATUS "")
+message(STATUS "Build configuration:")
+message(STATUS "  Build type:       ${CMAKE_BUILD_TYPE}")
+message(STATUS "  C Compiler:       ${ODYSSEY_COMPILER_STRING}")
+message(STATUS "  C Flags:          ${CMAKE_C_FLAGS}")
+message(STATUS "  Platform:         ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
+message(STATUS "  C lang standard:  ${CMAKE_C_STANDARD}")
+message(STATUS "")
+message(STATUS "BUILD_DEBIAN:           ${BUILD_DEBIAN}")
+message(STATUS "USE_BORINGSSL:          ${USE_BORINGSSL}")
+message(STATUS "BORINGSSL_ROOT_DIR:     ${BORINGSSL_ROOT_DIR}")
+message(STATUS "BORINGSSL_INCLUDE_DIR:  ${BORINGSSL_INCLUDE_DIR}")
+message(STATUS "OPENSSL_VERSION:        ${OPENSSL_VERSION}")
+message(STATUS "OPENSSL_ROOT_DIR:       ${OPENSSL_ROOT_DIR}")
+message(STATUS "OPENSSL_INCLUDE_DIR:    ${OPENSSL_INCLUDE_DIR}")
+message(STATUS "OPENSSL_LIBRARIES:      ${OPENSSL_LIBRARIES}")
+
+if (PAM_FOUND)
+    message(STATUS "PAM_LIBRARY:            ${PAM_LIBRARY}")
+    message(STATUS "PAM_INCLUDE_DIR:        ${PAM_INCLUDE_DIR}")
+endif()
+
+message(STATUS "BUILD_COMPRESSION:      ${BUILD_COMPRESSION}")
+if (BUILD_COMPRESSION)
+    message(STATUS "ZSTD_INCLUDE_DIR:       ${ZSTD_INCLUDE_DIR}")
+    message(STATUS "ZSTD_LIBRARY:           ${ZSTD_LIBRARY}")
+    message(STATUS "ZLIB_INCLUDE_DIRS:      ${ZLIB_INCLUDE_DIRS}")
+    message(STATUS "ZLIB_LIBRARIES:         ${ZLIB_LIBRARIES}")
+endif()
+
+    message(STATUS "LDAP_SUPPORT:           ${LDAP_FOUND}")
+if (LDAP_FOUND)
+    message(STATUS "LDAP_LIBRARY:           ${LDAP_LIBRARY}")
+    message(STATUS "LDAP_INCLUDE_DIR:       ${LDAP_INCLUDE_DIR}")
+endif()
+
+message(STATUS "SYSTEMD_FOUND:          ${SYSTEMD_FOUND}")
+if (SYSTEMD_FOUND)
+    message(STATUS "SYSTEMD_LIBRARY:      ${SYSTEMD_LIBRARY}")
+    message(STATUS "SYSTEMD_INCLUDE_DIR:   ${SYSTEMD_INCLUDE_DIR}")
+endif()
 
 add_subdirectory(sources)
-add_subdirectory(stress)
-add_subdirectory(test)
 
-# debian build
-option(BUILD_DEBIAN "Enable Debian Build" OFF)
-if (BUILD_DEBIAN)
-    include(BuildDebian)
-endif()
+set(OD_INSTALL_PREFIX "/usr/bin/")
+
+install(TARGETS odyssey DESTINATION "${OD_INSTALL_PREFIX}")
+
+include(Packaging)

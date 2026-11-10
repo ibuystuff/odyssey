@@ -3,89 +3,244 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
-#include <signal.h>
+#include <pthread.h>
+#include <sched.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <odyssey.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/system.h"
-#include "sources/worker.h"
-#include "sources/frontend.h"
+#include <machinarium/machinarium.h>
+#include <machinarium/machine.h>
 
-static inline void
-od_worker(void *arg)
+#include <status.h>
+#include <worker.h>
+#include <global.h>
+#include <thread_global.h>
+#include <client.h>
+#include <instance.h>
+#include <msg.h>
+#include <frontend.h>
+#include <alloc/linear.h>
+
+#ifdef PROM_FOUND
+#include <cron.h>
+#include <prom_metric.h>
+#endif
+
+static OD_THREAD_LOCAL uint8_t *linear_alloc_buf = NULL;
+static OD_THREAD_LOCAL od_linear_alloc_t linear_alloc;
+
+OD_THREAD_LOCAL bool worker_shutting_down = false;
+
+static void setup_affinity(od_instance_t *instance, int wid)
+{
+	const od_affinity_config_t *config = instance->config.cpu_affinity;
+
+	if (config == NULL || config->mode == OD_AFFINITY_MODE_OFF) {
+		return;
+	}
+
+	od_affinity_rule_t rule;
+	od_affinity_rule_init(&rule);
+
+	od_affinity_mode_t mode = od_affinity_resolve(
+		config, &rule, OD_AFFINITY_ROLE_WORKER, wid);
+	if (mode == OD_AFFINITY_MODE_OFF) {
+		return;
+	}
+
+#if !defined(__linux__)
+	(void)rule;
+	od_log(&instance->logger, NULL, NULL,
+	       "cpu affinity is not supported on this platform, ignoring");
+	return;
+#else
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+
+	if (mode == OD_AFFINITY_MODE_RULES) {
+		od_affinity_cpuset_export(&rule.cpuset, &cpuset);
+
+		char buf[256];
+		od_affinity_cpuset_to_str(&rule.cpuset, buf, sizeof(buf));
+		od_log(&instance->logger, NULL, NULL, "pin worker %d to cpu %s",
+		       wid, buf);
+	} else if (mode == OD_AFFINITY_MODE_AUTO) {
+		int ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+		int cpunum = 0;
+		if (ncpu > 1) {
+			cpunum = 1 + wid % (ncpu - 1);
+		}
+
+		CPU_SET(cpunum, &cpuset);
+
+		od_log(&instance->logger, NULL, NULL, "pin worker %d to cpu %d",
+		       wid, cpunum);
+	}
+
+	if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t),
+				   &cpuset) != 0) {
+		od_error(&instance->logger, NULL, NULL,
+			 "can't set worker cpu affinity: %s", strerror(errno));
+	}
+#endif
+}
+
+static inline void od_worker(void *arg)
 {
 	od_worker_t *worker = arg;
 	od_instance_t *instance = worker->global->instance;
 
-	for (;;)
-	{
+	setup_affinity(instance, worker->id);
+
+	/* thread global initialization */
+	od_thread_global **gl = od_thread_global_get();
+	od_retcode_t rc = od_thread_global_init(gl);
+
+	machine_set_global_dtor(od_thread_global_free);
+
+	if (rc != OK_RESPONSE) {
+		/* TODO: set errno */
+		od_fatal(&instance->logger, NULL, NULL,
+			 "failed to init worker thread info");
+		return;
+	}
+
+	(*gl)->wid = worker->id;
+
+	memset(&linear_alloc, 0, sizeof(linear_alloc));
+	if (instance->config.query_parsing.mode !=
+	    OD_CONFIG_QUERY_PARSING_MODE_DISABLED) {
+		size_t sz = instance->config.query_parsing.mem_limit_bytes;
+		linear_alloc_buf = od_malloc(sz);
+		if (linear_alloc_buf == NULL) {
+			od_fatal(
+				&instance->logger, NULL, NULL,
+				"failed to init worker's linear allocator, errno=%d (%s)",
+				mm_errno_get(), strerror(mm_errno_get()));
+			return;
+		}
+		memset(linear_alloc_buf, 0, sz);
+		od_linear_alloc_init(&linear_alloc, linear_alloc_buf, sz);
+		mm_machine_atexit(od_free, (void *)linear_alloc_buf);
+	}
+
+	while (!worker_shutting_down) {
 		machine_msg_t *msg;
-		msg = machine_channel_read(worker->task_channel, UINT32_MAX);
-		if (msg == NULL)
+		/*
+		 * Prefer newer clients: their connection timeouts are less likely
+		 * to have expired while waiting in the queue.
+		 */
+		msg = machine_channel_read_back(worker->task_channel,
+						UINT32_MAX);
+		if (msg == NULL) {
+			int error = machine_errno();
+			if (error != ECANCELED) {
+				od_error(
+					&instance->logger, NULL, NULL,
+					"worker[%d]: failed to read task channel: %s (%d)",
+					worker->id, strerror(error), error);
+			}
 			break;
+		}
 
 		od_msg_t msg_type;
-		msg_type = machine_msg_get_type(msg);
+		msg_type = machine_msg_type(msg);
 		switch (msg_type) {
-		case OD_MCLIENT_NEW:
-		{
+		case OD_MSG_CLIENT_NEW: {
 			od_client_t *client;
-			client = *(od_client_t**)machine_msg_get_data(msg);
+			client = *(od_client_t **)machine_msg_data(msg);
 			client->global = worker->global;
-			int64_t coroutine_id;
-			coroutine_id = machine_coroutine_create(od_frontend, client);
-			if (coroutine_id == -1) {
-				od_error(&instance->logger, "worker", client, NULL,
-				         "failed to create coroutine");
-				machine_close(client->io);
+
+			/*
+			 * Allocate readahead buffer from this worker's
+			 * thread-local vrb cache. od_io_prepare() was not
+			 * called in od_system (only io->io was assigned),
+			 * so the buffer is obtained here, in the worker
+			 * thread that owns it.
+			 */
+			rc = od_readahead_prepare(&client->io.readahead);
+			if (rc == -1) {
+				od_error(
+					&instance->logger, client, NULL,
+					"failed to allocate readahead buffer, errno = %d (%s)",
+					machine_errno(),
+					strerror(machine_errno()));
+				od_io_close(&client->io);
 				od_client_free(client);
+				od_routing_slot_release(worker->global);
+				break;
+			}
+
+			/* for NULL-terminator and prefix, just in case */
+			char coro_name[10 + OD_ID_LEN];
+			od_id_write_to_string(&client->id, coro_name,
+					      10 + OD_ID_LEN);
+
+			int64_t coroutine_id;
+			coroutine_id = machine_coroutine_create_named(
+				od_frontend, client, coro_name);
+			if (coroutine_id == -1) {
+				od_error(&instance->logger, client, NULL,
+					 "failed to create coroutine");
+				od_io_close(&client->io);
+				od_client_free(client);
+				od_routing_slot_release(worker->global);
 				break;
 			}
 			client->coroutine_id = coroutine_id;
+
+			worker->clients_processed++;
 			break;
 		}
+		case OD_MSG_STAT: {
+			uint64_t count_coroutine = 0;
+			uint64_t count_coroutine_cache = 0;
+			uint64_t msg_allocated = 0;
+			uint64_t msg_cache_count = 0;
+			uint64_t msg_cache_gc_count = 0;
+			uint64_t msg_cache_size = 0;
+			machine_stat(&count_coroutine, &count_coroutine_cache,
+				     &msg_allocated, &msg_cache_count,
+				     &msg_cache_gc_count, &msg_cache_size);
+#ifdef PROM_FOUND
+			od_prom_metrics_write_worker_stat(
+				((od_cron_t *)(worker->global->cron))->metrics,
+				worker->id, msg_allocated, msg_cache_count,
+				msg_cache_gc_count, msg_cache_size,
+				count_coroutine, count_coroutine_cache,
+				worker->clients_processed);
+#endif
+			od_log(&instance->logger, NULL, NULL,
+			       "worker[%d]: msg (%" PRIu64
+			       " allocated, %" PRIu64 " cached, %" PRIu64
+			       " freed, %" PRIu64 " cache_size), "
+			       "coroutines (%" PRIu64 " active, %" PRIu64
+			       " cached), clients_processed: %" PRIu64,
+			       worker->id, msg_allocated, msg_cache_count,
+			       msg_cache_gc_count, msg_cache_size,
+			       count_coroutine, count_coroutine_cache,
+			       worker->clients_processed);
+			break;
+		}
+		case OD_MSG_SHUTDOWN:
+			od_log(&instance->logger, NULL, NULL,
+			       "worker[%d]: shutdown message received",
+			       worker->id);
+
+			worker_shutting_down = true;
+			break;
 		default:
-			assert(0);
+			od_assert(0);
 			break;
 		}
 
 		machine_msg_free(msg);
 	}
 
-	od_log(&instance->logger, "worker", NULL, NULL, "stopped");
+	od_log(&instance->logger, NULL, NULL,
+	       "worker[%d] stopped processing new connections", worker->id);
 }
 
 void od_worker_init(od_worker_t *worker, od_global_t *global, int id)
@@ -93,37 +248,43 @@ void od_worker_init(od_worker_t *worker, od_global_t *global, int id)
 	worker->machine = -1;
 	worker->id = id;
 	worker->global = global;
+	worker->clients_processed = 0;
 }
 
 int od_worker_start(od_worker_t *worker)
 {
 	od_instance_t *instance = worker->global->instance;
 
-	worker->task_channel = machine_channel_create(instance->is_shared);
+	worker->task_channel = machine_channel_create();
 	if (worker->task_channel == NULL) {
-		od_error(&instance->logger, "worker", NULL, NULL,
-		         "failed to create task channel");
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to create task channel");
 		return -1;
 	}
-	if (instance->is_shared) {
-		char name[32];
-		od_snprintf(name, sizeof(name), "worker: %d", worker->id);
-		worker->machine = machine_create(name, od_worker, worker);
-		if (worker->machine == -1) {
-			machine_channel_free(worker->task_channel);
-			od_error(&instance->logger, "worker", NULL, NULL,
-			         "failed to start worker");
-			return -1;
-		}
-	} else {
-		int64_t coroutine_id;
-		coroutine_id = machine_coroutine_create(od_worker, worker);
-		if (coroutine_id == -1) {
-			od_error(&instance->logger, "worker", NULL, NULL,
-			         "failed to create worker coroutine");
-			machine_channel_free(worker->task_channel);
-			return -1;
-		}
+
+	char name[32];
+	od_snprintf(name, sizeof(name), "worker: %d", worker->id);
+	worker->machine = machine_create(name, od_worker, worker);
+	if (worker->machine == -1) {
+		machine_channel_free(worker->task_channel);
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to start worker, errno = %d (%s)",
+			 machine_errno(), strerror(machine_errno()));
+		return -1;
 	}
+
 	return 0;
+}
+
+od_linear_alloc_t *od_worker_get_local_linear_alloc(void)
+{
+	return &linear_alloc;
+}
+
+void od_worker_shutdown(od_worker_t *worker)
+{
+	machine_msg_t *msg;
+	msg = machine_msg_create(0);
+	machine_msg_set_type(msg, OD_MSG_SHUTDOWN);
+	machine_channel_write(worker->task_channel, msg);
 }

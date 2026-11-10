@@ -1,0 +1,38 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <machinarium/machinarium.h>
+
+#include <types.h>
+#include <global.h>
+
+#include <build.h>
+
+#ifdef PROM_FOUND
+#include <prom_metrics.h>
+#endif
+
+struct od_cron {
+	uint64_t stat_time_us;
+	od_global_t *global;
+	atomic_uint_fast64_t startup_errors;
+
+#ifdef PROM_FOUND
+	od_prom_metrics_t *metrics;
+#endif
+
+	machine_wait_flag_t *can_be_freed;
+	machine_wait_flag_t *online;
+};
+
+od_retcode_t od_cron_init(od_cron_t *);
+/* Release wait flags before start or after the cron coroutine has exited. */
+void od_cron_free(od_cron_t *);
+int od_cron_start(od_cron_t *, od_global_t *);
+od_retcode_t od_cron_stop(od_cron_t *cron);
+void od_cron_expire_now(od_cron_t *cron);

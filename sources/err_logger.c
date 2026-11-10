@@ -1,0 +1,114 @@
+#include <odyssey.h>
+
+#include <machinarium/machinarium.h>
+
+#include <err_logger.h>
+#include <od_memory.h>
+
+static size_t err_logger_required_buf_size(size_t sz)
+{
+	return sizeof(od_error_logger_t) + (sz * sizeof(od_counter_t *));
+}
+
+#if defined(__x86_64__) || defined(__i386) || defined(_X86_)
+#define OD_ERR_LOGGER_CAS_BACKOFF __asm__("pause")
+#else
+#define OD_ERR_LOGGER_CAS_BACKOFF
+#endif
+
+od_error_logger_t *od_err_logger_create(size_t intervals_count)
+{
+	od_error_logger_t *err_logger =
+		od_malloc(err_logger_required_buf_size(intervals_count));
+	if (err_logger == NULL) {
+		goto error;
+	}
+
+	err_logger->nintervals = intervals_count;
+	atomic_init(&err_logger->current_interval_num, 0);
+
+	for (size_t i = 0; i < intervals_count; ++i) {
+		/*
+		 * used for router and frontend statuses
+		 * so, let it be 100
+		 */
+		err_logger->interval_counters[i] = od_counter_create(100UL);
+		if (err_logger->interval_counters[i] == NULL) {
+			goto error;
+		}
+	}
+
+	return err_logger;
+error:
+
+	if (err_logger) {
+		for (size_t i = 0; i < err_logger->nintervals; ++i) {
+			if (err_logger->interval_counters[i] == NULL) {
+				continue;
+			}
+			od_counter_free(err_logger->interval_counters[i]);
+		}
+
+		od_free((void *)(err_logger));
+	}
+
+	return NULL;
+}
+
+od_retcode_t od_err_logger_free(od_error_logger_t *err_logger)
+{
+	if (err_logger == NULL) {
+		return OK_RESPONSE;
+	}
+
+	for (size_t i = 0; i < err_logger->nintervals; ++i) {
+		if (err_logger->interval_counters[i] == NULL) {
+			continue;
+		}
+		int rc = od_counter_free(err_logger->interval_counters[i]);
+		err_logger->interval_counters[i] = NULL;
+
+		if (rc != OK_RESPONSE) {
+			return rc;
+		}
+	}
+
+	od_free((void *)(err_logger));
+
+	return OK_RESPONSE;
+}
+
+od_retcode_t od_error_logger_store_err(od_error_logger_t *l, size_t err_t)
+{
+	size_t idx = atomic_load(&l->current_interval_num);
+	od_counter_inc(l->interval_counters[idx], err_t);
+	return OK_RESPONSE;
+}
+
+od_retcode_t od_err_logger_inc_interval(od_error_logger_t *l)
+{
+	while (1) {
+		size_t i = atomic_load(&l->current_interval_num);
+		size_t next = (i + 1) % l->nintervals;
+
+		if (atomic_compare_exchange_weak(&l->current_interval_num, &i,
+						 next)) {
+			/* some errors may be lost */
+			od_counter_reset_all(l->interval_counters[next]);
+			break;
+		}
+
+		OD_ERR_LOGGER_CAS_BACKOFF;
+	}
+
+	return OK_RESPONSE;
+}
+
+size_t od_err_logger_get_aggr_errors_count(od_error_logger_t *l, size_t err_t)
+{
+	size_t ret_val = 0;
+	for (size_t i = 0; i < l->nintervals; ++i) {
+		ret_val += od_counter_get_count(l->interval_counters[i], err_t);
+	}
+	return ret_val;
+}

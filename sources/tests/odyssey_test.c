@@ -1,0 +1,303 @@
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <stdlib.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+
+#include <kiwi/kiwi.h>
+#include <machinarium/machinarium.h>
+#include <tests/odyssey_test.h>
+
+char test_substring[1024] = { 0 };
+
+/* KIWI */
+extern void kiwi_test_enquote(void);
+extern void kiwi_test_pgoptions(void);
+extern void kiwi_test_be_read_startup_options(void);
+extern void kiwi_test_fe_read_auth(void);
+extern void kiwi_test_be_read_query(void);
+extern void kiwi_test_backend_key_data(void);
+extern void kiwi_test_cancel_request(void);
+extern void kiwi_test_cancel_write(void);
+extern void kiwi_test_msg_size_limits(void);
+
+/* MACHINARIUM */
+extern void machinarium_test_init(void);
+extern void machinarium_test_create0(void);
+extern void machinarium_test_create1(void);
+extern void machinarium_test_config(void);
+extern void machinarium_test_context_switch(void);
+extern void machinarium_test_sleep(void);
+extern void machinarium_test_sleep_random(void);
+extern void machinarium_test_sleep_yield(void);
+extern void machinarium_test_sleep_cancel0(void);
+extern void machinarium_test_join(void);
+extern void machinarium_test_condition0(void);
+extern void machinarium_test_stat(void);
+extern void machinarium_test_signal0(void);
+extern void machinarium_test_signal1(void);
+extern void machinarium_test_channel_create(void);
+extern void machinarium_test_channel_rw0(void);
+extern void machinarium_test_channel_rw1(void);
+extern void machinarium_test_channel_rw2(void);
+extern void machinarium_test_channel_rw3(void);
+extern void machinarium_test_channel_rw4(void);
+extern void machinarium_test_channel_timeout(void);
+extern void machinarium_test_channel_cancel(void);
+extern void machinarium_test_channel_shared_create(void);
+extern void machinarium_test_channel_shared_rw0(void);
+extern void machinarium_test_channel_shared_rw1(void);
+extern void machinarium_test_channel_shared_rw2(void);
+extern void machinarium_test_sleeplock(void);
+extern void machinarium_test_producer_consumer0(void);
+extern void machinarium_test_producer_consumer1(void);
+extern void machinarium_test_producer_consumer2(void);
+extern void machinarium_test_io_new(void);
+extern void machinarium_test_connect(void);
+extern void machinarium_test_connect_timeout(void);
+extern void machinarium_test_connect_cancel0(void);
+extern void machinarium_test_connect_cancel1(void);
+extern void machinarium_test_coroutine_names(void);
+extern void machinarium_test_accept_timeout(void);
+extern void machinarium_test_accept_cancel(void);
+extern void machinarium_test_advice_keepalive_usr_timeout(void);
+extern void machinarium_test_getaddrinfo0(void);
+extern void machinarium_test_getaddrinfo1(void);
+extern void machinarium_test_getaddrinfo2(void);
+extern void machinarium_test_client_server0(void);
+extern void machinarium_test_client_server1(void);
+extern void machinarium_test_client_server2(void);
+extern void machinarium_test_client_server_unix_socket(void);
+extern void machinarium_test_client_server_unix_socket_no_msg(void);
+extern void machinarium_test_check_stack_depth(void);
+extern void machinarium_test_read_10mb0(void);
+extern void machinarium_test_read_10mb1(void);
+extern void machinarium_test_read_10mb2(void);
+extern void machinarium_test_read_timeout(void);
+extern void machinarium_test_read_cancel(void);
+extern void machinarium_test_read_var(void);
+extern void machinarium_test_read_close(void);
+extern void machinarium_test_hm_hash(void);
+extern void machinarium_test_hm_dist(void);
+extern void machinarium_test_tls0(void);
+extern void machinarium_test_tls_verify_error(void);
+extern void machinarium_test_tls_cache(void);
+extern void machinarium_test_tls_unix_socket_no_msg(void);
+extern void machinarium_test_tls_unix_socket(void);
+extern void machinarium_test_tls_read_10mb0(void);
+extern void machinarium_test_tls_read_10mb1(void);
+extern void machinarium_test_tls_read_10mb2(void);
+extern void machinarium_test_tls_read_multithread(void);
+extern void machinarium_test_tls_read_var(void);
+extern void machinarium_test_wait_list_compare_wait_timeout(void);
+extern void machinarium_test_wait_list_compare_wait_wrong_value(void);
+extern void machinarium_test_wait_list_notify_after_compare_wait(void);
+extern void machinarium_test_wait_list_without_notify(void);
+extern void machinarium_test_wait_list_notify_after_wait(void);
+extern void machinarium_test_wait_list_one_producer_multiple_consumers(void);
+extern void
+machinarium_test_wait_list_one_producer_multiple_consumers_threads(void);
+extern void machinarium_test_wait_list_notify_all(void);
+extern void machinarium_test_machine_reserve_ids(void);
+extern void machinarium_test_wait_group_simple(void);
+extern void machinarium_test_wait_group_timeout(void);
+extern void machinarium_test_wait_group_lifetime(void);
+extern void machinarium_test_wait_flag_simple(void);
+extern void machinarium_test_wait_flag_timeout(void);
+extern void machinarium_test_ring_buffer(void);
+extern void machinarium_test_vrb(void);
+extern void machinarium_test_heap(void);
+extern void machinarium_test_clock(void);
+extern void machinarium_test_lf_stack(void);
+extern void machinarium_test_queue(void);
+extern void machinarium_vrb_benchmark(void);
+extern void machinarium_mutex_benchmark(void);
+extern void machinarium_test_eventfd(void);
+extern void machinarium_test_sem(void);
+
+extern void machinarium_test_mutex_threads(void);
+extern void machinarium_test_mutex_coroutines(void);
+extern void machinarium_test_mutex_timeout(void);
+
+extern void odyssey_test_tdigest(void);
+extern void odyssey_test_attribute(void);
+extern void odyssey_test_util(void);
+extern void odyssey_test_hba(void);
+extern void odyssey_test_address_parse(void);
+extern void odyssey_test_address_cmp(void);
+extern void odyssey_test_pstmt(void);
+extern void odyssey_test_clients_map(void);
+extern void odyssey_test_router_free_before_startup(void);
+extern void odyssey_test_affinity(void);
+extern void odyssey_test_duration_parse(void);
+extern void odyssey_test_misc(void);
+extern void odyssey_test_thread_pool(void);
+extern void odyssey_test_linear_alloc(void);
+extern void odyssey_test_scram(void);
+extern void odyssey_test_sql_minimal_parser(void);
+extern void odyssey_test_sql_full_parser(void);
+extern void odyssey_test_sql_pstmt(void);
+extern void odyssey_test_console_parser(void);
+extern void odyssey_test_config_field(void);
+extern void odyssey_test_autoconf(void);
+extern void odyssey_test_soft_oom(void);
+extern void odyssey_test_wait_event(void);
+
+extern void machinarium_test_tsan_simple_race_example(void);
+
+int main(int argc, char *argv[])
+{
+	if (argc > 1) {
+		odyssey_test_set_test_substring(argv[1]);
+	}
+
+	/*
+	 * Normally smth like that is done by odyssey/machinarium itself.
+	 * But this test doesn't have signal handlers and
+	 * machinarium's mm_socket_set_nosigpipe will not work on linux.
+	 * So this SIGPIPE ignoring will fix some tests (like tls unix socket with no msg).
+	 */
+	signal(SIGPIPE, SIG_IGN);
+
+	odyssey_test(kiwi_test_enquote);
+	odyssey_test(kiwi_test_pgoptions);
+	odyssey_test(kiwi_test_be_read_startup_options);
+	odyssey_test(kiwi_test_fe_read_auth);
+	odyssey_test(kiwi_test_be_read_query);
+	odyssey_test(kiwi_test_backend_key_data);
+	odyssey_test(kiwi_test_cancel_request);
+	odyssey_test(kiwi_test_cancel_write);
+	odyssey_test(kiwi_test_msg_size_limits);
+	odyssey_test(machinarium_test_init);
+	odyssey_test(machinarium_test_create0);
+	odyssey_test(machinarium_test_create1);
+	odyssey_test(machinarium_test_config);
+	odyssey_test(machinarium_test_context_switch);
+	odyssey_test(machinarium_test_sleep);
+	odyssey_test(machinarium_test_sleep_random);
+	odyssey_test(machinarium_test_sleep_yield);
+	odyssey_test(machinarium_test_sleep_cancel0);
+	odyssey_test(machinarium_test_join);
+	odyssey_test(machinarium_test_condition0);
+	odyssey_test(machinarium_test_stat);
+	odyssey_test(machinarium_test_signal0);
+	odyssey_test(machinarium_test_signal1);
+	odyssey_test(machinarium_test_channel_create);
+	odyssey_test(machinarium_test_channel_rw0);
+	odyssey_test(machinarium_test_channel_rw1);
+	odyssey_test(machinarium_test_channel_rw2);
+	odyssey_test(machinarium_test_channel_rw3);
+	odyssey_test(machinarium_test_channel_rw4);
+	odyssey_test(machinarium_test_channel_timeout);
+	odyssey_test(machinarium_test_channel_cancel);
+	odyssey_test(machinarium_test_channel_shared_create);
+	odyssey_test(machinarium_test_channel_shared_rw0);
+	odyssey_test(machinarium_test_channel_shared_rw1);
+	odyssey_test(machinarium_test_channel_shared_rw2);
+	odyssey_test(machinarium_test_sleeplock);
+	odyssey_test(machinarium_test_producer_consumer0);
+	odyssey_test(machinarium_test_producer_consumer1);
+	odyssey_test(machinarium_test_producer_consumer2);
+	odyssey_test(machinarium_test_io_new);
+	odyssey_test(machinarium_test_connect);
+	odyssey_test(machinarium_test_connect_timeout);
+	odyssey_test(machinarium_test_connect_cancel0);
+	odyssey_test(machinarium_test_connect_cancel1);
+	odyssey_test(machinarium_test_accept_timeout);
+	odyssey_test(machinarium_test_accept_cancel);
+	odyssey_test(machinarium_test_advice_keepalive_usr_timeout);
+	odyssey_test(machinarium_test_getaddrinfo0);
+	odyssey_test(machinarium_test_getaddrinfo1);
+	odyssey_test(machinarium_test_getaddrinfo2);
+	odyssey_test(machinarium_test_client_server0);
+	odyssey_test(machinarium_test_client_server1);
+	odyssey_test(machinarium_test_client_server2);
+	odyssey_test(machinarium_test_client_server_unix_socket);
+	odyssey_test(machinarium_test_client_server_unix_socket_no_msg);
+	odyssey_test(machinarium_test_check_stack_depth);
+	odyssey_test(machinarium_test_coroutine_names);
+	odyssey_test(machinarium_test_read_10mb0);
+	odyssey_test(machinarium_test_read_10mb1);
+	odyssey_test(machinarium_test_read_10mb2);
+	odyssey_test(machinarium_test_read_timeout);
+	odyssey_test(machinarium_test_read_cancel);
+	odyssey_test(machinarium_test_read_var);
+	odyssey_test(machinarium_test_read_close);
+	odyssey_test(machinarium_test_hm_hash);
+	odyssey_test(machinarium_test_hm_dist);
+	odyssey_test(machinarium_test_tls0);
+	odyssey_test(machinarium_test_tls_verify_error);
+	odyssey_test(machinarium_test_tls_cache);
+	odyssey_test(machinarium_test_tls_unix_socket_no_msg);
+	odyssey_test(machinarium_test_tls_unix_socket);
+	odyssey_test(machinarium_test_tls_read_10mb0);
+	odyssey_test(machinarium_test_tls_read_10mb1);
+	odyssey_test(machinarium_test_tls_read_10mb2);
+	odyssey_test(machinarium_test_tls_read_multithread);
+	odyssey_test(machinarium_test_tls_read_var);
+	odyssey_test(machinarium_test_wait_list_compare_wait_timeout);
+	odyssey_test(machinarium_test_wait_list_notify_after_compare_wait);
+	odyssey_test(machinarium_test_wait_list_compare_wait_wrong_value);
+	odyssey_test(machinarium_test_wait_list_without_notify);
+	odyssey_test(machinarium_test_wait_list_notify_after_wait);
+	odyssey_test(
+		machinarium_test_wait_list_one_producer_multiple_consumers);
+	odyssey_test(
+		machinarium_test_wait_list_one_producer_multiple_consumers_threads);
+	odyssey_test(machinarium_test_wait_list_notify_all);
+	odyssey_test(machinarium_test_machine_reserve_ids);
+	odyssey_test(machinarium_test_wait_group_simple);
+	odyssey_test(machinarium_test_wait_group_timeout);
+	odyssey_test(machinarium_test_wait_group_lifetime);
+	odyssey_test(machinarium_test_wait_flag_simple);
+	odyssey_test(machinarium_test_wait_flag_timeout);
+	odyssey_test(machinarium_test_ring_buffer);
+	odyssey_test(machinarium_test_vrb);
+	odyssey_test(machinarium_test_queue);
+	odyssey_test(machinarium_test_heap);
+	odyssey_test(machinarium_test_clock);
+	odyssey_test(machinarium_test_lf_stack);
+	odyssey_playground_test(machinarium_vrb_benchmark);
+	odyssey_playground_test(machinarium_mutex_benchmark);
+	odyssey_test(machinarium_test_mutex_threads);
+	odyssey_test(machinarium_test_mutex_coroutines);
+	odyssey_test(machinarium_test_mutex_timeout);
+	odyssey_test(machinarium_test_eventfd);
+	odyssey_test(machinarium_test_sem);
+	odyssey_test(odyssey_test_tdigest);
+	odyssey_test(odyssey_test_attribute);
+	odyssey_test(odyssey_test_util);
+	odyssey_test(odyssey_test_hba);
+	odyssey_test(odyssey_test_address_parse);
+	odyssey_test(odyssey_test_address_cmp);
+	odyssey_test(odyssey_test_pstmt);
+	odyssey_test(odyssey_test_clients_map);
+	odyssey_test(odyssey_test_router_free_before_startup);
+	odyssey_test(odyssey_test_affinity);
+	odyssey_test(odyssey_test_duration_parse);
+	odyssey_test(odyssey_test_misc);
+	odyssey_test(odyssey_test_thread_pool);
+	odyssey_test(odyssey_test_linear_alloc);
+	odyssey_test(odyssey_test_scram);
+	odyssey_test(odyssey_test_sql_minimal_parser);
+	odyssey_test(odyssey_test_sql_full_parser);
+	odyssey_test(odyssey_test_sql_pstmt);
+	odyssey_test(odyssey_test_console_parser);
+	odyssey_test(odyssey_test_config_field);
+	odyssey_test(odyssey_test_autoconf);
+	odyssey_test(odyssey_test_soft_oom);
+	odyssey_test(odyssey_test_wait_event);
+
+	odyssey_playground_test(machinarium_test_tsan_simple_race_example);
+
+	return 0;
+}

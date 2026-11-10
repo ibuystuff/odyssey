@@ -1,0 +1,3016 @@
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <odyssey.h>
+
+#include <sys/un.h>
+
+#include <machinarium/machinarium.h>
+#include <kiwi/kiwi.h>
+
+#include <types.h>
+#include <rules.h>
+#include <backend.h>
+#include <pool.h>
+#include <status.h>
+#include <router.h>
+#include <route_pool.h>
+#include <shared_pool.h>
+#include <client.h>
+#include <internal_client.h>
+#include <global.h>
+#include <instance.h>
+#include <util.h>
+#include <port.h>
+#include <attach.h>
+
+const char *od_rule_conn_type_to_str(od_rule_conn_type_t ct)
+{
+	switch (ct) {
+	case OD_RULE_CONN_TYPE_DEFAULT:
+		return "all";
+	case OD_RULE_CONN_TYPE_LOCAL:
+		return "local";
+	case OD_RULE_CONN_TYPE_HOST:
+		return "host";
+	case OD_RULE_CONN_TYPE_HOSTSSL:
+		return "hostssl";
+	case OD_RULE_CONN_TYPE_HOSTNOSSL:
+		return "hostnossl";
+	default:
+		abort();
+	}
+}
+
+void od_rules_init(od_rules_t *rules)
+{
+	od_list_init(&rules->storages);
+#ifdef LDAP_FOUND
+	od_list_init(&rules->ldap_endpoints);
+#endif
+	od_list_init(&rules->rules);
+	rules->next_order = 0;
+}
+
+void od_rules_rule_free(od_rule_t *);
+
+void od_rules_free(od_rules_t *rules)
+{
+	od_list_t *i, *n;
+
+#ifdef LDAP_FOUND
+	od_list_foreach_safe (&rules->ldap_endpoints, i, n) {
+		od_ldap_endpoint_t *ldap_endp;
+		ldap_endp = od_container_of(i, od_ldap_endpoint_t, link);
+		od_ldap_endpoint_free(ldap_endp);
+	}
+#endif
+
+	od_list_foreach_safe (&rules->rules, i, n) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		od_list_unlink(&rule->link);
+		od_list_init(&rule->link);
+		od_rules_rule_free(rule);
+	}
+}
+
+#ifdef LDAP_FOUND
+od_ldap_endpoint_t *od_rules_ldap_endpoint_add(od_rules_t *rules,
+					       od_ldap_endpoint_t *ldap)
+{
+	od_list_append(&rules->ldap_endpoints, &ldap->link);
+	return ldap;
+}
+
+od_ldap_storage_credentials_t *
+od_rule_ldap_storage_credentials_add(od_rule_t *rule,
+				     od_ldap_storage_credentials_t *lsc)
+{
+	od_ldap_storage_credentials_ref(lsc);
+	od_list_append(&rule->ldap_storage_creds_list, &lsc->link);
+	return lsc;
+}
+#endif
+
+od_rule_storage_t *od_rules_storage_add(od_rules_t *rules,
+					od_rule_storage_t *storage)
+{
+	od_list_append(&rules->storages, &storage->link);
+	return storage;
+}
+
+od_rule_storage_t *od_rules_storage_match(od_rules_t *rules, const char *name)
+{
+	od_list_t *i;
+	od_list_foreach (&rules->storages, i) {
+		od_rule_storage_t *storage;
+		storage = od_container_of(i, od_rule_storage_t, link);
+		if (strcmp(storage->name, name) == 0) {
+			return storage;
+		}
+	}
+	return NULL;
+}
+
+od_retcode_t od_rules_storages_watchdogs_run(od_logger_t *logger,
+					     od_rules_t *rules)
+{
+	od_list_t *i;
+	od_list_foreach (&rules->storages, i) {
+		od_rule_storage_t *storage;
+		storage = od_container_of(i, od_rule_storage_t, link);
+		if (storage->watchdog && storage->watchdog_coro_id == -1) {
+			int64_t coroutine_id;
+			/* the ref is held by watchdog */
+			od_rules_storage_ref(storage);
+			coroutine_id = machine_coroutine_create(
+				od_storage_watchdog_watch, storage->watchdog);
+			if (coroutine_id == INVALID_COROUTINE_ID) {
+				od_rules_storage_unref(storage);
+				od_error(logger, NULL, NULL,
+					 "failed to start watchdog coroutine");
+				return NOT_OK_RESPONSE;
+			}
+			storage->watchdog_coro_id = coroutine_id;
+		}
+	}
+	return OK_RESPONSE;
+}
+
+od_rule_auth_t *od_rules_auth_add(od_rule_t *rule)
+{
+	od_rule_auth_t *auth =
+		(od_rule_auth_t *)od_malloc(sizeof(od_rule_auth_t));
+	if (auth == NULL) {
+		return NULL;
+	}
+	memset(auth, 0, sizeof(*auth));
+	od_list_init(&auth->link);
+	od_list_append(&rule->auth_common_names, &auth->link);
+	rule->auth_common_names_count++;
+	return auth;
+}
+
+void od_rules_auth_free(od_rule_auth_t *auth)
+{
+	if (auth->common_name) {
+		od_free(auth->common_name);
+	}
+	od_free(auth);
+}
+
+static inline od_rule_auth_t *od_rules_auth_find(od_rule_t *rule, char *name)
+{
+	od_list_t *i;
+	od_list_foreach (&rule->auth_common_names, i) {
+		od_rule_auth_t *auth;
+		auth = od_container_of(i, od_rule_auth_t, link);
+		if (!strcasecmp(auth->common_name, name)) {
+			return auth;
+		}
+	}
+	return NULL;
+}
+
+od_group_t *od_rules_group_allocate(od_global_t *global)
+{
+	/* Allocate and force defaults */
+	od_group_t *group;
+	group = od_malloc(sizeof(*group));
+	if (group == NULL) {
+		return NULL;
+	}
+	memset(group, 0, sizeof(*group));
+	group->global = global;
+	group->check_retry = 10;
+	group->online = 0;
+
+	od_list_init(&group->link);
+	return group;
+}
+
+enum {
+	GROUP_QUERY_FAIL,
+	GROUP_QUERY_RFQ,
+	GROUP_QUERY_CONTINUE,
+};
+
+static int handle_group_query_msg(od_client_t *client, od_server_t *server,
+				  machine_msg_t *msg, od_list_t *members)
+{
+	int rc;
+	char *group_member;
+	od_group_member_name_item_t *member = NULL;
+
+	kiwi_be_type_t type;
+	type = *(char *)machine_msg_data(msg);
+
+	od_gdebug(client, server, "%s", kiwi_be_type_to_string(type));
+
+	switch (type) {
+	case KIWI_BE_ERROR_RESPONSE:
+		od_backend_error(server, machine_msg_data(msg),
+				 machine_msg_size(msg));
+		return GROUP_QUERY_FAIL;
+
+	case KIWI_BE_DATA_ROW:
+		rc = od_group_parse_val_datarow(msg, &group_member);
+		if (rc != OK_RESPONSE) {
+			od_gerror(client, server, "can't read data row");
+			return GROUP_QUERY_FAIL;
+		}
+		member = od_group_member_name_item_add(members);
+		if (member == NULL) {
+			od_free(group_member);
+			return GROUP_QUERY_FAIL;
+		}
+		member->value = group_member;
+		return GROUP_QUERY_CONTINUE;
+
+	case KIWI_BE_READY_FOR_QUERY:
+		od_backend_ready(server, machine_msg_data(msg),
+				 machine_msg_size(msg));
+		return GROUP_QUERY_RFQ;
+	default:
+		return GROUP_QUERY_CONTINUE;
+	}
+}
+
+static int read_group_list(od_client_t *client, od_server_t *server,
+			   od_list_t *members, uint32_t timeout_ms)
+{
+	while (1) {
+		machine_msg_t *msg =
+			od_read(&server->io, timeout_ms, OD_READ_BE);
+		if (msg == NULL) {
+			int err = mm_errno_get();
+			od_gerror(client, server,
+				  "can't read response: %d (%s)", err,
+				  strerror(err));
+			return NOT_OK_RESPONSE;
+		}
+
+		int rc = handle_group_query_msg(client, server, msg, members);
+		machine_msg_free(msg);
+
+		if (rc == GROUP_QUERY_FAIL) {
+			return NOT_OK_RESPONSE;
+		} else if (rc == GROUP_QUERY_RFQ) {
+			break;
+		}
+	}
+
+	return OK_RESPONSE;
+}
+
+static void do_group_check_poll_connected(od_instance_t *instance,
+					  od_rule_t *rule, od_group_t *group,
+					  od_router_t *router,
+					  od_client_t *client)
+{
+	od_list_t *i, *s;
+	od_server_t *server = client->server;
+
+	od_assert(server != NULL);
+
+	int rc = od_backend_query_send(server, group->group_query, NULL,
+				       strlen(group->group_query) + 1,
+				       1000 /* 1 sec */);
+	if (rc != OK_RESPONSE) {
+		/* retry later */
+		od_gerror(client, server, "group query failed, errno=%d (%s)",
+			  mm_errno_get(), strerror(mm_errno_get()));
+		return;
+	}
+
+	od_list_t members;
+	od_list_init(&members);
+	rc = read_group_list(client, server, &members, 1000);
+	if (rc != OK_RESPONSE) {
+		goto error;
+	}
+
+	size_t count = od_list_count(&members);
+	char **usernames = od_malloc(sizeof(char *) * count);
+	if (usernames == NULL) {
+		goto error;
+	}
+
+	int j = 0;
+	od_list_foreach (&members, i) {
+		od_group_member_name_item_t *member;
+		member = od_container_of(i, od_group_member_name_item_t, link);
+		usernames[j++] = member->value;
+		member->value = NULL;
+	}
+
+	if (od_logger_debug_enabled(&instance->logger, client, server)) {
+		char buff[1024] = { 0 };
+		char *out = buff;
+		char *end = buff + sizeof(buff);
+		size_t k = 0;
+		while (k < count && out < end) {
+			out += snprintf(out, end - out, "'%s', ",
+					usernames[k++]);
+		}
+		od_debug(&instance->logger, client, server, "%lu, [%s]", count,
+			 buff);
+	}
+
+	char **t_names;
+	int t_count;
+	od_router_lock(router);
+	t_names = rule->user_names;
+	t_count = rule->users_in_group;
+	rule->user_names = usernames;
+	rule->users_in_group = count;
+	od_router_unlock(router);
+
+	/* Free memory without router lock */
+	for (int i = 0; i < t_count; i++) {
+		od_free(t_names[i]);
+	}
+	od_free(t_names);
+
+	od_list_foreach_safe (&members, i, s) {
+		od_group_member_name_item_t *member;
+		member = od_container_of(i, od_group_member_name_item_t, link);
+		od_list_unlink(&member->link);
+		od_free(member->value);
+		od_free(member);
+	}
+
+	return;
+
+error:
+	od_list_foreach_safe (&members, i, s) {
+		od_group_member_name_item_t *m;
+		m = od_container_of(i, od_group_member_name_item_t, link);
+		od_list_unlink(&m->link);
+		od_free(m->value);
+		od_free(m);
+	}
+
+	return;
+}
+
+static void do_group_check_iteration(od_instance_t *instance, od_rule_t *rule,
+				     od_group_t *group, od_router_t *router,
+				     od_client_t *client)
+{
+	int rc;
+
+	rc = od_attach_extended(instance, router, client);
+	if (rc != OK_RESPONSE) {
+		/* do nothing with error, go to retry */
+		return;
+	}
+
+	do_group_check_poll_connected(instance, rule, group, router, client);
+
+	/*
+	 * yes, always close the connection
+	 * in fact, there is no need for that so
+	 * TODO: maybe just detach, not close the backend
+	 */
+	od_router_close(router, client);
+}
+
+static void do_group_check(void *arg)
+{
+	od_rule_t *group_rule = arg;
+	od_group_t *group = group_rule->group;
+	od_global_t *global = group->global;
+	od_router_t *router = global->router;
+	od_instance_t *instance = global->instance;
+
+	group->online = 1;
+	od_log(&instance->logger, NULL, NULL, "start group checking for %s.%s",
+	       group_rule->db_name, group_rule->user_name);
+
+	/* create internal auth client */
+	od_client_t *group_checker_client;
+	group_checker_client = od_client_allocate_internal(global);
+	if (group_checker_client == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "route rule group_checker failed to allocate client");
+		goto to_return;
+	}
+
+	group_checker_client->global = global;
+	group_checker_client->type = OD_POOL_CLIENT_INTERNAL;
+	od_id_generate(&group_checker_client->id, "a");
+
+	/* set storage user and database */
+	kiwi_var_set(&group_checker_client->startup.user, KIWI_VAR_UNDEF,
+		     group->group_query_user,
+		     strlen(group->group_query_user) + 1);
+
+	kiwi_var_set(&group_checker_client->startup.database, KIWI_VAR_UNDEF,
+		     group->group_query_db, strlen(group->group_query_db) + 1);
+
+	int rc;
+	rc = OK_RESPONSE;
+
+	/* route */
+	od_router_status_t status;
+	status = od_router_route(router, group_checker_client);
+	od_debug(&instance->logger, group_checker_client, NULL,
+		 "routing to internal group_checker route status: %s",
+		 od_router_status_to_str(status));
+
+	if (status != OD_ROUTER_OK) {
+		od_error(&instance->logger, group_checker_client, NULL,
+			 "route rule group_checker failed: %s",
+			 od_router_status_to_str(status));
+		goto to_return;
+	}
+
+	while (group->online) {
+		rc = machine_wait_flag_wait(
+			group_rule->group_checker_online,
+			(uint32_t)instance->config.group_checker_interval_ms);
+		if (rc == 0) {
+			od_log(&instance->logger, NULL, NULL,
+			       "done flag is set, exiting from rule group checker for %s.%s",
+			       group_rule->db_name, group_rule->user_name);
+			break;
+		}
+
+		if (rc == -1 && machine_errno() != ETIMEDOUT) {
+			od_error(&instance->logger, NULL, NULL,
+				 "can't wait done flag: %s (%d)",
+				 strerror(machine_errno()), machine_errno());
+			break;
+		}
+
+		/* do not check return status, just return */
+		do_group_check_iteration(instance, group_rule, group, router,
+					 group_checker_client);
+	}
+
+	od_router_unroute(router, group_checker_client);
+	od_client_free_extended(group_checker_client);
+	od_group_free(group);
+
+	char **t_names;
+	int t_count;
+	od_router_lock(router);
+	t_names = group_rule->user_names;
+	t_count = group_rule->users_in_group;
+	group_rule->user_names = NULL;
+	group_rule->users_in_group = 0;
+	od_router_unlock(router);
+	for (int i = 0; i < t_count; i++) {
+		od_free(t_names[i]);
+	}
+	od_free(t_names);
+
+to_return:
+	od_log(&instance->logger, NULL, NULL,
+	       "group checking for %s.%s finished", group_rule->db_name,
+	       group_rule->user_name);
+
+	machine_wait_flag_set(group_rule->group_checker_finished);
+
+	od_rules_unref(group_rule);
+}
+
+od_retcode_t od_rules_groups_checkers_run(od_logger_t *logger,
+					  od_rules_t *rules)
+{
+	od_list_t *i;
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		if (rule->group && !rule->obsolete && !rule->group->online) {
+			/* group checkers holds the ref - it will do unref on exit */
+			od_rules_ref(rule);
+
+			rule->group_checker_machine_id =
+				machine_coroutine_create(do_group_check, rule);
+			if (rule->group_checker_machine_id ==
+			    INVALID_COROUTINE_ID) {
+				od_rules_unref(rule);
+				od_error(
+					logger, NULL, NULL,
+					"failed to start group_checker coroutine");
+				return NOT_OK_RESPONSE;
+			}
+		}
+	}
+
+	return OK_RESPONSE;
+}
+
+static od_rule_t *od_rules_add(od_rules_t *rules)
+{
+	machine_wait_flag_t *df = machine_wait_flag_create();
+	if (df == NULL) {
+		return NULL;
+	}
+
+	machine_wait_flag_t *gcf = machine_wait_flag_create();
+	if (gcf == NULL) {
+		machine_wait_flag_destroy(df);
+		return NULL;
+	}
+
+	od_rule_t *rule;
+	rule = (od_rule_t *)od_malloc(sizeof(od_rule_t));
+	if (rule == NULL) {
+		machine_wait_flag_destroy(df);
+		machine_wait_flag_destroy(gcf);
+		return NULL;
+	}
+	memset(rule, 0, sizeof(*rule));
+	rule->group_checker_machine_id = -1;
+	/* pool */
+	rule->pool = od_rule_pool_alloc();
+	if (rule->pool == NULL) {
+		machine_wait_flag_destroy(df);
+		machine_wait_flag_destroy(gcf);
+		od_free(rule);
+		return NULL;
+	}
+
+	rule->group_checker_online = df;
+	rule->group_checker_finished = gcf;
+
+	rule->user_role = OD_RULE_ROLE_UNDEF;
+	/* backward compatibility */
+	rule->maintain_params = 1;
+
+	rule->obsolete = 0;
+	rule->mark = 0;
+	atomic_store(&rule->refs, 1);
+
+	rule->order = rules->next_order++;
+
+	rule->conn_type = OD_RULE_CONN_TYPE_DEFAULT;
+
+	rule->target_session_attrs = OD_TARGET_SESSION_ATTRS_UNDEF;
+
+	rule->auto_route_ro_on_standby = 0;
+
+	rule->auth_common_name_default = 0;
+	rule->auth_common_names_count = 0;
+	rule->server_lifetime_us = 3600 * 1000000L;
+	rule->server_drop_on_cached_plan_error = 1;
+	rule->server_drop_on_oom = 1;
+	rule->client_show_id = 1;
+	rule->reserve_session_server_connection = 1;
+#ifdef PAM_FOUND
+	rule->auth_pam_data = od_pam_auth_data_create();
+#endif
+
+#ifdef LDAP_FOUND
+	rule->ldap_endpoint_name = NULL;
+	rule->ldap_endpoint = NULL;
+	rule->ldap_storage_credentials_attr = NULL;
+	od_list_init(&rule->ldap_storage_creds_list);
+#endif
+
+	kiwi_vars_init(&rule->vars);
+
+	rule->enable_password_passthrough = 0;
+
+	od_list_init(&rule->auth_common_names);
+	od_list_init(&rule->link);
+	od_list_append(&rules->rules, &rule->link);
+
+	rule->quantiles = NULL;
+	return rule;
+}
+
+od_rule_t *od_rules_add_new_rule(od_rules_t *rules, const char *dbname,
+				 int db_is_default, const char *user,
+				 int user_is_default,
+				 const od_address_range_t *address_range,
+				 od_rule_conn_type_t conn_type,
+				 int pool_internal)
+{
+	od_rule_t *rule = NULL;
+
+	rule = od_rules_match(rules, dbname, user, address_range, conn_type,
+			      db_is_default, user_is_default, pool_internal);
+	if (rule != NULL) {
+		/* already defined */
+		return NULL;
+	}
+
+	rule = od_rules_add(rules);
+	if (rule == NULL) {
+		return NULL;
+	}
+
+	rule->db_is_default = db_is_default;
+	rule->db_name_len = strlen(dbname);
+	rule->db_name = od_strdup(dbname);
+	if (rule->db_name == NULL) {
+		goto error;
+	}
+
+	rule->user_is_default = user_is_default;
+	rule->user_name_len = strlen(user);
+	rule->user_name = od_strdup(user);
+	if (rule->user_name == NULL) {
+		goto error;
+	}
+
+	if (od_address_range_copy(address_range, &rule->address_range)) {
+		goto error;
+	}
+
+	rule->conn_type = conn_type;
+
+	return rule;
+
+error:
+	od_rules_rule_free(rule);
+	return NULL;
+}
+
+void od_rules_rule_free(od_rule_t *rule)
+{
+	od_rules_unref(rule);
+}
+
+static void od_rules_rule_free_now(od_rule_t *rule)
+{
+	kiwi_vars_free(&rule->vars);
+
+	if (rule->password) {
+		od_free(rule->password);
+	}
+	if (rule->password_pgpass) {
+		od_free(rule->password_pgpass);
+	}
+	if (rule->auth) {
+		od_free(rule->auth);
+	}
+	if (rule->auth_query) {
+		od_free(rule->auth_query);
+	}
+	if (rule->auth_query_db) {
+		od_free(rule->auth_query_db);
+	}
+	if (rule->auth_query_user) {
+		od_free(rule->auth_query_user);
+	}
+	if (rule->storage) {
+		od_rules_storage_unref(rule->storage);
+	}
+	if (rule->storage_name) {
+		od_free(rule->storage_name);
+	}
+	if (rule->storage_db) {
+		od_free(rule->storage_db);
+	}
+	if (rule->storage_user) {
+		od_free(rule->storage_user);
+	}
+	if (rule->storage_password) {
+		od_free(rule->storage_password);
+	}
+	if (rule->pool) {
+		od_rule_pool_free(rule->pool);
+	}
+	if (rule->mdb_iamproxy_socket_path) {
+		od_free(rule->mdb_iamproxy_socket_path);
+	}
+	if (rule->shared_pool) {
+		od_shared_pool_unref(rule->shared_pool);
+	}
+	if (rule->backend_startup_vars) {
+		for (size_t j = 0; j < rule->backend_startup_vars_sz; j++) {
+			od_free(rule->backend_startup_vars[j].name);
+			od_free(rule->backend_startup_vars[j].value);
+		}
+		od_free(rule->backend_startup_vars);
+	}
+
+	od_list_t *i, *n;
+	od_list_foreach_safe (&rule->auth_common_names, i, n) {
+		od_rule_auth_t *auth;
+		auth = od_container_of(i, od_rule_auth_t, link);
+		od_rules_auth_free(auth);
+	}
+#ifdef PAM_FOUND
+	od_pam_auth_data_free(rule->auth_pam_data);
+#endif
+#ifdef LDAP_FOUND
+	if (rule->ldap_endpoint_name) {
+		od_free(rule->ldap_endpoint_name);
+	}
+	if (rule->ldap_storage_credentials_attr) {
+		od_free(rule->ldap_storage_credentials_attr);
+	}
+	if (rule->ldap_endpoint) {
+		od_ldap_endpoint_free(rule->ldap_endpoint);
+	}
+	if (!od_list_empty(&rule->ldap_storage_creds_list)) {
+		od_list_foreach_safe (&rule->ldap_storage_creds_list, i, n) {
+			od_ldap_storage_credentials_t *lsc;
+			lsc = od_container_of(i, od_ldap_storage_credentials_t,
+					      link);
+			od_ldap_storage_credentials_free(lsc);
+		}
+	}
+#endif
+	if (rule->auth_module) {
+		od_free(rule->auth_module);
+	}
+	if (rule->quantiles) {
+		od_free(rule->quantiles);
+	}
+
+	/*
+	 * group checker uses db_name and user_name
+	 * so free them at a last
+	 */
+	if (rule->db_name) {
+		od_free(rule->db_name);
+	}
+	if (rule->user_name) {
+		od_free(rule->user_name);
+	}
+	if (rule->address_range.string_value) {
+		od_free(rule->address_range.string_value);
+	}
+
+	machine_wait_flag_destroy(rule->group_checker_online);
+	machine_wait_flag_destroy(rule->group_checker_finished);
+
+	od_list_unlink(&rule->link);
+	od_free(rule);
+}
+
+void od_rules_ref(od_rule_t *rule)
+{
+	atomic_fetch_add(&rule->refs, 1);
+}
+
+void od_rules_unref(od_rule_t *rule)
+{
+	int64_t r = atomic_fetch_sub(&rule->refs, 1);
+	od_assert(r >= 1);
+	if (r == 1) {
+		od_rules_rule_free_now(rule);
+	}
+}
+
+static int od_rules_rule_get_specificity(const od_rule_t *rule)
+{
+	/*
+	 * from specified db, user, address, connection type to default values
+	 * smth like:
+	 * - db.user
+	 * - db.default
+	 * - default.user
+	 * - default.default
+	 *
+	 * this means that db < user < address < connection type
+	 * let higher priority mean earlier comparison when matching
+	 */
+
+	int specificity = 0;
+
+	if (!rule->db_is_default) {
+		specificity += 1000;
+	}
+
+	if (!rule->user_is_default) {
+		specificity += 100;
+	}
+
+	if (!rule->address_range.is_default) {
+		specificity += 10;
+	}
+
+	if (rule->conn_type != OD_RULE_CONN_TYPE_DEFAULT) {
+		specificity += 1;
+	}
+
+	return specificity;
+}
+
+static int od_rules_rule_db_cmp(const od_rule_t *a, const od_rule_t *b)
+{
+	if (a->db_is_default) {
+		if (b->db_is_default) {
+			return 0;
+		}
+
+		return 1;
+	}
+
+	if (b->db_is_default) {
+		return -1;
+	}
+
+	return strcmp(a->db_name, b->db_name);
+}
+
+static int od_rules_rule_user_cmp(const od_rule_t *a, const od_rule_t *b)
+{
+	if (a->user_is_default) {
+		if (b->user_is_default) {
+			return 0;
+		}
+
+		return 1;
+	}
+
+	if (b->user_is_default) {
+		return -1;
+	}
+
+	return strcmp(a->user_name, b->user_name);
+}
+
+static int od_rules_rule_address_cmp(const od_rule_t *a, const od_rule_t *b)
+{
+	const od_address_range_t *ar_a = &a->address_range;
+	const od_address_range_t *ar_b = &b->address_range;
+
+	if (ar_a->is_default) {
+		if (ar_b->is_default) {
+			return 0;
+		}
+
+		return 1;
+	}
+
+	if (ar_b->is_default) {
+		return -1;
+	}
+
+	if (ar_a->string_value_len > ar_b->string_value_len) {
+		int cmp = strncmp(ar_a->string_value, ar_b->string_value,
+				  ar_b->string_value_len);
+		if (cmp != 0) {
+			return cmp;
+		}
+
+		/* same prefix, but bigger length - a is greater */
+		return 1;
+	}
+
+	if (ar_a->string_value_len < ar_b->string_value_len) {
+		int cmp = strncmp(ar_a->string_value, ar_b->string_value,
+				  ar_a->string_value_len);
+		if (cmp != 0) {
+			return cmp;
+		}
+
+		/* same prefix, but smaller length - a is less */
+		return -1;
+	}
+
+	return strncmp(ar_a->string_value, ar_b->string_value,
+		       ar_a->string_value_len);
+}
+
+static int od_rules_rule_conn_type_cmp(const od_rule_t *a, const od_rule_t *b)
+{
+	return (int)b->conn_type - (int)a->conn_type;
+}
+
+static int od_rules_rule_cmp(const od_rule_t *a, const od_rule_t *b)
+{
+	int cmp = od_rules_rule_db_cmp(a, b);
+	if (cmp != 0) {
+		return cmp;
+	}
+
+	cmp = od_rules_rule_user_cmp(a, b);
+	if (cmp != 0) {
+		return cmp;
+	}
+
+	cmp = od_rules_rule_address_cmp(a, b);
+	if (cmp != 0) {
+		return cmp;
+	}
+
+	return od_rules_rule_conn_type_cmp(a, b);
+}
+
+static int od_rules_rule_specificity_cmp(const void *a, const void *b)
+{
+	const od_rule_t *rule_a = *((const od_rule_t **)a);
+	const od_rule_t *rule_b = *((const od_rule_t **)b);
+
+	int specificity_a = od_rules_rule_get_specificity(rule_a);
+	int specificity_b = od_rules_rule_get_specificity(rule_b);
+
+	/* let obsolete rules stay in the end of list */
+	if (rule_a->obsolete) {
+		specificity_a = -1;
+	}
+
+	if (rule_b->obsolete) {
+		specificity_b = -1;
+	}
+
+	/* from higher specificity to lower, so invert comparison */
+	if (specificity_a > specificity_b) {
+		return -1;
+	}
+
+	if (specificity_a < specificity_b) {
+		return 1;
+	}
+
+	return od_rules_rule_cmp(rule_a, rule_b);
+}
+
+static int od_rules_rule_order_cmp(const void *a, const void *b)
+{
+	const od_rule_t *rule_a = *((const od_rule_t **)a);
+	const od_rule_t *rule_b = *((const od_rule_t **)b);
+
+	/* let obsolete rules stay in the end of list */
+	int order_a = rule_a->obsolete ? INT_MAX : rule_a->order;
+	int order_b = rule_b->obsolete ? INT_MAX : rule_b->order;
+
+	if (order_a < order_b) {
+		return -1;
+	}
+
+	if (order_a > order_b) {
+		return 1;
+	}
+
+	return od_rules_rule_cmp(rule_a, rule_b);
+}
+
+void od_rules_stop_checkers(od_rules_t *rules)
+{
+	od_list_t *n, *i;
+	od_list_foreach_safe (&rules->rules, i, n) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		if (rule->group_checker_machine_id != -1) {
+			machine_wait_flag_set(rule->group_checker_online);
+			machine_wait_flag_wait(rule->group_checker_finished,
+					       UINT32_MAX);
+			rule->group_checker_machine_id = -1;
+		}
+	}
+}
+
+int od_rules_sort_for_matching(od_rules_t *rules)
+{
+	size_t count = od_list_count(&rules->rules);
+	if (count == 0) {
+		return 0;
+	}
+
+	od_rule_t **sorted = od_malloc(count * sizeof(od_rule_t *));
+	if (sorted == NULL) {
+		return 1;
+	}
+
+	size_t index = 0;
+	od_list_t *i, *n;
+	od_list_foreach_safe (&rules->rules, i, n) {
+		od_rule_t *rule = od_container_of(i, od_rule_t, link);
+		od_list_unlink(&rule->link);
+		sorted[index++] = rule;
+	}
+
+	/*
+	 * is we are matching rules sequentialy (in order they written in config)
+	 * then we must sort them by order
+	 *
+	 * in case when maching is not sequential, then we must
+	 * place default-containing rules at the end
+	 * (default routes has lower priority when matching)
+	*/
+
+	int sequential = od_global_get_instance()->config.sequential_routing;
+
+	if (sequential) {
+		qsort(sorted, count, sizeof(od_rule_t *),
+		      od_rules_rule_order_cmp);
+	} else {
+		qsort(sorted, count, sizeof(od_rule_t *),
+		      od_rules_rule_specificity_cmp);
+	}
+
+	for (index = 0; index < count; ++index) {
+		od_list_append(&rules->rules, &sorted[index]->link);
+	}
+
+	od_free(sorted);
+
+	return 0;
+}
+
+static int od_rule_db_match(const od_rule_t *rule, const char *dbname)
+{
+	if (rule->db_is_default) {
+		return 1;
+	}
+
+	return strcmp(rule->db_name, dbname) == 0;
+}
+
+static int od_rule_user_match(const od_rule_t *rule, const char *user)
+{
+	if (rule->user_is_default) {
+		return 1;
+	}
+
+	return od_name_in_rule(rule, user);
+}
+
+static int od_rule_address_match(const od_rule_t *rule,
+				 struct sockaddr_storage *uaddr)
+{
+	if (rule->address_range.is_default) {
+		return 1;
+	}
+
+	return od_address_validate(&rule->address_range, uaddr);
+}
+
+static int od_rule_conn_type_match(const od_rule_t *rule,
+				   const kiwi_be_startup_t *startup,
+				   struct sockaddr_storage *user_addr)
+{
+	if (rule->conn_type == OD_RULE_CONN_TYPE_DEFAULT) {
+		return 1;
+	}
+
+	sa_family_t family = user_addr->ss_family;
+	int is_ssl = startup->is_ssl_request;
+	int is_host = family == AF_INET || family == AF_INET6;
+	int is_local = family == AF_UNIX;
+
+	switch (rule->conn_type) {
+	case OD_RULE_CONN_TYPE_LOCAL:
+		return is_local;
+	case OD_RULE_CONN_TYPE_HOST:
+		return is_host;
+	case OD_RULE_CONN_TYPE_HOSTSSL:
+		return is_host && is_ssl;
+	case OD_RULE_CONN_TYPE_HOSTNOSSL:
+		return is_host && !is_ssl;
+
+	case OD_RULE_CONN_TYPE_DEFAULT:
+	default:
+		abort();
+	}
+}
+
+static od_rule_t *od_rules_find_first_matching(
+	od_rules_t *rules, const kiwi_be_startup_t *startup,
+	struct sockaddr_storage *user_addr, int pool_internal)
+{
+	const char *dbname = startup->database.value;
+	const char *user = startup->user.value;
+
+	/*
+	 * Here we can find first matching, because of rules sorting
+	 * in case sequential routing - the rules are sorted by order
+	 * in case of non-sequential routing - the rules are sorted by specificity
+	 * (specificity means a measure of how well the user fits the
+	 *  rule exactly, not just by 'default' comparison)
+	 */
+
+	od_list_t *i;
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		if (rule->obsolete) {
+			continue;
+		}
+		if (pool_internal) {
+			if (rule->pool->routing != OD_RULE_POOL_INTERNAL) {
+				continue;
+			}
+		} else {
+			if (rule->pool->routing !=
+			    OD_RULE_POOL_CLIENT_VISIBLE) {
+				continue;
+			}
+		}
+
+		if (!od_rule_db_match(rule, dbname)) {
+			continue;
+		}
+
+		if (!od_rule_user_match(rule, user)) {
+			continue;
+		}
+
+		if (!od_rule_address_match(rule, user_addr)) {
+			continue;
+		}
+
+		if (!od_rule_conn_type_match(rule, startup, user_addr)) {
+			continue;
+		}
+
+		return rule;
+	}
+
+	return NULL;
+}
+
+od_rule_t *od_rules_forward(od_rules_t *rules, const kiwi_be_startup_t *startup,
+			    struct sockaddr_storage *user_addr,
+			    int pool_internal)
+{
+	return od_rules_find_first_matching(rules, startup, user_addr,
+					    pool_internal);
+}
+
+static inline int od_rule_match(od_rule_t *rule, const char *dbname,
+				const char *user,
+				const od_address_range_t *address_range,
+				od_rule_conn_type_t conn_type,
+				int db_is_default, int user_is_default)
+{
+	if (strcmp(rule->db_name, dbname) != 0) {
+		return 0;
+	}
+
+	if (!od_name_in_rule(rule, user)) {
+		return 0;
+	}
+
+	if (rule->conn_type != conn_type) {
+		return 0;
+	}
+
+	if (rule->address_range.is_default != address_range->is_default) {
+		return 0;
+	}
+
+	if (rule->db_is_default != db_is_default) {
+		return 0;
+	}
+
+	if (rule->user_is_default != user_is_default) {
+		return 0;
+	}
+
+	if (!address_range->is_default) {
+		return od_address_range_equals(&rule->address_range,
+					       address_range);
+	}
+
+	return 1;
+}
+
+od_rule_t *od_rules_match(od_rules_t *rules, const char *db_name,
+			  const char *user_name,
+			  const od_address_range_t *address_range,
+			  od_rule_conn_type_t conn_type, int db_is_default,
+			  int user_is_default, int pool_internal)
+{
+	od_list_t *i;
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		/* filter out internal or client-vidible rules */
+		if (pool_internal) {
+			if (rule->pool->routing != OD_RULE_POOL_INTERNAL) {
+				continue;
+			}
+		} else {
+			if (rule->pool->routing !=
+			    OD_RULE_POOL_CLIENT_VISIBLE) {
+				continue;
+			}
+		}
+
+		if (od_rule_match(rule, db_name, user_name, address_range,
+				  conn_type, db_is_default, user_is_default)) {
+			return rule;
+		}
+	}
+	return NULL;
+}
+
+static inline od_rule_t *
+od_rules_match_active(od_rules_t *rules, char *db_name, char *user_name,
+		      od_address_range_t *address_range,
+		      od_rule_conn_type_t conn_type)
+{
+	od_list_t *i;
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		if (rule->obsolete) {
+			continue;
+		}
+		if (strcmp(rule->db_name, db_name) == 0 &&
+		    od_name_in_rule(rule, user_name) &&
+		    od_address_range_equals(&rule->address_range,
+					    address_range) &&
+		    rule->conn_type == conn_type) {
+			return rule;
+		}
+	}
+	return NULL;
+}
+
+int od_rules_storage_compare(od_rule_storage_t *a, od_rule_storage_t *b)
+{
+	if (a == NULL || b == NULL) {
+		return a == b;
+	}
+
+	/* type */
+	if (a->storage_type != b->storage_type) {
+		return 0;
+	}
+
+	/* type */
+	if (a->server_max_routing != b->server_max_routing) {
+		return 0;
+	}
+
+	/* host */
+	if (a->host && b->host) {
+		if (strcmp(a->host, b->host) != 0) {
+			return 0;
+		}
+	} else if (a->host || b->host) {
+		return 0;
+	}
+
+	/* port */
+	if (a->port != b->port) {
+		return 0;
+	}
+
+	/* tls_opts->tls_mode */
+	if (a->tls_opts->tls_mode != b->tls_opts->tls_mode) {
+		return 0;
+	}
+
+	/* tls_opts->tls_ca_file */
+	if (a->tls_opts->tls_ca_file && b->tls_opts->tls_ca_file) {
+		if (strcmp(a->tls_opts->tls_ca_file,
+			   b->tls_opts->tls_ca_file) != 0) {
+			return 0;
+		}
+	} else if (a->tls_opts->tls_ca_file || b->tls_opts->tls_ca_file) {
+		return 0;
+	}
+
+	/* tls_opts->tls_key_file */
+	if (a->tls_opts->tls_key_file && b->tls_opts->tls_key_file) {
+		if (strcmp(a->tls_opts->tls_key_file,
+			   b->tls_opts->tls_key_file) != 0) {
+			return 0;
+		}
+	} else if (a->tls_opts->tls_key_file || b->tls_opts->tls_key_file) {
+		return 0;
+	}
+
+	/* tls_opts->tls_cert_file */
+	if (a->tls_opts->tls_cert_file && b->tls_opts->tls_cert_file) {
+		if (strcmp(a->tls_opts->tls_cert_file,
+			   b->tls_opts->tls_cert_file) != 0) {
+			return 0;
+		}
+	} else if (a->tls_opts->tls_cert_file || b->tls_opts->tls_cert_file) {
+		return 0;
+	}
+
+	/* tls_opts->tls_protocols */
+	if (a->tls_opts->tls_protocols && b->tls_opts->tls_protocols) {
+		if (strcmp(a->tls_opts->tls_protocols,
+			   b->tls_opts->tls_protocols) != 0) {
+			return 0;
+		}
+	} else if (a->tls_opts->tls_protocols || b->tls_opts->tls_protocols) {
+		return 0;
+	}
+
+	/* endpoints_status_poll_interval_ms */
+	if (a->endpoints_status_poll_interval_ms !=
+	    b->endpoints_status_poll_interval_ms) {
+		return 0;
+	}
+
+	/* endpoints count */
+	if (a->endpoints_count != b->endpoints_count) {
+		return 0;
+	}
+
+	/* endpoints addresses */
+	for (size_t k = 0; k < a->endpoints_count; k++) {
+		if (od_address_cmp(&a->endpoints[k].address,
+				   &b->endpoints[k].address) != 0) {
+			return 0;
+		}
+	}
+
+	/* balancing */
+	if (a->balancing.method.type != b->balancing.method.type) {
+		return 0;
+	}
+	if (a->balancing.method.az_aware != b->balancing.method.az_aware) {
+		return 0;
+	}
+	if (a->balancing.debug_notice != b->balancing.debug_notice) {
+		return 0;
+	}
+
+	/* balancing: weighted */
+	if (a->balancing.method.weighted.nweights !=
+	    b->balancing.method.weighted.nweights) {
+		return 0;
+	}
+	for (size_t k = 0; k < a->balancing.method.weighted.nweights; k++) {
+		od_balancing_host_weight_t *aw =
+			&a->balancing.method.weighted.weights[k];
+		od_balancing_host_weight_t *bw =
+			&b->balancing.method.weighted.weights[k];
+		if (aw->weight != bw->weight) {
+			return 0;
+		}
+		if ((aw->host == NULL) != (bw->host == NULL)) {
+			return 0;
+		}
+		if (aw->host && bw->host && strcmp(aw->host, bw->host) != 0) {
+			return 0;
+		}
+	}
+
+	/* balancing: weighted_leastconn */
+	if (a->balancing.method.weighted_leastconn.nweights !=
+	    b->balancing.method.weighted_leastconn.nweights) {
+		return 0;
+	}
+	for (size_t k = 0; k < a->balancing.method.weighted_leastconn.nweights;
+	     k++) {
+		od_balancing_host_weight_t *aw =
+			&a->balancing.method.weighted_leastconn.weights[k];
+		od_balancing_host_weight_t *bw =
+			&b->balancing.method.weighted_leastconn.weights[k];
+		if (aw->weight != bw->weight) {
+			return 0;
+		}
+		if ((aw->host == NULL) != (bw->host == NULL)) {
+			return 0;
+		}
+		if (aw->host && bw->host && strcmp(aw->host, bw->host) != 0) {
+			return 0;
+		}
+	}
+
+	/* balancing: responsetime */
+	if (a->balancing.method.responsetime.time_weight !=
+	    b->balancing.method.responsetime.time_weight) {
+		return 0;
+	}
+	if (a->balancing.method.responsetime.conn_weight !=
+	    b->balancing.method.responsetime.conn_weight) {
+		return 0;
+	}
+
+	return 1;
+}
+
+int od_rules_rule_compare(od_rule_t *a, od_rule_t *b)
+{
+	/* db default */
+	if (a->db_is_default != b->db_is_default) {
+		return 0;
+	}
+
+	/* user default */
+	if (a->user_is_default != b->user_is_default) {
+		return 0;
+	}
+
+	if (a->conn_type != b->conn_type) {
+		return 0;
+	}
+
+	/* password */
+	if (a->password && b->password) {
+		if (strcmp(a->password, b->password) != 0) {
+			return 0;
+		}
+	} else if (a->password || b->password) {
+		return 0;
+	}
+
+	/* role */
+	if (a->user_role != b->user_role) {
+		return 0;
+	}
+
+	/* quantiles changed */
+	if (a->quantiles_count == b->quantiles_count) {
+		if (a->quantiles_count != 0 &&
+		    memcmp(a->quantiles, b->quantiles,
+			   sizeof(double) * a->quantiles_count) != 0) {
+			return 0;
+		}
+	} else {
+		return 0;
+	}
+
+	/* auth */
+	if (a->auth_mode != b->auth_mode) {
+		return 0;
+	}
+
+	/* auth query */
+	if (a->auth_query && b->auth_query) {
+		if (strcmp(a->auth_query, b->auth_query) != 0) {
+			return 0;
+		}
+	} else if (a->auth_query || b->auth_query) {
+		return 0;
+	}
+
+	/* auth query db */
+	if (a->auth_query_db && b->auth_query_db) {
+		if (strcmp(a->auth_query_db, b->auth_query_db) != 0) {
+			return 0;
+		}
+	} else if (a->auth_query_db || b->auth_query_db) {
+		return 0;
+	}
+
+	/* auth query user */
+	if (a->auth_query_user && b->auth_query_user) {
+		if (strcmp(a->auth_query_user, b->auth_query_user) != 0) {
+			return 0;
+		}
+	} else if (a->auth_query_user || b->auth_query_user) {
+		return 0;
+	}
+
+	/* auth common name default */
+	if (a->auth_common_name_default != b->auth_common_name_default) {
+		return 0;
+	}
+
+	/* auth common names count */
+	if (a->auth_common_names_count != b->auth_common_names_count) {
+		return 0;
+	}
+
+	/* compare auth common names */
+	od_list_t *i;
+	od_list_foreach (&a->auth_common_names, i) {
+		od_rule_auth_t *auth;
+		auth = od_container_of(i, od_rule_auth_t, link);
+		if (!od_rules_auth_find(b, auth->common_name)) {
+			return 0;
+		}
+	}
+
+	/* storage */
+	if (strcmp(a->storage_name, b->storage_name) != 0) {
+		return 0;
+	}
+
+	if (!od_rules_storage_compare(a->storage, b->storage)) {
+		return 0;
+	}
+
+	/* storage_db */
+	if (a->storage_db && b->storage_db) {
+		if (strcmp(a->storage_db, b->storage_db) != 0) {
+			return 0;
+		}
+	} else if (a->storage_db || b->storage_db) {
+		return 0;
+	}
+
+	/* storage_user */
+	if (a->storage_user && b->storage_user) {
+		if (strcmp(a->storage_user, b->storage_user) != 0) {
+			return 0;
+		}
+	} else if (a->storage_user || b->storage_user) {
+		return 0;
+	}
+
+	/* storage_password */
+	if (a->storage_password && b->storage_password) {
+		if (strcmp(a->storage_password, b->storage_password) != 0) {
+			return 0;
+		}
+	} else if (a->storage_password || b->storage_password) {
+		return 0;
+	}
+
+	/* pool */
+	if (!od_rule_pool_compare(a->pool, b->pool)) {
+		return 0;
+	}
+
+	/* client_fwd_error */
+	if (a->client_fwd_error != b->client_fwd_error) {
+		return 0;
+	}
+
+	if (a->client_show_id != b->client_show_id) {
+		return 0;
+	}
+
+	/* reserve_session_server_connection */
+	if (a->reserve_session_server_connection !=
+	    b->reserve_session_server_connection) {
+		return 0;
+	}
+
+	if (a->auto_route_ro_on_standby != b->auto_route_ro_on_standby) {
+		return 0;
+	}
+
+	if (a->catchup_timeout != b->catchup_timeout) {
+		return 0;
+	}
+
+	if (a->catchup_checks != b->catchup_checks) {
+		return 0;
+	}
+
+	/* client_max */
+	if (a->client_max != b->client_max) {
+		return 0;
+	}
+
+	/* server_lifetime */
+	if (a->server_lifetime_us != b->server_lifetime_us) {
+		return 0;
+	}
+
+	if (a->server_drop_on_oom != b->server_drop_on_oom) {
+		return 0;
+	}
+
+	/* maintain_params */
+	if (a->maintain_params != b->maintain_params) {
+		return 0;
+	}
+
+	if (a->maintain_params_set != b->maintain_params_set) {
+		return 0;
+	}
+
+	/* keepalive */
+	if (a->keepalive != b->keepalive) {
+		return 0;
+	}
+
+	/* keepalive_keep_interval */
+	if (a->keepalive_keep_interval != b->keepalive_keep_interval) {
+		return 0;
+	}
+
+	/* keepalive_probes */
+	if (a->keepalive_probes != b->keepalive_probes) {
+		return 0;
+	}
+
+	/* keepalive_usr_timeout */
+	if (a->keepalive_usr_timeout != b->keepalive_usr_timeout) {
+		return 0;
+	}
+
+	return 1;
+}
+
+int od_rules_rule_compare_to_drop(od_rule_t *a, od_rule_t *b)
+{
+	/* role */
+	if (a->user_role < b->user_role) {
+		return 0;
+	}
+
+	/* force drop rules with shared pools */
+	if (a->shared_pool != NULL || b->shared_pool != NULL) {
+		return 0;
+	}
+
+	return 1;
+}
+
+static od_rule_key_t *rk_of(od_rule_t *rule)
+{
+	od_rule_key_t *rk = od_malloc(sizeof(od_rule_key_t));
+	if (rk == NULL) {
+		/* TODO: better */
+		abort();
+	}
+
+	od_rule_key_init(rk);
+
+	rk->usr_name = od_strndup(rule->user_name, rule->user_name_len);
+	rk->db_name = od_strndup(rule->db_name, rule->db_name_len);
+
+	od_address_range_copy(&rule->address_range, &rk->address_range);
+
+	rk->conn_type = rule->conn_type;
+
+	return rk;
+}
+
+int od_rules_merge(od_rules_t *rules, od_rules_t *src, od_list_t *added,
+		   od_list_t *deleted, od_list_t *to_drop,
+		   od_list_t *not_changed)
+{
+	int count_mark = 0;
+	int count_deleted = 0;
+	int count_new = 0;
+
+	od_list_t *i;
+	/* mark all rules for obsoletion */
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		rule->mark = 1;
+		count_mark++;
+	}
+
+	/* select dropped rules */
+	od_list_t *n;
+	od_list_foreach_safe (&rules->rules, i, n) {
+		od_rule_t *rule_old;
+		rule_old = od_container_of(i, od_rule_t, link);
+
+		int ok = 0;
+
+		od_list_t *m;
+		od_list_t *j;
+		od_list_foreach_safe (&src->rules, j, m) {
+			od_rule_t *rule_new;
+			rule_new = od_container_of(j, od_rule_t, link);
+			if (strcmp(rule_old->user_name, rule_new->user_name) ==
+				    0 &&
+			    strcmp(rule_old->db_name, rule_new->db_name) == 0 &&
+			    od_address_range_equals(&rule_old->address_range,
+						    &rule_new->address_range) &&
+			    rule_old->conn_type == rule_new->conn_type) {
+				ok = 1;
+				break;
+			}
+		}
+
+		if (!ok) {
+			od_rule_key_t *rk = rk_of(rule_old);
+			od_list_append(deleted, &rk->link);
+			++count_deleted;
+		}
+	};
+
+	/* select added rules */
+	od_list_foreach_safe (&src->rules, i, n) {
+		od_rule_t *rule_new;
+		rule_new = od_container_of(i, od_rule_t, link);
+
+		int ok = 0;
+
+		od_list_t *m;
+		od_list_t *j;
+		od_list_foreach_safe (&rules->rules, j, m) {
+			od_rule_t *rule_old;
+			rule_old = od_container_of(j, od_rule_t, link);
+			if (strcmp(rule_old->user_name, rule_new->user_name) ==
+				    0 &&
+			    strcmp(rule_old->db_name, rule_new->db_name) == 0 &&
+			    od_address_range_equals(&rule_old->address_range,
+						    &rule_new->address_range) &&
+			    rule_old->conn_type == rule_new->conn_type) {
+				ok = 1;
+				break;
+			}
+		}
+
+		if (!ok) {
+			od_rule_key_t *rk = rk_of(rule_new);
+			od_list_append(added, &rk->link);
+		}
+	}
+
+	/* select new rules */
+	od_list_foreach_safe (&src->rules, i, n) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+
+		/* find and compare origin rule */
+		od_rule_t *origin;
+		origin = od_rules_match_active(rules, rule->db_name,
+					       rule->user_name,
+					       &rule->address_range,
+					       rule->conn_type);
+		if (origin) {
+			/*
+			 * If the rule is unchanged (same settings, same
+			 * storage), keep the origin alive and drop the
+			 * freshly parsed copy.  Since od_rules_storage_merge
+			 * already re-pointed rule->storage to the origin's
+			 * storage (when the storage is unchanged), the
+			 * pointer comparison inside od_rules_rule_compare
+			 * will succeed and the origin keeps its backend
+			 * connections, watchdog and endpoint statuses.
+			 *
+			 * However, default rules (db_is_default or
+			 * user_is_default) are always force-dropped: a new
+			 * dedicated rule may shadow them, and existing
+			 * routes matched via the default rule must be
+			 * recreated to pick up the dedicated rule.
+			 */
+			if (origin->shared_pool == NULL &&
+			    rule->shared_pool == NULL &&
+			    !origin->db_is_default &&
+			    !origin->user_is_default &&
+			    od_rules_rule_compare(origin, rule)) {
+				origin->mark = 0;
+				count_mark--;
+				origin->order = rule->order;
+
+				od_rule_key_t *rk = rk_of(origin);
+				od_list_append(not_changed, &rk->link);
+
+				continue;
+			}
+
+			if (!od_rules_rule_compare_to_drop(origin, rule)) {
+				od_rule_key_t *rk = rk_of(origin);
+				od_list_append(to_drop, &rk->link);
+			}
+
+			/* add new version, origin version still exists */
+		} else {
+			/* add new version */
+
+			/*			od_list_append(added, &rule->link); */
+		}
+
+		od_list_unlink(&rule->link);
+		od_list_init(&rule->link);
+		od_list_append(&rules->rules, &rule->link);
+#ifdef PAM_FOUND
+		if (rule->auth_pam_data) {
+			od_pam_auth_data_free(rule->auth_pam_data);
+		}
+		rule->auth_pam_data = od_pam_auth_data_create();
+#endif
+		count_new++;
+	}
+
+	/* try to free obsolete schemes, which are unused by any
+	 * rule at the moment */
+	if (count_mark > 0) {
+		od_list_foreach_safe (&rules->rules, i, n) {
+			od_rule_t *rule;
+			rule = od_container_of(i, od_rule_t, link);
+
+			int is_obsolete = rule->obsolete || rule->mark;
+			rule->mark = 0;
+			rule->obsolete = is_obsolete;
+
+			if (is_obsolete) {
+				od_list_unlink(&rule->link);
+				od_list_init(&rule->link);
+				od_rules_unref(rule);
+			}
+		}
+	}
+
+	/*
+	 * the rules list was changed, need to sort it for matching correct work
+	 */
+	od_rules_sort_for_matching(rules);
+
+	return count_new + count_mark + count_deleted;
+}
+
+int od_pool_validate(od_logger_t *logger, od_rule_pool_t *pool, char *db_name,
+		     char *user_name, od_address_range_t *address_range)
+{
+	/* pooling mode */
+	if (!pool->pool_type_str) {
+		od_error(logger, NULL, NULL,
+			 "rule '%s.%s %s': pooling mode is not set", db_name,
+			 user_name, address_range->string_value);
+		return NOT_OK_RESPONSE;
+	}
+	if (strcmp(pool->pool_type_str, "session") == 0) {
+		pool->pool_type = OD_RULE_POOL_SESSION;
+	} else if (strcmp(pool->pool_type_str, "transaction") == 0) {
+		pool->pool_type = OD_RULE_POOL_TRANSACTION;
+	} else if (strcmp(pool->pool_type_str, "statement") == 0) {
+		pool->pool_type = OD_RULE_POOL_STATEMENT;
+	} else {
+		od_error(logger, NULL, NULL,
+			 "rule '%s.%s %s': unknown pooling mode", db_name,
+			 user_name, address_range->string_value);
+		return NOT_OK_RESPONSE;
+	}
+
+	pool->routing = OD_RULE_POOL_CLIENT_VISIBLE;
+	if (!pool->routing_type) {
+		od_debug(
+			logger, NULL, NULL,
+			"rule '%s.%s %s': pool routing mode is not set, assuming \"client_visible\" by default",
+			db_name, user_name, address_range->string_value);
+	} else if (strcmp(pool->routing_type, "internal") == 0) {
+		pool->routing = OD_RULE_POOL_INTERNAL;
+	} else if (strcmp(pool->routing_type, "client_visible") == 0) {
+		pool->routing = OD_RULE_POOL_CLIENT_VISIBLE;
+	} else {
+		od_error(logger, NULL, NULL,
+			 "rule '%s.%s %s': unknown pool routing mode", db_name,
+			 user_name, address_range->string_value);
+		return NOT_OK_RESPONSE;
+	}
+
+	if (pool->routing == OD_RULE_POOL_INTERNAL &&
+	    !address_range->is_default) {
+		od_error(
+			logger, NULL, NULL,
+			"rule '%s.%s %s': internal rules must have default address_range",
+			db_name, user_name, address_range->string_value);
+		return NOT_OK_RESPONSE;
+	}
+
+	if (pool->pool_type == OD_RULE_POOL_SESSION && pool->pin_on_listen) {
+		od_error(
+			logger, NULL, NULL,
+			"setting pool_pin_on_listen with session pool for %s.%s makes no sense",
+			db_name, user_name);
+		return NOT_OK_RESPONSE;
+	}
+
+	/* reserve prepare statement feature */
+	if (pool->reserve_prepared_statement &&
+	    pool->pool_type == OD_RULE_POOL_SESSION) {
+		pool->reserve_prepared_statement = 0;
+
+		od_log(logger, NULL, NULL,
+		       "rule '%s.%s %s': disable prepared statements reserving due to session pooling",
+		       db_name, user_name, address_range->string_value);
+	}
+
+	if (!pool->reserve_prepared_statement &&
+	    pool->server_pstmt_cache_size > 0) {
+		pool->server_pstmt_cache_size = 0;
+
+		od_log(logger, NULL, NULL,
+		       "rule '%s.%s %s': ignore server_pstmt_cache_size due to disabled prepared statements reserving",
+		       db_name, user_name, address_range->string_value);
+	}
+
+	if (pool->reserve_prepared_statement && pool->discard) {
+		pool->discard = 0;
+		pool->smart_discard = 1;
+
+		od_log(logger, NULL, NULL,
+		       "rule '%s.%s %s': replace pool_discard with pool_smart_discard due to prepared statements reserving",
+		       db_name, user_name, address_range->string_value);
+	}
+
+	if (pool->smart_discard && !pool->reserve_prepared_statement) {
+		od_error(
+			logger, NULL, NULL,
+			"rule '%s.%s %s': pool smart discard is forbidden without using prepared statements support",
+			db_name, user_name, address_range->string_value);
+		return NOT_OK_RESPONSE;
+	}
+
+	if (pool->discard_query && pool->reserve_prepared_statement) {
+		if (strcasestr(pool->discard_query, "DEALLOCATE ALL")) {
+			od_error(
+				logger, NULL, NULL,
+				"rule '%s.%s %s': cannot support prepared statements when 'DEALLOCATE ALL' present in discard string",
+				db_name, user_name,
+				address_range->string_value);
+			return NOT_OK_RESPONSE;
+		}
+	}
+
+	return OK_RESPONSE;
+}
+
+int od_rules_autogenerate_defaults(od_rules_t *rules, od_logger_t *logger)
+{
+	od_rule_t *rule;
+	od_rule_t *default_rule;
+	od_list_t *i;
+	bool need_autogen = false;
+	/* rules */
+	od_list_foreach (&rules->rules, i) {
+		rule = od_container_of(i, od_rule_t, link);
+
+		/* match storage and make a copy of in the user rules */
+		if (rule->auth_query != NULL &&
+		    !od_rules_match(rules, rule->db_name, rule->user_name,
+				    &rule->address_range, rule->conn_type,
+				    rule->db_is_default, rule->user_is_default,
+				    1)) {
+			need_autogen = true;
+			break;
+		}
+	}
+
+	od_address_range_t default_address_range =
+		od_address_range_create_default();
+
+	if (!need_autogen ||
+	    od_rules_match(rules, "default_db", "default_user",
+			   &default_address_range, OD_RULE_CONN_TYPE_DEFAULT, 1,
+			   1, 1)) {
+		od_log(logger, NULL, NULL,
+		       "skipping default internal rule auto-generation: no need in them");
+		od_address_range_destroy(&default_address_range);
+		return OK_RESPONSE;
+	}
+
+	default_rule = od_rules_match(rules, "default_db", "default_user",
+				      &default_address_range,
+				      OD_RULE_CONN_TYPE_DEFAULT, 1, 1, 0);
+	if (!default_rule) {
+		od_log(logger, NULL, NULL,
+		       "skipping default internal rule auto-generation: no default rule provided");
+		od_address_range_destroy(&default_address_range);
+		return OK_RESPONSE;
+	}
+
+	if (!default_rule->storage) {
+		od_log(logger, NULL, NULL,
+		       "skipping default internal rule auto-generation: default rule storage not set");
+		od_address_range_destroy(&default_address_range);
+		return OK_RESPONSE;
+	}
+
+	if (!default_rule->storage_password) {
+		od_log(logger, NULL, NULL,
+		       "skipping default internal rule auto-generation: default rule storage password not set");
+		od_address_range_destroy(&default_address_range);
+		return OK_RESPONSE;
+	}
+
+	rule = od_rules_add(rules);
+	if (rule == NULL) {
+		od_address_range_destroy(&default_address_range);
+		return NOT_OK_RESPONSE;
+	}
+	rule->user_is_default = 1;
+	rule->user_name_len = sizeof("default_user");
+
+	/* we need malloc'd string here */
+	rule->user_name = od_strdup("default_user");
+	if (rule->user_name == NULL) {
+		od_address_range_destroy(&default_address_range);
+		return NOT_OK_RESPONSE;
+	}
+	rule->db_is_default = 1;
+	rule->db_name_len = sizeof("default_db");
+	/* we need malloc'd string here */
+	rule->db_name = od_strdup("default_db");
+	if (rule->db_name == NULL) {
+		od_address_range_destroy(&default_address_range);
+		return NOT_OK_RESPONSE;
+	}
+
+	rule->address_range = default_address_range;
+
+	rule->conn_type = OD_RULE_CONN_TYPE_DEFAULT;
+
+/* force several default settings */
+#define OD_DEFAULT_INTERNAL_POLL_SZ 0
+
+	rule->pool->pool_type_str = od_strdup("transaction");
+	if (rule->pool->pool_type_str == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+	rule->pool->pool_type = OD_RULE_POOL_TRANSACTION;
+
+	rule->pool->routing_type = od_strdup("internal");
+	if (rule->pool->routing_type == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+	rule->pool->routing = OD_RULE_POOL_INTERNAL;
+
+	rule->pool->size = OD_DEFAULT_INTERNAL_POLL_SZ;
+	rule->enable_password_passthrough = true;
+	rule->storage = od_rules_storage_ref(default_rule->storage);
+	rule->storage_password = od_strdup(default_rule->storage_password);
+	if (rule->storage_password == NULL) {
+		return NOT_OK_RESPONSE;
+	}
+	rule->storage_password_len = default_rule->storage_password_len;
+
+	od_log(logger, NULL, NULL, "default internal rule auto-generated");
+	return OK_RESPONSE;
+}
+
+static inline int od_rules_validate_endpoints(od_logger_t *logger,
+					      od_config_t *config,
+					      od_rule_storage_t *storage)
+{
+	if (storage->host == NULL) {
+		if (config->unix_socket_dir == NULL) {
+			od_error(logger, NULL, NULL,
+				 "storage '%s': no host specified and "
+				 "unix_socket_dir is not set",
+				 storage->name);
+
+			return -1;
+		}
+
+		/* enforce one endpoint with unix address */
+		char buff[sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+		if (od_unix_socket_path(buff, sizeof(buff),
+					config->unix_socket_dir,
+					storage->port) == -1) {
+			od_error(logger, NULL, NULL,
+				 "storage '%s': unix socket path "
+				 "'%s/.s.PGSQL.%d' is too long",
+				 storage->name, config->unix_socket_dir,
+				 storage->port);
+			return -1;
+		}
+
+		storage->endpoints =
+			od_malloc(1 * sizeof(od_storage_endpoint_t));
+		if (storage->endpoints == NULL) {
+			return -1;
+		}
+
+		od_storage_endpoint_t *endpoint = &storage->endpoints[0];
+
+		endpoint->storage = storage;
+		od_storage_endpoint_status_init(&endpoint->status);
+		od_address_init(&endpoint->address);
+
+		endpoint->address.type = OD_ADDRESS_TYPE_UNIX;
+		endpoint->address.host = od_strdup(buff);
+		if (endpoint->address.host == NULL) {
+			od_free(storage->endpoints);
+			return -1;
+		}
+
+		storage->endpoints_count = 1;
+	} else {
+		/* force default port */
+		for (size_t i = 0; i < storage->endpoints_count; ++i) {
+			if (storage->endpoints[i].address.port == 0) {
+				storage->endpoints[i].address.port =
+					storage->port;
+			}
+		}
+	}
+
+	return 0;
+}
+
+int od_rules_validate(od_rules_t *rules, od_config_t *config,
+		      od_logger_t *logger)
+{
+	/* storages */
+	if (od_list_empty(&rules->storages)) {
+		od_error(logger, NULL, NULL, "no storage defined");
+		return -1;
+	}
+
+	od_list_t *i;
+	od_list_t *li;
+	od_list_foreach (&rules->storages, i) {
+		od_rule_storage_t *storage;
+		storage = od_container_of(i, od_rule_storage_t, link);
+		if (storage->server_max_routing == 0) {
+			storage->server_max_routing = config->workers;
+		}
+		if (storage->type == NULL) {
+			od_error(logger, NULL, NULL,
+				 "storage '%s': no type is specified",
+				 storage->name);
+			return -1;
+		}
+		if (strcmp(storage->type, "remote") == 0) {
+			storage->storage_type = OD_RULE_STORAGE_REMOTE;
+		} else if (strcmp(storage->type, "local") == 0) {
+			storage->storage_type = OD_RULE_STORAGE_LOCAL;
+		} else {
+			od_error(logger, NULL, NULL, "unknown storage type");
+			return -1;
+		}
+		if (storage->storage_type == OD_RULE_STORAGE_REMOTE) {
+			if (od_rules_validate_endpoints(logger, config,
+							storage) != 0) {
+				return -1;
+			}
+		}
+		if (storage->tls_opts->tls) {
+			if (strcmp(storage->tls_opts->tls, "disable") == 0) {
+				storage->tls_opts->tls_mode =
+					OD_CONFIG_TLS_DISABLE;
+			} else if (strcmp(storage->tls_opts->tls, "allow") ==
+				   0) {
+				storage->tls_opts->tls_mode =
+					OD_CONFIG_TLS_ALLOW;
+				od_log(logger, NULL, NULL,
+				       "storage '%s': tls \"allow\" now follows libpq sslmode=allow, "
+				       "a connection is made in plaintext and is retried with tls "
+				       "only after the server has rejected it; "
+				       "use tls \"prefer\" to always negotiate tls first",
+				       storage->name);
+			} else if (strcmp(storage->tls_opts->tls, "prefer") ==
+				   0) {
+				storage->tls_opts->tls_mode =
+					OD_CONFIG_TLS_PREFER;
+			} else if (strcmp(storage->tls_opts->tls, "require") ==
+				   0) {
+				storage->tls_opts->tls_mode =
+					OD_CONFIG_TLS_REQUIRE;
+			} else if (strcmp(storage->tls_opts->tls,
+					  "verify_ca") == 0) {
+				storage->tls_opts->tls_mode =
+					OD_CONFIG_TLS_VERIFY_CA;
+			} else if (strcmp(storage->tls_opts->tls,
+					  "verify_full") == 0) {
+				storage->tls_opts->tls_mode =
+					OD_CONFIG_TLS_VERIFY_FULL;
+			} else {
+				od_error(logger, NULL, NULL,
+					 "unknown storage tls_opts->tls mode");
+				return -1;
+			}
+		}
+	}
+
+	/*
+	 * auto_route_ro_on_standby decisions are driven by the full query
+	 * parser: with any other query_parsing mode it silently degrades
+	 * to routing everything to the primary
+	 */
+	if (config->query_parsing.mode != OD_CONFIG_QUERY_PARSING_MODE_FULL) {
+		od_list_foreach (&config->listen, li) {
+			od_config_listen_t *listen;
+			listen = od_container_of(li, od_config_listen_t, link);
+			if (listen->auto_route_ro_on_standby) {
+				od_error(
+					logger, NULL, NULL,
+					"listen '%s:%d': auto_route_ro_on_standby requires query_parsing_mode 'full'",
+					od_config_listen_host_name(listen),
+					listen->port);
+				return -1;
+			}
+		}
+
+		od_list_foreach (&rules->rules, i) {
+			od_rule_t *rule;
+			rule = od_container_of(i, od_rule_t, link);
+			if (rule->auto_route_ro_on_standby) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': auto_route_ro_on_standby requires query_parsing_mode 'full'",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return -1;
+			}
+		}
+	}
+
+	/* rules */
+	if (od_list_empty(&rules->rules)) {
+		od_error(logger, NULL, NULL, "no rules defined");
+		return -1;
+	}
+
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+
+		/* match storage and make a copy of in the user rules */
+		if (rule->storage_name == NULL) {
+			od_error(
+				logger, NULL, NULL,
+				"rule '%s.%s %s': no rule storage is specified",
+				rule->db_name, rule->user_name,
+				rule->address_range.string_value);
+			return NOT_OK_RESPONSE;
+		}
+
+		od_rule_storage_t *storage;
+		storage = od_rules_storage_match(rules, rule->storage_name);
+		if (storage == NULL) {
+			od_error(logger, NULL, NULL,
+				 "rule '%s.%s %s': no rule storage '%s' found",
+				 rule->db_name, rule->user_name,
+				 rule->address_range.string_value,
+				 rule->storage_name);
+			return NOT_OK_RESPONSE;
+		}
+
+		rule->storage = od_rules_storage_ref(storage);
+
+		if (od_pool_validate(logger, rule->pool, rule->db_name,
+				     rule->user_name,
+				     &rule->address_range) == NOT_OK_RESPONSE) {
+			return NOT_OK_RESPONSE;
+		}
+
+		if (rule->auto_route_ro_on_standby &&
+		    rule->pool->pool_type == OD_RULE_POOL_SESSION) {
+			od_error(
+				logger, NULL, NULL,
+				"rule '%s.%s %s': auto_route_ro_on_standby is not supported with session pooling",
+				rule->db_name, rule->user_name,
+				rule->address_range.string_value);
+			return NOT_OK_RESPONSE;
+		}
+
+		if (rule->storage->storage_type != OD_RULE_STORAGE_LOCAL) {
+			if (rule->user_role != OD_RULE_ROLE_UNDEF) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': role set for non-local storage",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return NOT_OK_RESPONSE;
+			}
+		} else {
+			if (rule->user_role == OD_RULE_ROLE_UNDEF) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': force stat role for local storage",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				rule->user_role = OD_RULE_ROLE_STAT;
+			}
+		}
+
+		/* resolve password from pgpass file if requested */
+		if (rule->password_pgpass != NULL) {
+			const char *errmsg = NULL;
+			char *pgpass_password = passwordFromFile(
+				NULL, NULL, rule->db_name, rule->user_name,
+				rule->password_pgpass, &errmsg);
+			if (errmsg != NULL) {
+				od_error(logger, NULL, NULL,
+					 "rule '%s.%s %s': %s", rule->db_name,
+					 rule->user_name,
+					 rule->address_range.string_value,
+					 errmsg);
+				return -1;
+			}
+			if (pgpass_password != NULL) {
+				od_free(rule->password);
+				rule->password = pgpass_password;
+				rule->password_len = strlen(rule->password);
+			} else {
+				od_log(logger, NULL, NULL,
+				       "rule '%s.%s %s': no password for user "
+				       "found in pgpass file '%s'",
+				       rule->db_name, rule->user_name,
+				       rule->address_range.string_value,
+				       rule->password_pgpass);
+			}
+		}
+
+		/* auth */
+		if (!rule->auth) {
+			od_error(
+				logger, NULL, NULL,
+				"rule '%s.%s %s': authentication mode is not defined",
+				rule->db_name, rule->user_name,
+				rule->address_range.string_value);
+			return -1;
+		}
+		if (strcmp(rule->auth, "none") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_NONE;
+		} else if (strcmp(rule->auth, "block") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_BLOCK;
+		} else if (strcmp(rule->auth, "clear_text") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_CLEAR_TEXT;
+
+#ifdef PAM_FOUND
+			if (rule->auth_query != NULL &&
+			    rule->auth_pam_service != NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"auth query and pam service auth method cannot be "
+					"used simultaneously");
+				return -1;
+			}
+#endif
+
+			if (rule->enable_mdb_iamproxy_auth == 0 &&
+			    rule->password == NULL && rule->auth_query == NULL
+#ifdef PAM_FOUND
+			    && rule->auth_pam_service == NULL
+#endif
+			    && rule->auth_module == NULL
+#ifdef LDAP_FOUND
+			    && rule->ldap_endpoint == NULL
+#endif
+			) {
+
+				od_error(logger, NULL, NULL,
+					 "rule '%s.%s %s': password is not set",
+					 rule->db_name, rule->user_name,
+					 rule->address_range.string_value);
+				return -1;
+			}
+		} else if (strcmp(rule->auth, "external") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_EXTERNAL;
+		} else if (strcmp(rule->auth, "md5") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_MD5;
+			if (rule->password == NULL &&
+			    rule->auth_query == NULL) {
+				od_error(logger, NULL, NULL,
+					 "rule '%s.%s %s': password is not set",
+					 rule->db_name, rule->user_name,
+					 rule->address_range.string_value);
+				return -1;
+			}
+		} else if (strcmp(rule->auth, "scram-sha-256") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_SCRAM_SHA_256;
+			if (rule->password == NULL &&
+			    rule->auth_query == NULL) {
+				od_error(logger, NULL, NULL,
+					 "rule '%s.%s %s': password is not set",
+					 rule->db_name, rule->user_name,
+					 rule->address_range.string_value);
+				return -1;
+			}
+		} else if (strcmp(rule->auth, "cert") == 0) {
+			rule->auth_mode = OD_RULE_AUTH_CERT;
+		} else {
+			od_error(
+				logger, NULL, NULL,
+				"rule '%s.%s %s': has unknown authentication mode",
+				rule->db_name, rule->user_name,
+				rule->address_range.string_value);
+			return -1;
+		}
+
+		/* auth_query */
+		if (rule->auth_query) {
+			if (rule->auth_query_user == NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': auth_query_user is not set",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return -1;
+			}
+			if (rule->auth_query_db == NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': auth_query_db is not set",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return -1;
+			}
+		}
+
+		/* group */
+		if (rule->group) {
+			if (rule->group->group_query == NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': group_query is not set",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return -1;
+			}
+			if (rule->group->group_query_user == NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': group_query_user is not set",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return -1;
+			}
+			if (rule->group->group_query_db == NULL) {
+				od_error(
+					logger, NULL, NULL,
+					"rule '%s.%s %s': group_query_db is not set",
+					rule->db_name, rule->user_name,
+					rule->address_range.string_value);
+				return -1;
+			}
+		}
+
+#ifdef LDAP_FOUND
+		if (rule->ldap_endpoint != NULL &&
+		    config->coroutine_stack_size <
+			    LDAP_MIN_COROUTINE_STACK_SIZE) {
+			od_error(
+				logger, NULL, NULL,
+				"rule '%s.%s %s' use ldap_endpoint. coroutine_stack_size must be >= %d",
+				rule->db_name, rule->user_name,
+				rule->address_range.string_value,
+				LDAP_MIN_COROUTINE_STACK_SIZE);
+			return -1;
+		}
+#endif
+	}
+
+	return 0;
+}
+
+int od_rules_storage_merge(od_rules_t *dst, od_rules_t *src,
+			   od_list_t *retired_watchdogs)
+{
+	/*
+	 * Diff-based merge of storages from src into dst.
+	 *
+	 * For each storage in src, look for an equivalent storage in dst
+	 * (matched by name).  If found and contents are identical, reuse
+	 * the old storage: re-point every rule in src that references the
+	 * new storage to the old one, then free the new copy.  This keeps
+	 * the old storage's watchdog and endpoint statuses alive, avoiding
+	 * unnecessary reconnection churn.
+	 *
+	 * Storages in dst that are not present in src (or whose contents
+	 * changed) are unlinked from dst.  Their watchdog (if running) is
+	 * signalled offline before unref, so the coroutine exits cleanly
+	 * and drops its own ref.  The join is deferred: coroutine ids are
+	 * collected into retired_watchdogs and the caller must join them
+	 * after releasing the router lock (a stopping watchdog needs the
+	 * router lock for its final polling step).
+	 *
+	 * New storages (present in src but not in dst) are moved into dst.
+	 *
+	 * After this call, rules in src->rules reference storages that are
+	 * either in dst->storages (reused) or in src->storages (new), so
+	 * od_rules_merge which follows can safely compare origin->storage
+	 * and rule->storage.
+	 */
+
+	/* mark all dst storages as not-yet-matched */
+	od_list_t *i;
+	od_list_foreach (&dst->storages, i) {
+		od_rule_storage_t *s;
+		s = od_container_of(i, od_rule_storage_t, link);
+		s->mark = 0;
+	}
+
+	od_list_t *n;
+	od_list_foreach_safe (&src->storages, i, n) {
+		od_rule_storage_t *new_storage;
+		new_storage = od_container_of(i, od_rule_storage_t, link);
+
+		/* find equivalent storage in dst by name */
+		od_rule_storage_t *old_storage = NULL;
+		od_list_t *j;
+		od_list_foreach (&dst->storages, j) {
+			od_rule_storage_t *s;
+			s = od_container_of(j, od_rule_storage_t, link);
+			if (strcmp(s->name, new_storage->name) == 0) {
+				old_storage = s;
+				break;
+			}
+		}
+
+		if (old_storage &&
+		    od_rules_storage_compare(old_storage, new_storage)) {
+			/*
+			 * Storage is unchanged: reuse old storage.
+			 * Re-point all rules in src that reference
+			 * new_storage to old_storage.
+			 */
+			od_list_t *k;
+			od_list_foreach (&src->rules, k) {
+				od_rule_t *rule;
+				rule = od_container_of(k, od_rule_t, link);
+				if (rule->storage == new_storage) {
+					od_rules_storage_unref(new_storage);
+					rule->storage = od_rules_storage_ref(
+						old_storage);
+				}
+			}
+
+			/*
+			 * The new storage has a freshly allocated watchdog
+			 * that we don't need — the old storage already has
+			 * a running one.  Free it.  The watchdog coroutine
+			 * must not be running (it is started later, after
+			 * merge), so assert that.
+			 */
+			if (new_storage->watchdog) {
+				od_assert(new_storage->watchdog_coro_id == -1);
+				od_storage_watchdog_free(new_storage->watchdog);
+				new_storage->watchdog = NULL;
+			}
+
+			/* free the new copy and drop it from src */
+			od_list_unlink(&new_storage->link);
+			od_rules_storage_unref(new_storage);
+
+			/* mark old storage as matched */
+			old_storage->mark = 1;
+		} else {
+			/*
+			 * Storage is new or changed: move new into dst.
+			 * Signal the old watchdog (if running) offline and
+			 * unlink before unref, so the watchdog coroutine
+			 * exits cleanly and drops its own ref.  The join is
+			 * deferred to the caller via retired_watchdogs: a
+			 * stopping watchdog needs the router lock for its
+			 * final polling step, so it must not be joined while
+			 * the router lock is held.  od_rules_storage_unref
+			 * no longer signals set_offline via refcount.
+			 */
+			if (old_storage) {
+				if (old_storage->watchdog != NULL &&
+				    old_storage->watchdog_coro_id != -1) {
+					od_storage_watchdog_set_offline(
+						old_storage->watchdog);
+
+					od_rules_watchdog_join_t *join =
+						od_malloc(sizeof(*join));
+					if (join != NULL) {
+						join->coro_id =
+							old_storage
+								->watchdog_coro_id;
+						od_list_init(&join->link);
+						od_list_append(
+							retired_watchdogs,
+							&join->link);
+					}
+				}
+				od_list_unlink(&old_storage->link);
+				od_rules_storage_unref(old_storage);
+			}
+
+			od_list_unlink(&new_storage->link);
+			od_rules_storage_add(dst, new_storage);
+			new_storage->mark = 1;
+		}
+	}
+
+	/*
+	 * Unlink storages in dst that were not matched (not present in
+	 * new config), signal their watchdogs offline and unref them.
+	 * Joins are deferred to the caller via retired_watchdogs.
+	 */
+	od_list_foreach_safe (&dst->storages, i, n) {
+		od_rule_storage_t *s;
+		s = od_container_of(i, od_rule_storage_t, link);
+		if (!s->mark) {
+			if (s->watchdog != NULL && s->watchdog_coro_id != -1) {
+				od_storage_watchdog_set_offline(s->watchdog);
+
+				od_rules_watchdog_join_t *join =
+					od_malloc(sizeof(*join));
+				if (join != NULL) {
+					join->coro_id = s->watchdog_coro_id;
+					od_list_init(&join->link);
+					od_list_append(retired_watchdogs,
+						       &join->link);
+				}
+			}
+			od_list_unlink(&s->link);
+			od_rules_storage_unref(s);
+		} else {
+			s->mark = 0;
+		}
+	}
+
+	return 0;
+}
+
+int od_rules_cleanup(od_rules_t *rules)
+{
+	/* cleanup declarative storages rules data */
+	od_list_t *n, *i;
+	od_list_foreach_safe (&rules->storages, i, n) {
+		od_rule_storage_t *storage;
+		storage = od_container_of(i, od_rule_storage_t, link);
+		od_list_unlink(&storage->link);
+		od_rules_storage_unref(storage);
+	}
+	od_list_init(&rules->storages);
+#ifdef LDAP_FOUND
+
+	/* TODO: cleanup ldap
+	od_list_foreach_safe(&rules->storages, i, n)
+	{
+		od_ldap_endpoint_t *endp;
+		storage = od_container_of(i, od_ldap_endpoint_t, link);
+		od_ldap_endpoint_free(endp);
+	}
+
+	od_list_init(&rules->ldap_endpoints);*/
+#endif
+
+	return 0;
+}
+
+static inline char *od_rules_yes_no(int value)
+{
+	return value ? "yes" : "no";
+}
+
+void od_rules_print(od_rules_t *rules, od_logger_t *logger)
+{
+	od_list_t *i;
+	od_log(logger, NULL, NULL, "storages");
+
+	od_list_foreach (&rules->storages, i) {
+		od_rule_storage_t *storage;
+		storage = od_container_of(i, od_rule_storage_t, link);
+
+		od_log(logger, NULL, NULL, "  storage types           %s",
+		       storage->storage_type == OD_RULE_STORAGE_REMOTE ?
+			       "remote" :
+			       "local");
+
+		od_log(logger, NULL, NULL, "  host          %s",
+		       storage->host ? storage->host : "<unix socket>");
+
+		od_log(logger, NULL, NULL, "  port          %d", storage->port);
+		od_log(logger, NULL, NULL, "  server_max_routing %d",
+		       storage->server_max_routing);
+		od_log(logger, NULL, NULL,
+		       "  endpoints_status_poll_interval_ms %d",
+		       storage->endpoints_status_poll_interval_ms);
+		for (size_t ep_i = 0; ep_i < storage->endpoints_count; ep_i++) {
+			char ep_str[256];
+			od_address_to_str(&storage->endpoints[ep_i].address,
+					  ep_str, sizeof(ep_str));
+			od_log(logger, NULL, NULL, "  endpoint[%zu] %s", ep_i,
+			       ep_str);
+		}
+
+		if (storage->tls_opts->tls) {
+			od_log(logger, NULL, NULL, "  tls             %s",
+			       storage->tls_opts->tls);
+		}
+		if (storage->tls_opts->tls_ca_file) {
+			od_log(logger, NULL, NULL, "  tls_ca_file     %s",
+			       storage->tls_opts->tls_ca_file);
+		}
+		if (storage->tls_opts->tls_key_file) {
+			od_log(logger, NULL, NULL, "  tls_key_file    %s",
+			       storage->tls_opts->tls_key_file);
+		}
+		if (storage->tls_opts->tls_cert_file) {
+			od_log(logger, NULL, NULL, "  tls_cert_file   %s",
+			       storage->tls_opts->tls_cert_file);
+		}
+		if (storage->tls_opts->tls_protocols) {
+			od_log(logger, NULL, NULL, "  tls_protocols   %s",
+			       storage->tls_opts->tls_protocols);
+		}
+		if (storage->watchdog) {
+			if (storage->watchdog->query) {
+				od_log(logger, NULL, NULL,
+				       "  watchdog query   %s",
+				       storage->watchdog->query);
+			}
+			if (storage->watchdog->interval) {
+				od_log(logger, NULL, NULL,
+				       "  watchdog interval   %d",
+				       storage->watchdog->interval);
+			}
+		}
+	}
+
+	od_list_foreach (&rules->rules, i) {
+		od_rule_t *rule;
+		rule = od_container_of(i, od_rule_t, link);
+		if (rule->obsolete) {
+			continue;
+		}
+		od_log(logger, NULL, NULL, "<%s.%s %s %s>", rule->db_name,
+		       rule->user_name, rule->address_range.string_value,
+		       od_rule_conn_type_to_str(rule->conn_type));
+		od_log(logger, NULL, NULL,
+		       "  authentication                    %s", rule->auth);
+		if (rule->auth_common_name_default) {
+			od_log(logger, NULL, NULL,
+			       "  auth_common_name default");
+		}
+		od_list_t *j;
+		od_list_foreach (&rule->auth_common_names, j) {
+			od_rule_auth_t *auth;
+			auth = od_container_of(j, od_rule_auth_t, link);
+			od_log(logger, NULL, NULL, "  auth_common_name %s",
+			       auth->common_name);
+		}
+		if (rule->auth_query) {
+			od_log(logger, NULL, NULL,
+			       "  auth_query                        %s",
+			       rule->auth_query);
+		}
+		if (rule->auth_query_db) {
+			od_log(logger, NULL, NULL,
+			       "  auth_query_db                     %s",
+			       rule->auth_query_db);
+		}
+		if (rule->auth_query_user) {
+			od_log(logger, NULL, NULL,
+			       "  auth_query_user                   %s",
+			       rule->auth_query_user);
+		}
+		if (rule->auth_module) {
+			od_log(logger, NULL, NULL,
+			       "  auth_module                       %s",
+			       rule->auth_module);
+		}
+		{
+			const char *role_str = "undef";
+			switch (rule->user_role) {
+			case OD_RULE_ROLE_ADMIN:
+				role_str = "admin";
+				break;
+			case OD_RULE_ROLE_STAT:
+				role_str = "stat";
+				break;
+			case OD_RULE_ROLE_NOTALLOW:
+				role_str = "notallow";
+				break;
+			default:
+				break;
+			}
+			od_log(logger, NULL, NULL,
+			       "  role                              %s",
+			       role_str);
+		}
+		od_log(logger, NULL, NULL,
+		       "  target_session_attrs              %s",
+		       od_target_session_attrs_to_str(
+			       rule->target_session_attrs));
+		od_log(logger, NULL, NULL,
+		       "  auto_route_ro_on_standby          %s",
+		       rule->auto_route_ro_on_standby ? "yes" : "no");
+
+		/* pool  */
+		od_log(logger, NULL, NULL,
+		       "  pool                              %s",
+		       rule->pool->pool_type_str);
+		od_log(logger, NULL, NULL,
+		       "  pool routing                      %s",
+		       rule->pool->routing_type == NULL ?
+			       "client visible" :
+			       rule->pool->routing_type);
+		od_log(logger, NULL, NULL,
+		       "  pool size                         %d",
+		       rule->pool->size);
+		od_log(logger, NULL, NULL,
+		       "  min pool size                     %d",
+		       rule->pool->min_size);
+		od_log(logger, NULL, NULL,
+		       "  pool timeout                      %" PRIu64,
+		       rule->pool->timeout_ms);
+		od_log(logger, NULL, NULL,
+		       "  pool ttl                          %d",
+		       rule->pool->ttl);
+		od_log(logger, NULL, NULL,
+		       "  pool discard                      %s",
+		       rule->pool->discard ? "yes" : "no");
+		if (rule->pool->discard_query) {
+			od_log(logger, NULL, NULL,
+			       "  pool discard_query                %s",
+			       rule->pool->discard_query);
+		}
+		od_log(logger, NULL, NULL,
+		       "  pool smart discard                %s",
+		       rule->pool->smart_discard ? "yes" : "no");
+		od_log(logger, NULL, NULL,
+		       "  pool cancel                       %s",
+		       rule->pool->cancel ? "yes" : "no");
+		od_log(logger, NULL, NULL,
+		       "  pool rollback                     %s",
+		       rule->pool->rollback ? "yes" : "no");
+		od_log(logger, NULL, NULL,
+		       "  pool client_idle_timeout          %" PRIu64,
+		       rule->pool->client_idle_timeout);
+		od_log(logger, NULL, NULL,
+		       "  pool idle_in_transaction_timeout  %" PRIu64,
+		       rule->pool->idle_in_transaction_timeout);
+		od_log(logger, NULL, NULL,
+		       "  pool reset_timeout_ms             %" PRIu64,
+		       rule->pool->reset_timeout_ms);
+		od_log(logger, NULL, NULL,
+		       "  pool pin_on_listen                %s",
+		       rule->pool->pin_on_listen ? "yes" : "no");
+		od_log(logger, NULL, NULL,
+		       "  pool notice_after_waiting_ms      %d",
+		       rule->pool->notice_after_waiting_ms);
+		od_log(logger, NULL, NULL,
+		       "  pool attach_check                 %s",
+		       rule->pool->attach_check ? "yes" : "no");
+		od_log(logger, NULL, NULL,
+		       "  pool acquire_fail_fast            %s",
+		       rule->pool->acquire_fail_fast ? "yes" : "no");
+		if (rule->pool->pool_type != OD_RULE_POOL_SESSION) {
+			od_log(logger, NULL, NULL,
+			       "  pool prepared statement support   %s",
+			       rule->pool->reserve_prepared_statement ? "yes" :
+									"no");
+			od_log(logger, NULL, NULL,
+			       "  server pstmt cache size            %d",
+			       rule->pool->server_pstmt_cache_size);
+		}
+
+		if (rule->client_max_set) {
+			od_log(logger, NULL, NULL,
+			       "  client_max                        %d",
+			       rule->client_max);
+		}
+		od_log(logger, NULL, NULL,
+		       "  client_fwd_error                  %s",
+		       od_rules_yes_no(rule->client_fwd_error));
+		od_log(logger, NULL, NULL,
+		       "  reserve_session_server_connection %s",
+		       od_rules_yes_no(
+			       rule->reserve_session_server_connection));
+		od_log(logger, NULL, NULL,
+		       "  client_show_id                    %s",
+		       od_rules_yes_no(rule->client_show_id));
+		od_log(logger, NULL, NULL,
+		       "  application_name_add_host         %s",
+		       od_rules_yes_no(rule->application_name_add_host));
+		od_log(logger, NULL, NULL,
+		       "  server_drop_on_cached_plan_error  %s",
+		       od_rules_yes_no(rule->server_drop_on_cached_plan_error));
+		od_log(logger, NULL, NULL,
+		       "  server_drop_on_oom                %s",
+		       od_rules_yes_no(rule->server_drop_on_oom));
+		od_log(logger, NULL, NULL,
+		       "  password_passthrough              %s",
+		       od_rules_yes_no(rule->enable_password_passthrough));
+		od_log(logger, NULL, NULL,
+		       "  server_lifetime_us                %" PRIu64,
+		       rule->server_lifetime_us);
+#ifdef LDAP_FOUND
+		if (rule->ldap_endpoint_name) {
+			od_log(logger, NULL, NULL,
+			       "  ldap_endpoint_name                %s",
+			       rule->ldap_endpoint_name);
+		}
+		if (rule->ldap_storage_credentials_attr != NULL) {
+			od_log(logger, NULL, NULL,
+			       "  ldap_storage_credentials_attr     %s",
+			       rule->ldap_storage_credentials_attr);
+		}
+		if (!od_list_empty(&rule->ldap_storage_creds_list)) {
+			od_list_t *f;
+			od_list_foreach (&rule->ldap_storage_creds_list, f) {
+				od_ldap_storage_credentials_t *lsc;
+				lsc = od_container_of(
+					f, od_ldap_storage_credentials_t, link);
+				if (lsc->name) {
+					od_log(logger, NULL, NULL,
+					       "  lsc_name                %s",
+					       lsc->name);
+				}
+				if (lsc->lsc_username) {
+					od_log(logger, NULL, NULL,
+					       "  lsc_username                %s",
+					       lsc->lsc_username);
+				}
+				if (lsc->lsc_password) {
+					od_log(logger, NULL, NULL,
+					       "  lsc_password                %s",
+					       lsc->lsc_password);
+				}
+			}
+		}
+#endif
+		od_log(logger, NULL, NULL,
+		       "  storage                           %s",
+		       rule->storage_name);
+		od_log(logger, NULL, NULL,
+		       "  type                              %s",
+		       rule->storage->type);
+		od_log(logger, NULL, NULL,
+		       "  host                              %s",
+		       rule->storage->host ? rule->storage->host :
+					     "<unix socket>");
+		od_log(logger, NULL, NULL,
+		       "  port                              %d",
+		       rule->storage->port);
+		if (rule->storage->tls_opts->tls) {
+			od_log(logger, NULL, NULL,
+			       "  tls_opts->tls                               %s",
+			       rule->storage->tls_opts->tls);
+		}
+		if (rule->storage->tls_opts->tls_ca_file) {
+			od_log(logger, NULL, NULL,
+			       "  tls_opts->tls_ca_file                       %s",
+			       rule->storage->tls_opts->tls_ca_file);
+		}
+		if (rule->storage->tls_opts->tls_key_file) {
+			od_log(logger, NULL, NULL,
+			       "  tls_opts->tls_key_file                      %s",
+			       rule->storage->tls_opts->tls_key_file);
+		}
+		if (rule->storage->tls_opts->tls_cert_file) {
+			od_log(logger, NULL, NULL,
+			       "  tls_opts->tls_cert_file                     %s",
+			       rule->storage->tls_opts->tls_cert_file);
+		}
+		if (rule->storage->tls_opts->tls_protocols) {
+			od_log(logger, NULL, NULL,
+			       "  tls_opts->tls_protocols                     %s",
+			       rule->storage->tls_opts->tls_protocols);
+		}
+		if (rule->storage_db) {
+			od_log(logger, NULL, NULL,
+			       "  storage_db                        %s",
+			       rule->storage_db);
+		}
+		if (rule->storage_user) {
+			od_log(logger, NULL, NULL,
+			       "  storage_user                      %s",
+			       rule->storage_user);
+		}
+		if (rule->catchup_timeout) {
+			od_log(logger, NULL, NULL, "  catchup timeout   %d",
+			       rule->catchup_timeout);
+		}
+		if (rule->catchup_checks) {
+			od_log(logger, NULL, NULL, "  catchup checks    %d",
+			       rule->catchup_checks);
+		}
+
+		od_log(logger, NULL, NULL,
+		       "  maintain_params                   %s",
+		       od_rules_yes_no(rule->maintain_params));
+
+		od_log(logger, NULL, NULL,
+		       "  log_debug                         %s",
+		       od_rules_yes_no(rule->log_debug));
+		if (rule->log_debug_sampling_set) {
+			od_log(logger, NULL, NULL,
+			       "  log_debug_sampling                %d",
+			       rule->log_debug_sampling);
+		}
+		od_log(logger, NULL, NULL,
+		       "  log_query                         %s",
+		       od_rules_yes_no(rule->log_query));
+		if (rule->log_query_sampling_set) {
+			od_log(logger, NULL, NULL,
+			       "  log_query_sampling                %d",
+			       rule->log_query_sampling);
+		}
+
+		for (int vi = 0; vi < KIWI_VAR_MAX; vi++) {
+			kiwi_var_t *v = &rule->vars.vars[vi];
+			if (v->value_len > 0 && v->name) {
+				od_log(logger, NULL, NULL, "  pgoption %s=%s",
+				       v->name, v->value);
+			}
+		}
+		for (size_t vi = 0; vi < rule->backend_startup_vars_sz; vi++) {
+			untyped_kiwi_var_t *v = &rule->backend_startup_vars[vi];
+			if (v->name) {
+				od_log(logger, NULL, NULL,
+				       "  backend_startup_var %s=%s", v->name,
+				       v->value ? v->value : "");
+			}
+		}
+
+		od_log(logger, NULL, NULL,
+		       "  keepalive                         %d",
+		       rule->keepalive);
+		od_log(logger, NULL, NULL,
+		       "  keepalive_keep_interval           %d",
+		       rule->keepalive_keep_interval);
+		od_log(logger, NULL, NULL,
+		       "  keepalive_probes                  %d",
+		       rule->keepalive_probes);
+		od_log(logger, NULL, NULL,
+		       "  keepalive_usr_timeout             %d",
+		       rule->keepalive_usr_timeout);
+	}
+}
+
+/* Checks that the name matches the rule */
+bool od_name_in_rule(const od_rule_t *rule, const char *name)
+{
+	if (rule->group) {
+		for (int i = 0; i < rule->users_in_group; i++) {
+			if (strcmp(rule->user_names[i], name) == 0) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	return strcmp(rule->user_name, name) == 0;
+}

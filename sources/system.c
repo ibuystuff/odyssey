@@ -3,204 +3,740 @@
  * Odyssey.
  *
  * Scalable PostgreSQL connection pooler.
-*/
+ */
 
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <inttypes.h>
+#include <odyssey.h>
+
 #include <unistd.h>
-#include <errno.h>
-#include <signal.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <sys/un.h>
+#include <sys/file.h>
+#include <netinet/in.h>
 
-#include <machinarium.h>
-#include <shapito.h>
+#include <machinarium/machinarium.h>
+#include <machinarium/machine.h>
+#include <machinarium/file.h>
+#include <machinarium/socket.h>
 
-#include "sources/macro.h"
-#include "sources/version.h"
-#include "sources/atomic.h"
-#include "sources/util.h"
-#include "sources/error.h"
-#include "sources/list.h"
-#include "sources/pid.h"
-#include "sources/id.h"
-#include "sources/logger.h"
-#include "sources/daemon.h"
-#include "sources/config.h"
-#include "sources/config_reader.h"
-#include "sources/msg.h"
-#include "sources/global.h"
-#include "sources/server.h"
-#include "sources/server_pool.h"
-#include "sources/client.h"
-#include "sources/client_pool.h"
-#include "sources/route_id.h"
-#include "sources/route.h"
-#include "sources/route_pool.h"
-#include "sources/io.h"
-#include "sources/instance.h"
-#include "sources/router_cancel.h"
-#include "sources/router.h"
-#include "sources/console.h"
-#include "sources/worker.h"
-#include "sources/worker_pool.h"
-#include "sources/system.h"
-#include "sources/cron.h"
-#include "sources/tls.h"
+#include <status.h>
+#include <system.h>
+#include <server.h>
+#include <global.h>
+#include <instance.h>
+#include <cron.h>
+#include <client.h>
+#include <msg.h>
+#include <extension.h>
+#include <util.h>
+#include <router.h>
+#include <dns.h>
+#include <hba_rule.h>
+#include <hba.h>
+#include <frontend.h>
+#include <server.h>
+#include <hba_rule.h>
+#include <sighandler.h>
+#include <setproctitle.h>
+#include <worker_pool.h>
+#include <cfg_import.h>
+#include <autoconf.h>
+#include <tls.h>
+#include <memory.h>
+#include <systemd_notify.h>
+#include <rate.h>
+#include <restart_sync.h>
+#include <od_ldap.h>
+#include <wait_event.h>
 
-static inline void
-od_system_server(void *arg)
+int od_system_send_msg(od_system_t *system, int msg_type, void *arg)
 {
-	od_systemserver_t *server = arg;
+	od_instance_t *instance = system->global->instance;
+	machine_msg_t *msg = machine_msg_create(arg != NULL ? sizeof(arg) : 0);
+	if (msg == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to create message for system channel");
+		return -1;
+	}
+	machine_msg_set_type(msg, msg_type);
+	if (arg) {
+		memcpy(machine_msg_data(msg), &arg, sizeof(arg));
+	}
+	machine_channel_write(system->system_channel, msg);
+	return 0;
+}
+
+static void *killer(void *arg)
+{
+	uint64_t timeout_ms = (uint64_t)(uintptr_t)arg;
+
+	struct timespec duration;
+	memset(&duration, 0, sizeof(duration));
+	duration.tv_sec = timeout_ms / 1000;
+	duration.tv_nsec = (timeout_ms % 1000) * 1000000;
+
+	struct timespec rem;
+	memset(&rem, 0, sizeof(rem));
+
+	while (1) {
+		int rc = nanosleep(&duration, &rem);
+		if (rc == 0 || errno != EINTR) {
+			break;
+		}
+		duration = rem;
+	}
+
+	exit(124);
+}
+
+static void start_timeout_thread(uint64_t timeout_ms)
+{
+	pthread_t th;
+	int rc = pthread_create(&th, NULL, killer,
+				(void *)(uintptr_t)timeout_ms);
+	if (rc == 0) {
+		pthread_detach(th);
+	} else {
+		od_gerror(NULL, NULL,
+			  "can't start shutdown timeout killer: %d (%s)", rc,
+			  strerror(rc));
+	}
+}
+
+void od_system_server_shutdown(od_system_server_t *server)
+{
+	atomic_store(&server->closed, 1);
+	mm_io_shutdown(server->io);
+	mm_eventfd_write(&server->shutdown_efd, UINT32_MAX);
+}
+
+static int check_client_max(od_system_server_t *server, od_global_t *global,
+			    od_instance_t *instance)
+{
+	/*
+	 * if global limit is reached - check if limit
+	 * for this listen is not reached
+	 */
+
+	uint64_t global_cnt = atomic_fetch_add(&global->router->clients, 1);
+	uint64_t local_cnt = atomic_fetch_add(&server->clients, 1);
+
+	if (instance->config.client_max_set &&
+	    global_cnt >= (uint64_t)instance->config.client_max) {
+		if (server->config->reserved_clients == -1) {
+			/* no reserve on this port - give up */
+			goto fail;
+		}
+
+		if (local_cnt >= (uint64_t)server->config->reserved_clients) {
+			/* reserve exhausted */
+			goto fail;
+		}
+
+		/* ok, we have some reserve, continue */
+	} else {
+		/* global client_max is not reached - no need to check reserve */
+	}
+
+	return 0;
+
+fail:
+	atomic_fetch_sub(&server->clients, 1);
+	atomic_fetch_sub(&global->router->clients, 1);
+
+	return 1;
+}
+
+static void od_system_unix_socket_release(od_system_server_t *server)
+{
+	if (server->unix_socket_owned) {
+		/*
+		 * The path may be replaced between lstat() and unlink(),
+		 * yet only the socket we bound is removed: it is matched
+		 * by dev/ino captured at bind time, and unlink() does
+		 * not follow symlinks. Swapping the path requires write
+		 * access to the socket directory, which alone already
+		 * allows removing the socket, so the residual race grants
+		 * no additional privileges (Coverity TOCTOU is accepted).
+		 */
+		dev_t dev;
+		ino_t ino;
+		int rc =
+			mm_file_is_socket(server->unix_socket_path, &dev, &ino);
+		if (rc == -1) {
+			if (errno != ENOENT) {
+				od_gerror(
+					NULL, NULL,
+					"failed to inspect unix socket %s: %s",
+					server->unix_socket_path,
+					strerror(errno));
+			}
+		} else if (rc == 1 && dev == server->unix_socket_dev &&
+			   ino == server->unix_socket_ino) {
+			if (mm_file_unlink(server->unix_socket_path) == -1 &&
+			    errno != ENOENT) {
+				od_gerror(NULL, NULL,
+					  "failed to remove unix socket %s: %s",
+					  server->unix_socket_path,
+					  strerror(errno));
+			}
+		}
+		server->unix_socket_owned = false;
+	}
+
+	/* Keep the lock file: unlinking it would allow independent locks. */
+	if (server->unix_socket_lock_fd != -1) {
+		mm_file_close(server->unix_socket_lock_fd);
+		server->unix_socket_lock_fd = -1;
+	}
+	od_free(server->unix_socket_path);
+	server->unix_socket_path = NULL;
+}
+
+static int od_system_unix_socket_prepare(od_system_server_t *server,
+					 struct sockaddr_un *addr,
+					 bool *lock_held)
+{
+	*lock_held = false;
+	server->unix_socket_path = od_strdup(addr->sun_path);
+	if (server->unix_socket_path == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	char lock_path[sizeof(addr->sun_path) + sizeof(".odyssey.lock")];
+	od_snprintf(lock_path, sizeof(lock_path), "%s.odyssey.lock",
+		    addr->sun_path);
+	server->unix_socket_lock_fd =
+		mm_file_open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+	if (server->unix_socket_lock_fd == -1) {
+		return -1;
+	}
+	if (mm_file_flock(server->unix_socket_lock_fd, LOCK_EX | LOCK_NB) ==
+	    -1) {
+		*lock_held = errno == EWOULDBLOCK || errno == EAGAIN;
+		return -1;
+	}
+
+	int rc = mm_file_is_regular(server->unix_socket_lock_fd);
+	if (rc == -1) {
+		return -1;
+	}
+	if (rc == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	dev_t sock_dev;
+	ino_t sock_ino;
+	rc = mm_file_is_socket(addr->sun_path, &sock_dev, &sock_ino);
+	if (rc == -1) {
+		return errno == ENOENT ? 0 : -1;
+	}
+	if (rc == 0) {
+		errno = EEXIST;
+		return -1;
+	}
+
+#if !defined(__linux__)
+	/* BSD/macOS can return ECONNREFUSED for a live, overloaded listener. */
+	(void)sock_dev;
+	(void)sock_ino;
+	errno = EADDRINUSE;
+	return -1;
+#else
+	/* A socket file alone is not proof that its listener has died. */
+	int fd = mm_socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1) {
+		return -1;
+	}
+	rc = mm_socket_set_nonblock(fd, 1);
+	if (rc == 0) {
+		rc = mm_socket_connect(fd, (struct sockaddr *)addr);
+	}
+	int error = errno;
+	close(fd);
+	if (rc == 0) {
+		errno = EADDRINUSE;
+		return -1;
+	}
+	if (error != ECONNREFUSED) {
+		/* Includes permission errors and a live listener with a full backlog. */
+		errno = error;
+		return -1;
+	}
+
+	/*
+	 * Do not remove a path replaced while checking the listener: the
+	 * dev/ino comparison against the probed socket narrows the residual
+	 * lstat-to-unlink race window. Swapping the path requires write
+	 * access to the socket directory, which alone already allows
+	 * removing it, so the race grants no additional privileges
+	 * (Coverity TOCTOU is accepted).
+	 */
+	dev_t current_dev;
+	ino_t current_ino;
+	rc = mm_file_is_socket(addr->sun_path, &current_dev, &current_ino);
+	if (rc == -1) {
+		return errno == ENOENT ? 0 : -1;
+	}
+	if (rc == 0 || current_dev != sock_dev || current_ino != sock_ino) {
+		errno = EAGAIN;
+		return -1;
+	}
+	if (mm_file_unlink(addr->sun_path) == -1 && errno != ENOENT) {
+		return -1;
+	}
+	return 0;
+#endif
+}
+
+static inline void od_system_server(void *arg)
+{
+	od_system_server_t *server = arg;
 	od_instance_t *instance = server->global->instance;
 
-	for (;;)
-	{
+	/*
+	 * now we are ready to accept connections on this instance
+	 * so if this odyssey was started by online restart, we need
+	 * to terminate parent odyssey instance
+	 */
+	od_restart_terminate_parent();
+
+	mm_eventfd_attach(&server->shutdown_efd);
+	mm_eventfd_peer_to(&server->shutdown_efd, server->io);
+
+	while (!atomic_load(&server->closed)) {
+		od_global_t *global = server->global;
+
 		/* accepted client io is not attached to epoll context yet */
-		machine_io_t *client_io;
+		mm_io_t *client_io;
 		int rc;
-		rc = machine_accept(server->io, &client_io, server->config->backlog,
-		                    0, UINT32_MAX);
+		rc = mm_io_accept(server->io, &client_io,
+				  server->config->backlog, 0 /* attach */,
+				  30 * 1000 /* 30 sec */);
 		if (rc == -1) {
-			od_error(&instance->logger, "server", NULL, NULL,
-			         "accept failed: %s",
-			         machine_error(server->io));
 			int errno_ = machine_errno();
-			if (errno_ == EADDRINUSE)
+			if (errno_ == ETIMEDOUT) {
+				/* just no new connections for last accept interval */
+				continue;
+			}
+
+			if (errno_ == EAGAIN || errno_ == EINVAL) {
+				/*
+				 * accept was interrupted by propagated signal
+				 * (which is shutdown eventfd)
+				 *
+				 * or just listen socket was shutdowned (EINVAL)
+				 *
+				 * in both cases need to stop accepting anyway
+				 */
 				break;
+			}
+
+			od_error(&instance->logger, NULL, NULL,
+				 "accept failed: %s", mm_io_error(server->io));
+			if (errno_ == EADDRINUSE) {
+				break;
+			}
+			continue;
+		}
+
+		/* Rate lim ourselves, if any limiter configured.
+		 * XXX: Here we do not (yet) have knowledge if client is cancel request or
+		 * not, so this rate limit actually rates everything. */
+		if (instance->config.accept_rate_limit != 0) {
+			uint32_t max_wait_ms = UINT32_MAX;
+			if (server->config->client_login_timeout_ms > 0) {
+				max_wait_ms = (uint32_t)server->config
+						      ->client_login_timeout_ms;
+			}
+			od_wait_event_start(OD_WAIT_RATELIMIT_ACCEPT);
+			int rc = od_rate_limiter_waitn(
+				&global->accept_rate_limiter, 1, max_wait_ms);
+			od_wait_event_end(OD_WAIT_RATELIMIT_ACCEPT);
+			if (rc != 0) {
+				mm_io_attach(client_io);
+				od_error(
+					&instance->logger, NULL, NULL,
+					"too many tcp connections (new connections are limited to %d per sec), connection declined",
+					instance->config.accept_rate_limit);
+				od_frontend_fatal_no_startup(
+					client_io, KIWI_TOO_MANY_CONNECTIONS,
+					"too many tcp connections (new connections are limited to %d per sec)",
+					instance->config.accept_rate_limit);
+				mm_io_close(client_io);
+				mm_io_free(client_io);
+				continue;
+			}
+		}
+
+		if (check_client_max(server, global, instance)) {
+			/*
+			 * writing error message could not be displayed correctly, if
+			 * client requested ssl establishment, which can not be afforded
+			 * because the system is probably under haavy load now
+			 *
+			 * so the fatal sending is just best effort
+			 */
+			mm_io_attach(client_io);
+			od_error(
+				&instance->logger, NULL, NULL,
+				"too many tcp connections (global client_max %d), connection declined",
+				instance->config.client_max);
+			od_frontend_fatal_no_startup(
+				client_io, KIWI_TOO_MANY_CONNECTIONS,
+				"too many tcp connections (global client_max %d)",
+				instance->config.client_max);
+			mm_io_close(client_io);
+			mm_io_free(client_io);
 			continue;
 		}
 
 		/* set network options */
-		machine_set_nodelay(client_io, instance->config.nodelay);
-		if (instance->config.keepalive > 0)
-			machine_set_keepalive(client_io, 1, instance->config.keepalive);
-		rc = machine_set_readahead(client_io, instance->config.readahead);
-		if (rc == -1) {
-			od_error(&instance->logger, "server", NULL, NULL,
-			         "failed to set client readahead: %s",
-			         machine_error(client_io));
-			machine_close(client_io);
-			machine_io_free(client_io);
-			continue;
+		mm_io_set_nodelay(client_io, instance->config.nodelay);
+		if (instance->config.keepalive > 0) {
+			mm_io_set_keepalive(
+				client_io, 1, instance->config.keepalive,
+				instance->config.keepalive_keep_interval,
+				instance->config.keepalive_probes,
+				(int)instance->config.keepalive_usr_timeout_ms);
+		}
+
+		if (!instance->config.disable_nolinger) {
+			mm_io_set_nolinger(client_io, 1);
 		}
 
 		/* allocate new client */
 		od_client_t *client = od_client_allocate();
 		if (client == NULL) {
-			od_error(&instance->logger, "server", NULL, NULL,
-			         "failed to allocate client object");
-			machine_close(client_io);
-			machine_io_free(client_io);
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to allocate client object");
+			atomic_fetch_sub(&server->clients, 1);
+			atomic_fetch_sub(&global->router->clients, 1);
+			mm_io_close(client_io);
+			mm_io_free(client_io);
 			continue;
 		}
-		od_idmgr_generate(&instance->id_mgr, &client->id, "c");
-		client->io = client_io;
-		client->config_listen = server->config;
+		od_id_generate(&client->id, "c");
+		/*
+		 * Only assign the io handle here; defer readahead buffer
+		 * allocation to the worker thread so it comes from the
+		 * worker's thread-local vrb cache (avoids cross-thread
+		 * cache ownership).
+		 */
+		client->io.io = client_io;
+		client->rule = NULL;
+		client->source = server;
 		client->tls = server->tls;
-		client->time_accept = machine_time();
+		client->time_accept = 0;
+		client->time_accept = machine_time_us();
 
 		/* create new client event and pass it to worker pool */
 		machine_msg_t *msg;
-		msg = machine_msg_create(OD_MCLIENT_NEW, sizeof(od_client_t*));
-		char *msg_data = machine_msg_get_data(msg);
-		memcpy(msg_data, &client, sizeof(od_client_t*));
-		od_workerpool_t *worker_pool = server->global->worker_pool;
-		od_workerpool_feed(worker_pool, msg);
+		msg = machine_msg_create(sizeof(od_client_t *));
+		if (msg == NULL) {
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to allocate client message");
+			atomic_fetch_sub(&server->clients, 1);
+			atomic_fetch_sub(&global->router->clients, 1);
+			od_io_close(&client->io);
+			od_client_free(client);
+			continue;
+		}
+		machine_msg_set_type(msg, OD_MSG_CLIENT_NEW);
+		memcpy(machine_msg_data(msg), &client, sizeof(od_client_t *));
+
+		rc = od_routing_slot_acquire(global,
+					     od_client_login_timeout(client));
+		if (rc == -1) {
+			od_error(
+				&instance->logger, client, NULL,
+				"routing slot wait timed out, connection rejected (high TLS handshakes rate?)");
+			/*
+			 * we can send FATAL with detailed description here
+			 * but it will not work with SSL, and will be dispayed as
+			 * 'server sent an error response during SSL exchange', so
+			 * let it be more clear 'server closed the connection unexpectedly'
+			 */
+			machine_msg_free(msg);
+			atomic_fetch_sub(&server->clients, 1);
+			atomic_fetch_sub(&global->router->clients, 1);
+			od_io_close(&client->io);
+			od_client_free(client);
+			continue;
+		}
+		od_worker_pool_t *worker_pool = server->global->worker_pool;
+		od_worker_pool_feed(worker_pool, msg);
 	}
+
+	mm_eventfd_remove_peer_to(&server->shutdown_efd, server->io);
+
+	mm_io_close(server->io);
+	mm_io_free(server->io);
+
+	od_system_unix_socket_release(server);
 }
 
-static inline int
-od_system_server_start(od_system_t *system, od_configlisten_t *config,
-                       struct addrinfo *addr)
+static void od_system_server_tls_dtor(void *element)
 {
-	od_instance_t *instance = system->global.instance;
-	od_systemserver_t *server;
-	server = malloc(sizeof(od_systemserver_t));
+	machine_tls_free(*(machine_tls_t **)element);
+}
+
+od_system_server_t *od_system_server_init(void)
+{
+	od_system_server_t *server;
+	server = od_malloc(sizeof(od_system_server_t));
 	if (server == NULL) {
-		od_error(&instance->logger, "system", NULL, NULL,
-		         "failed to allocate system server object");
-		return -1;
+		return NULL;
 	}
+	memset(server, 0, sizeof(od_system_server_t));
+	server->unix_socket_lock_fd = -1;
+	od_list_init(&server->link);
+
+	int rc = mm_eventfd_init(&server->shutdown_efd);
+	if (rc != 0) {
+		od_free(server);
+		return NULL;
+	}
+
+	server->io = NULL;
+	server->tls = NULL;
+	mm_vector_init(&server->tls_retired, sizeof(machine_tls_t *),
+		       od_system_server_tls_dtor);
+	od_id_generate(&server->sid, "sid");
+	atomic_init(&server->closed, false);
+	atomic_init(&server->clients, 0);
+	server->coro_id = -1;
+
+	return server;
+}
+
+static inline od_retcode_t
+od_system_server_retire_tls(od_system_server_t *server)
+{
+	if (server->tls == NULL) {
+		return OK_RESPONSE;
+	}
+
+	if (mm_vector_append(&server->tls_retired, &server->tls) != 0) {
+		return NOT_OK_RESPONSE;
+	}
+
+	return OK_RESPONSE;
+}
+
+void od_system_server_free(od_system_server_t *server)
+{
+	od_system_unix_socket_release(server);
+	mm_eventfd_destroy(&server->shutdown_efd);
+
+	if (server->tls) {
+		/* Free tls */
+		machine_tls_free(server->tls);
+	}
+	mm_vector_destroy(&server->tls_retired);
+	server->io = NULL;
+	server->tls = NULL;
+
+	od_list_unlink(&server->link);
+
+	od_free(server);
+}
+
+static inline od_retcode_t od_system_server_start(od_system_t *system,
+						  od_config_listen_t *config,
+						  mm_addrinfo_t *addr)
+{
+	od_instance_t *instance;
+	od_system_server_t *server;
+
+	instance = system->global->instance;
+
+	server = od_system_server_init();
+	if (server == NULL) {
+		/* failed to set up new system server */
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to allocate system server object");
+		return NOT_OK_RESPONSE;
+	}
+
 	server->config = config;
 	server->addr = addr;
-	server->global = &system->global;
+	server->global = system->global;
 
 	/* create server tls */
-	if (server->config->tls_mode != OD_TLS_DISABLE) {
+	if (server->config->tls_opts->tls_mode != OD_CONFIG_TLS_DISABLE) {
 		server->tls = od_tls_frontend(server->config);
 		if (server->tls == NULL) {
-			od_error(&instance->logger, "server", NULL, NULL,
-			         "failed to create tls handler");
-			free(server);
-			return -1;
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to create tls handler");
+			goto error;
 		}
 	}
 
 	/* create server io */
-	server->io = machine_io_create();
+	server->io = mm_io_create();
 	if (server->io == NULL) {
-		od_error(&instance->logger, "server", NULL, NULL,
-		         "failed to create system io");
-		if (server->tls)
-			machine_tls_free(server->tls);
-		free(server);
-		return -1;
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to create system io");
+		goto error;
 	}
 
-	char addr_name[128];
-	od_getaddrname(server->addr, addr_name, sizeof(addr_name), 1, 1);
+	char addr_name[PATH_MAX];
+	int addr_name_len;
+	struct sockaddr_un saddr_un;
+	struct sockaddr *saddr;
+	if (server->addr) {
+		/* resolve listen address and port */
+		od_getaddrname(server->addr, addr_name, sizeof(addr_name), 1,
+			       1);
+		addr_name_len = strlen(addr_name);
+		saddr = server->addr->ai_addr;
+	} else {
+		/* set unix socket path */
+		memset(&saddr_un, 0, sizeof(saddr_un));
+		saddr_un.sun_family = AF_UNIX;
+		saddr = (struct sockaddr *)&saddr_un;
+		addr_name_len = od_unix_socket_path(
+			addr_name, sizeof(saddr_un.sun_path),
+			instance->config.unix_socket_dir, config->port);
+		if (addr_name_len == -1) {
+			od_error(&instance->logger, NULL, NULL,
+				 "unix socket path '%s/.s.PGSQL.%d' is too "
+				 "long (maximum %d characters)",
+				 instance->config.unix_socket_dir, config->port,
+				 (int)sizeof(saddr_un.sun_path) - 1);
+			goto error;
+		}
+		memcpy(saddr_un.sun_path, addr_name, addr_name_len);
+	}
 
-	/* bind to listen address and port */
+	if (server->addr == NULL) {
+		bool lock_held;
+		if (od_system_unix_socket_prepare(server, &saddr_un,
+						  &lock_held) == -1) {
+			if (lock_held) {
+				od_error(
+					&instance->logger, NULL, NULL,
+					"unix socket '%s' appears to be owned by another odyssey instance (lock held)",
+					saddr_un.sun_path);
+			} else {
+				od_error(
+					&instance->logger, NULL, NULL,
+					"failed to prepare unix socket '%s': %s",
+					saddr_un.sun_path, strerror(errno));
+			}
+			goto error;
+		}
+	}
+
+	/* bind */
 	int rc;
-	rc = machine_bind(server->io, server->addr->ai_addr);
-	if (rc == -1) {
-		od_error(&instance->logger, "server", NULL, NULL,
-		         "bind to %s failed: %s",
-		         addr_name,
-		         machine_error(server->io));
-		if (server->tls)
-			machine_tls_free(server->tls);
-		machine_close(server->io);
-		machine_io_free(server->io);
-		free(server);
-		return -1;
+	if (instance->config.bindwith_reuseport &&
+	    saddr->sa_family != AF_UNIX) {
+		rc = mm_io_bind(server->io, saddr,
+				MM_BINDWITH_SO_REUSEPORT |
+					MM_BINDWITH_SO_REUSEADDR);
+	} else {
+		rc = mm_io_bind(server->io, saddr, MM_BINDWITH_SO_REUSEADDR);
 	}
 
-	od_log(&instance->logger, "server", NULL, NULL,
-	       "listening on %s", addr_name);
+	if (rc == -1) {
+		od_error(&instance->logger, NULL, NULL,
+			 "bind to '%s' failed: %s", addr_name,
+			 mm_io_error(server->io));
+		goto error;
+	}
+
+	/* chmod */
+	if (server->addr == NULL) {
+		dev_t dev;
+		ino_t ino;
+		int is_sock =
+			mm_file_is_socket(server->unix_socket_path, &dev, &ino);
+		if (is_sock == -1) {
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to inspect bound unix socket '%s': %s",
+				 server->unix_socket_path, strerror(errno));
+			goto error;
+		}
+		if (is_sock == 0) {
+			od_error(&instance->logger, NULL, NULL,
+				 "bound unix socket '%s' was replaced",
+				 server->unix_socket_path);
+			goto error;
+		}
+		server->unix_socket_dev = dev;
+		server->unix_socket_ino = ino;
+		server->unix_socket_owned = true;
+
+		long mode;
+		mode = strtol(instance->config.unix_socket_mode, NULL, 8);
+		if ((errno == ERANGE &&
+		     (mode == LONG_MAX || mode == LONG_MIN))) {
+			od_error(&instance->logger, NULL, NULL,
+				 "incorrect unix_socket_mode");
+		} else {
+			rc = mm_file_chmod(saddr_un.sun_path, (mode_t)mode);
+			if (rc == -1) {
+				od_error(&instance->logger, NULL, NULL,
+					 "chmod(%s, %ld) failed",
+					 saddr_un.sun_path, mode);
+			}
+		}
+	}
+
+	od_log(&instance->logger, NULL, NULL, "listening on %s", addr_name);
 
 	int64_t coroutine_id;
 	coroutine_id = machine_coroutine_create(od_system_server, server);
 	if (coroutine_id == -1) {
-		od_error(&instance->logger, "system", NULL, NULL,
-		         "failed to start server coroutine");
-		if (server->tls)
-			machine_tls_free(server->tls);
-		machine_close(server->io);
-		machine_io_free(server->io);
-		free(server);
-		return -1;
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to start server coroutine");
+		goto error;
 	}
-	return 0;
+
+	server->coro_id = coroutine_id;
+
+	/* register server in list for possible TLS reload */
+	od_router_t *router = system->global->router;
+	od_list_append(&router->servers, &server->link);
+	return OK_RESPONSE;
+
+error:
+	if (server->io) {
+		mm_io_close(server->io);
+		mm_io_free(server->io);
+		server->io = NULL;
+	}
+	od_system_server_free(server);
+	return NOT_OK_RESPONSE;
 }
 
-static inline int
-od_system_listen(od_system_t *system)
+static inline int od_system_listen(od_system_t *system)
 {
-	od_instance_t *instance = system->global.instance;
+	od_instance_t *instance = system->global->instance;
 	int binded = 0;
 	od_list_t *i;
-	od_list_foreach(&instance->config.listen, i)
-	{
-		od_configlisten_t *listen;
-		listen = od_container_of(i, od_configlisten_t, link);
+	od_list_foreach (&instance->config.listen, i) {
+		od_config_listen_t *listen;
+		listen = od_container_of(i, od_config_listen_t, link);
+
+		/* unix socket */
+		int rc;
+		if (listen->host == NULL) {
+			rc = od_system_server_start(system, listen, NULL);
+			if (rc == 0) {
+				binded++;
+			}
+			continue;
+		}
 
 		/* listen '*' */
 		struct addrinfo *hints_ptr = NULL;
-		struct addrinfo  hints;
+		struct addrinfo hints;
 		memset(&hints, 0, sizeof(struct addrinfo));
 		hints.ai_family = AF_UNSPEC;
 		hints.ai_socktype = SOCK_STREAM;
@@ -215,141 +751,667 @@ od_system_listen(od_system_t *system)
 		/* resolve listen address and port */
 		char port[16];
 		od_snprintf(port, sizeof(port), "%d", listen->port);
-		struct addrinfo *ai = NULL;
-		int rc;
-		rc = machine_getaddrinfo(host, port, hints_ptr, &ai, UINT32_MAX);
+		mm_addrinfo_t *ai = NULL;
+		rc = mm_getaddrinfo(host, port, hints_ptr, &ai, UINT32_MAX);
 		if (rc != 0) {
-			od_error(&instance->logger, "system", NULL, NULL,
-			         "failed to resolve %s:%d",
-			          listen->host,
-			          listen->port);
+			od_error(&instance->logger, NULL, NULL,
+				 "failed to resolve %s:%d", listen->host,
+				 listen->port);
 			continue;
 		}
 
 		/* listen resolved addresses */
 		if (host) {
 			rc = od_system_server_start(system, listen, ai);
-			if (rc == 0)
+			if (rc == 0) {
 				binded++;
+			}
+			mm_freeaddrinfo(ai);
 			continue;
 		}
+		mm_addrinfo_t *orig = ai;
 		while (ai) {
 			rc = od_system_server_start(system, listen, ai);
-			if (rc == 0)
+			if (rc == 0) {
 				binded++;
+			}
 			ai = ai->ai_next;
 		}
+		mm_freeaddrinfo(orig);
 	}
+
+#ifdef ODYSSEY_VERSION_GIT
+	od_setproctitlef(
+		&instance->orig_argv_ptr, instance->orig_argv_ptr_len,
+		"%s %s (git %s) listening and accepting new connections ",
+		ODYSSEY_NAME, ODYSSEY_VERSION_NUMBER, ODYSSEY_VERSION_GIT);
+#else
+	od_setproctitlef(&instance->orig_argv_ptr, instance->orig_argv_ptr_len,
+			 "%s %s listening and accepting new connections ",
+			 ODYSSEY_NAME, ODYSSEY_VERSION_NUMBER);
+#endif
 
 	return binded;
 }
 
-static inline void
-od_system_signal_handler(void *arg)
+static inline int od_config_listen_host_cmp(char *host_listen,
+					    char *host_server)
 {
-	od_system_t *system = arg;
-	od_instance_t *instance = system->global.instance;
-
-	sigset_t mask;
-	sigemptyset(&mask);
-	sigaddset(&mask, SIGINT);
-	sigaddset(&mask, SIGTERM);
-	sigaddset(&mask, SIGHUP);
-	int rc;
-	rc = machine_signal_init(&mask);
-	if (rc == -1) {
-		od_error(&instance->logger, "system", NULL, NULL,
-		         "failed to init signal handler");
-		return;
+	if (host_listen == NULL && host_server == NULL) {
+		return 0;
 	}
-	for (;;)
-	{
-		rc = machine_signal_wait(UINT32_MAX);
-		if (rc == -1)
-			break;
-		switch (rc) {
-		case SIGTERM:
-			od_log(&instance->logger, "system", NULL, NULL,
-			       "SIGTERM received, shutting down");
-			exit(0);
-			break;
-		case SIGINT:
-			od_log(&instance->logger, "system", NULL, NULL,
-			       "SIGINT received, shutting down");
-			exit(0);
-			break;
-		case SIGHUP:
-			od_log(&instance->logger, "system", NULL, NULL,
-			       "SIGHUP received, skipping");
-			break;
-		}
+	if (host_listen == NULL || host_server == NULL) {
+		return 1;
 	}
+	return strcmp(host_listen, host_server);
 }
 
-static inline void
-od_system(void *arg)
+/* a new autoconf file must pass the checks RELOAD would run */
+static int od_system_alter_system_check(const char *autoconf_path, void *arg)
+{
+	od_global_t *global = arg;
+	od_instance_t *instance = global->instance;
+	return od_cfg_check(&instance->logger, instance->config_file,
+			    autoconf_path);
+}
+
+typedef struct {
+	od_global_t *global;
+	const char *key;
+	const char *line;
+	char *err;
+	size_t err_size;
+	int result;
+} od_system_alter_system_task_t;
+
+static void od_system_alter_system_task(void *arg)
+{
+	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+	od_system_alter_system_task_t *task = arg;
+	od_instance_t *instance = task->global->instance;
+	/* Each command has its own machine, but shares the autoconf file. */
+	pthread_mutex_lock(&mutex);
+	task->result =
+		od_autoconf_update(instance->config_file, task->key, task->line,
+				   od_system_alter_system_check, task->global,
+				   task->err, task->err_size);
+	pthread_mutex_unlock(&mutex);
+}
+
+int od_system_alter_system(od_global_t *global, const char *key,
+			   const char *line, char *err, size_t err_size)
+{
+	od_system_alter_system_task_t task = {
+		.global = global,
+		.key = key,
+		.line = line,
+		.err = err,
+		.err_size = err_size,
+		.result = -1,
+	};
+
+	int64_t machine = machine_create("alter_system",
+					 od_system_alter_system_task, &task);
+	if (machine == -1) {
+		od_snprintf(err, (int)err_size,
+			    "could not start the change: %s",
+			    strerror(machine_errno()));
+		return -1;
+	}
+
+	/* the task writes into task, so it must finish before we return */
+	int rc = machine_wait_nb(machine);
+	if (rc != 0) {
+		od_snprintf(err, (int)err_size,
+			    "waiting for the change failed: %s",
+			    strerror(machine_errno()));
+		return -1;
+	}
+	return task.result;
+}
+
+void od_system_config_reload(od_system_t *system)
+{
+	od_instance_t *instance = system->global->instance;
+	od_router_t *router = system->global->router;
+	od_hba_t *hba = system->global->hba;
+	od_list_t *i;
+
+	od_log(&instance->logger, NULL, NULL, "importing changes from '%s'",
+	       instance->config_file);
+
+	/*
+	 * No lock here: stop_checkers self-synchronizes with the group
+	 * checkers via wait flags, and the checkers need the router lock
+	 * to finish, so it must not be held here.
+	 */
+	od_rules_stop_checkers(&router->rules);
+
+	od_config_t config;
+	od_config_init(&config);
+
+	od_rules_t rules;
+	od_rules_init(&rules);
+
+	od_hba_rules_t hba_rules;
+	od_hba_rules_init(&hba_rules);
+
+	int rc;
+	rc = od_cfg_import(&instance->logger, &config, &rules, system->global,
+			   &hba_rules, instance->config_file);
+	if (rc == -1) {
+		goto error;
+	}
+
+	rc = od_config_validate(&config, &instance->logger);
+	if (rc == -1) {
+		goto error;
+	}
+
+	rc = od_rules_validate(&rules, &config, &instance->logger);
+	if (rc == -1) {
+		goto error;
+	}
+	od_config_reload(&instance->config, &config);
+	od_logger_set_debug(&instance->logger, instance->config.log_debug,
+			    instance->config.log_debug_sampling);
+	od_hba_reload(hba, &hba_rules);
+
+	/* auto-generate default rule for auth_query if none specified */
+	rc = od_rules_autogenerate_defaults(&rules, &instance->logger);
+
+	od_rules_sort_for_matching(&rules);
+
+	if (rc == -1) {
+		goto error;
+	}
+
+	/*
+	 * Merge storages: reuse unchanged storages (keeping their watchdogs
+	 * and endpoint statuses alive), move new/changed storages into
+	 * router->rules, and unref removed/changed ones.  Running
+	 * watchdogs keep their storages alive via refcount and stop
+	 * automatically when the last non-watchdog ref is dropped.  After
+	 * this, rules in the freshly parsed config reference the correct
+	 * storages, so od_rules_merge can compare origin->storage and
+	 * rule->storage by pointer.
+	 *
+	 * The router lock protects the storages list against concurrent
+	 * readers (attach, console SHOW).  Watchdog joins are deferred
+	 * until the lock is released: a stopping watchdog needs the
+	 * router lock for its final polling step.
+	 */
+	od_list_t retired_watchdogs;
+	od_list_init(&retired_watchdogs);
+
+	od_router_lock(router);
+	od_rules_storage_merge(&router->rules, &rules, &retired_watchdogs);
+	od_router_unlock(router);
+
+	od_list_t *wit, *wn;
+	od_list_foreach_safe (&retired_watchdogs, wit, wn) {
+		od_rules_watchdog_join_t *join;
+		join = od_container_of(wit, od_rules_watchdog_join_t, link);
+		od_list_unlink(&join->link);
+		machine_join(join->coro_id);
+		od_free(join);
+	}
+
+	machine_tls_cache_invalidate();
+
+	/* Reload TLS certificates */
+	od_list_foreach (&router->servers, i) {
+		od_system_server_t *server;
+		od_config_listen_t *listen_config = NULL;
+		server = od_container_of(i, od_system_server_t, link);
+
+		od_list_t *j;
+		od_list_foreach (&config.listen, j) {
+			listen_config =
+				od_container_of(j, od_config_listen_t, link);
+			if (listen_config->port == server->config->port &&
+			    od_config_listen_host_cmp(listen_config->host,
+						      server->config->host) ==
+				    0) {
+				/* we have found matched listen config rule */
+				break;
+			}
+			listen_config = NULL;
+		}
+
+		char *host_name = od_config_listen_host_name(server->config);
+
+		if (listen_config == NULL) {
+			od_log(&instance->logger, NULL, NULL,
+			       "failed to match listen config for %s:%d",
+			       host_name, server->config->port);
+		} else if (server->config->tls_opts->tls_mode !=
+			   listen_config->tls_opts->tls_mode) {
+			od_log(&instance->logger, NULL, NULL,
+			       "reloaded tls mode for %s:%d", host_name,
+			       server->config->port);
+
+			server->config->tls_opts->tls_mode =
+				listen_config->tls_opts->tls_mode;
+		}
+
+		/* build tls from the new config, so that changed cert paths apply */
+		od_config_listen_t *tls_source =
+			listen_config != NULL ? listen_config : server->config;
+
+		if (tls_source->tls_opts->tls_mode == OD_CONFIG_TLS_DISABLE) {
+			continue;
+		}
+
+		int files_changed =
+			listen_config != NULL &&
+			!od_tls_opts_files_eq(server->config->tls_opts,
+					      listen_config->tls_opts);
+
+		/* do not let a broken certificate replace a working one */
+		char tls_error[256];
+		if (od_tls_frontend_validate(tls_source, tls_error,
+					     sizeof(tls_error)) !=
+		    OK_RESPONSE) {
+			od_error(
+				&instance->logger, NULL, NULL,
+				"failed to load tls certificate for %s:%d, keeping previous certificate: %s",
+				host_name, server->config->port, tls_error);
+			continue;
+		}
+
+		machine_tls_t *tls = od_tls_frontend(tls_source);
+		if (tls == NULL) {
+			od_error(
+				&instance->logger, NULL, NULL,
+				"failed to build tls handler for %s:%d, keeping previous certificate",
+				host_name, server->config->port);
+			continue;
+		}
+
+		/*
+		 * The replaced handle stays alive until shutdown: clients
+		 * accepted earlier still point at it.
+		 */
+		if (od_system_server_retire_tls(server) != OK_RESPONSE) {
+			machine_tls_free(tls);
+			od_error(
+				&instance->logger, NULL, NULL,
+				"failed to retire tls handler for %s:%d, keeping previous certificate",
+				host_name, server->config->port);
+			continue;
+		}
+
+		server->tls = tls;
+
+		if (files_changed) {
+			od_log(&instance->logger, NULL, NULL,
+			       "reloaded tls certificate files for %s:%d",
+			       host_name, server->config->port);
+		}
+	}
+
+	od_config_free(&config);
+
+	if (instance->config.log_config) {
+		od_rules_print(&rules, &instance->logger);
+	}
+
+	/* Merge configuration changes.
+	 *
+	 * Add new routes or obsolete previous ones which are updated or not
+	 * present in new config file.
+	 *
+	 * Force obsolete clients to disconnect.
+	 */
+	od_log(&instance->logger, NULL, NULL, "reconfigure rules");
+	int updates = od_router_reconfigure(router, &rules);
+
+	/* start watchdogs and group checkers for new/changed storages
+	 * and rules — directly in system thread scheduler */
+	od_router_lock(router);
+	od_rules_storages_watchdogs_run(&instance->logger, &router->rules);
+	od_router_unlock(router);
+
+	od_router_lock(router);
+	od_rules_groups_checkers_run(&instance->logger, &router->rules);
+	od_router_unlock(router);
+
+	/* free unused rules */
+	od_rules_free(&rules);
+
+	od_log(&instance->logger, NULL, NULL,
+	       "%d routes created/deleted and scheduled for removal", updates);
+
+	/* the file on disk loaded, so a restart would come up on it */
+	atomic_store(&instance->config_load_failed, 0);
+	return;
+
+error:
+	/*
+	 * Keep running on the config already in memory. The file on disk is
+	 * not usable, so a restart would not come up on it.
+	 */
+	atomic_store(&instance->config_load_failed, 1);
+
+	od_config_free(&config);
+	od_rules_free(&rules);
+
+	od_error(&instance->logger, NULL, NULL,
+		 "failed to load '%s', keeping the running configuration",
+		 instance->config_file);
+}
+
+static inline void od_system(void *arg)
 {
 	od_system_t *system = arg;
-	od_instance_t *instance = system->global.instance;
+	od_global_t *global = system->global;
+	od_instance_t *instance = system->global->instance;
+	od_router_t *router = system->global->router;
 
-	/* start router coroutine */
-	int rc;
-	od_router_t *router = system->global.router;
-	rc = od_router_start(router);
-	if (rc == -1)
-		return;
+	od_wait_counters_reset();
 
-	/* start console coroutine */
-	od_console_t *console = system->global.console;
-	rc = od_console_start(console);
-	if (rc == -1)
-		return;
-
-	/* start cron coroutine */
-	od_cron_t *cron = system->global.cron;
-	rc = od_cron_start(cron);
-	if (rc == -1)
-		return;
-
-	/* start worker threads */
-	od_workerpool_t *worker_pool = system->global.worker_pool;
-	rc = od_workerpool_start(worker_pool, &system->global, instance->config.workers);
-	if (rc == -1)
-		return;
-
-	/* start signal handler coroutine */
-	int64_t coroutine_id;
-	coroutine_id = machine_coroutine_create(od_system_signal_handler, system);
-	if (coroutine_id == -1) {
-		od_error(&instance->logger, "system", NULL, NULL,
-		         "failed to start signal handler");
+	system->system_channel = machine_channel_create();
+	if (system->system_channel == NULL) {
+		od_fatal(&instance->logger, NULL, NULL,
+			 "failed to create system channel");
 		return;
 	}
+
+	instance->pstmts = od_global_pstmts_map_create(
+		4 * (size_t)instance->config.workers);
+	if (instance->pstmts == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to create pstmts map, errno = %d (%s)",
+			 machine_errno(), strerror(machine_errno()));
+		return;
+	}
+
+	instance->clients_by_key = od_global_clients_map_create(
+		64 * (size_t)instance->config.workers);
+	if (instance->clients_by_key == NULL) {
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to create clients map, errno = %d (%s)",
+			 machine_errno(), strerror(machine_errno()));
+		return;
+	}
+
+	uint64_t max_inflight =
+		instance->config.cancel_max_inflight > 0 ?
+			(uint64_t)instance->config.cancel_max_inflight :
+			2 * (uint64_t)instance->config.workers;
+	mm_sem_init(&global->cancel_sem, max_inflight);
+	mm_sem_init(&global->routing_sem,
+		    (uint64_t)instance->config.client_max_routing);
+	od_rate_limiter_init(&global->cancel_rate_limiter,
+			     (uint64_t)instance->config.cancel_rate_limit);
+	od_rate_limiter_init(&global->accept_rate_limiter,
+			     (uint64_t)instance->config.accept_rate_limit);
+
+	/* start worker threads */
+
+	int rc;
+#ifdef LDAP_FOUND
+	rc = od_ldap_workers_init(instance->config.workers);
+	if (rc == -1) {
+		od_fatal(&instance->logger, NULL, NULL,
+			 "failed to start ldap pool, errno = %d (%s)",
+			 machine_errno(), strerror(machine_errno()));
+		return;
+	}
+#endif
+
+	/* start worker threads */
+	od_worker_pool_t *worker_pool = system->global->worker_pool;
+	rc = od_worker_pool_start(worker_pool, system->global,
+				  (uint32_t)instance->config.workers);
+	if (rc == -1) {
+		return;
+	}
+
+	/* start signal handler coroutine */
+	int64_t mid;
+	mid = machine_create("sighandler", od_system_signal_handler, system);
+	if (mid == -1) {
+		od_fatal(&instance->logger, NULL, NULL,
+			 "failed to start signal handler");
+		return;
+	}
+
+	system->sighandler_machine = mid;
 
 	/* start listen servers */
 	rc = od_system_listen(system);
 	if (rc == 0) {
-		od_error(&instance->logger, "system", NULL, NULL,
-		         "failed to bind any listen address");
+		/* Preserve the listener errors queued before this fatal exit. */
+		od_logger_shutdown(&instance->logger);
+		/* Other threads still exist: leave logger storage alive until exit. */
+		if (instance->logger.async) {
+			if (machine_wait(instance->logger.machine)) {
+				abort();
+			}
+		}
+		od_fatal(&instance->logger, NULL, NULL,
+			 "failed to bind any listen address, errno=%d (%s)",
+			 mm_errno_get(), strerror(mm_errno_get()));
 		exit(1);
 	}
+
+	od_cron_start(global->cron, global);
+
+	od_rules_storages_watchdogs_run(&instance->logger, &router->rules);
+	od_rules_groups_checkers_run(&instance->logger, &router->rules);
+
+	/* event loop: handle reload and shutdown requests */
+	bool shutdown = false;
+	while (!shutdown) {
+		machine_msg_t *msg = machine_channel_read(
+			system->system_channel, UINT32_MAX);
+		if (msg == NULL) {
+			od_log(&instance->logger, NULL, NULL,
+			       "NULL message in system channel");
+			break;
+		}
+
+		int type = machine_msg_type(msg);
+		void *msg_arg = NULL;
+		if (machine_msg_size(msg) >= (int)sizeof(msg_arg)) {
+			memcpy(&msg_arg, machine_msg_data(msg),
+			       sizeof(msg_arg));
+		}
+		machine_msg_free(msg);
+
+		switch (type) {
+		case OD_MSG_RELOAD:
+			od_system_config_reload(system);
+
+			if (msg_arg != NULL) {
+				mm_wait_flag_set((mm_wait_flag_t *)msg_arg);
+			}
+			break;
+		case OD_MSG_GC:
+			od_log(&instance->logger, NULL, NULL, "GC request");
+			od_cron_expire_now(global->cron);
+
+			if (msg_arg != NULL) {
+				mm_wait_flag_set((mm_wait_flag_t *)msg_arg);
+			}
+			break;
+		case OD_MSG_SHUTDOWN:
+			od_log(&instance->logger, NULL, NULL,
+			       "shutdown request");
+			shutdown = true;
+			break;
+		default:
+			od_log(&instance->logger, NULL, NULL,
+			       "unexpected message type %d in system channel",
+			       type);
+			break;
+		}
+	}
+
+	if (instance->config.graceful_shutdown_timeout_ms != 0) {
+		start_timeout_thread(
+			instance->config.graceful_shutdown_timeout_ms);
+	}
+
+	od_list_t *i, *n;
+	od_list_foreach_safe (&router->servers, i, n) {
+		od_system_server_t *server;
+		server = od_container_of(i, od_system_server_t, link);
+		od_system_server_shutdown(server);
+	}
+
+	od_rules_stop_checkers(&router->rules);
+
+	od_cron_stop(global->cron);
+
+	/* stop workers first so client/server coroutines release
+	 * their storage refs — otherwise od_rules_cleanup won't
+	 * reach r==2 and watchdogs won't get set_offline */
+	od_worker_pool_shutdown(worker_pool);
+	od_worker_pool_wait_gracefully_shutdown(worker_pool);
+
+	machine_wait_nb(system->sighandler_machine);
+
+	od_list_foreach_safe (&router->servers, i, n) {
+		od_system_server_t *server;
+		server = od_container_of(i, od_system_server_t, link);
+		machine_join(server->coro_id);
+	}
+
+	/* collect watchdog coroutine IDs before rules are freed */
+	int watchdog_count = 0;
+	{
+		od_list_t *j;
+		od_list_foreach (&router->rules.storages, j) {
+			od_rule_storage_t *s;
+			s = od_container_of(j, od_rule_storage_t, link);
+			if (s->watchdog_coro_id != -1) {
+				watchdog_count++;
+			}
+		}
+	}
+
+	int64_t *watchdog_ids = NULL;
+	if (watchdog_count > 0) {
+		watchdog_ids = od_malloc(sizeof(int64_t) * watchdog_count);
+		if (watchdog_ids) {
+			int k = 0;
+			od_list_t *j;
+			od_list_foreach (&router->rules.storages, j) {
+				od_rule_storage_t *s;
+				s = od_container_of(j, od_rule_storage_t, link);
+				if (s->watchdog_coro_id != -1) {
+					watchdog_ids[k++] = s->watchdog_coro_id;
+				}
+			}
+		}
+	}
+
+	/* signal all watchdogs to stop before dropping storage refs.
+	 *
+	 * od_rules_storage_unref no longer signals set_offline via
+	 * refcount — the caller must do it explicitly.  Here we
+	 * signal every running watchdog, then join it (below) so it
+	 * exits and drops its own storage ref before od_router_free
+	 * frees the routes and rules. */
+	{
+		od_list_t *j;
+		od_list_foreach (&router->rules.storages, j) {
+			od_rule_storage_t *s;
+			s = od_container_of(j, od_rule_storage_t, link);
+			if (s->watchdog != NULL && s->watchdog_coro_id != -1) {
+				od_storage_watchdog_set_offline(s->watchdog);
+			}
+		}
+	}
+
+	/* unref storages: drop the storage list refs. Rules and routes
+	 * are still alive, so storage refcount stays above 1.  The
+	 * storage will be freed later when od_router_free drops route
+	 * rule refs and the watchdog's own ref is already gone. */
+	od_rules_cleanup(&router->rules);
+
+	/* join watchdog coroutines: machine_join yields to scheduler,
+	 * giving each watchdog a chance to see set_offline (signalled
+	 * above) and exit.  Routes and rules are still alive, so the
+	 * watchdog can safely access them during its final polling step. */
+	if (watchdog_ids) {
+		for (int k = 0; k < watchdog_count; k++) {
+			machine_join(watchdog_ids[k]);
+		}
+		od_free(watchdog_ids);
+	}
+
+	/* now safe to free router: all watchdogs are dead, so no one
+	 * will access routes or rules after this point */
+	od_router_free(router);
+
+	od_soft_oom_stop_checker(&global->soft_oom);
+
+#ifdef LDAP_FOUND
+	od_ldap_workers_destroy();
+#endif
+
+	if (instance->config.host_watcher_enabled) {
+		od_host_watcher_destroy(&global->host_watcher);
+	}
+
+	if (instance->config.hba_file != NULL) {
+		od_hba_free(global->hba);
+	}
+
+	od_extension_free(&instance->logger, global->extensions);
+
+	od_logger_shutdown(&instance->logger);
+	od_logger_wait_finish(&instance->logger);
+
+	mm_sem_destroy(&global->cancel_sem);
+	mm_sem_destroy(&global->routing_sem);
+
+	machine_channel_free(system->system_channel);
+
+	od_instance_free(instance);
+	od_global_destroy(global);
+	od_system_free(system);
 }
 
-int od_system_init(od_system_t *system)
+void od_system_init(od_system_t *system)
 {
 	system->machine = -1;
-	memset(&system->global, 0, sizeof(system->global));
-	return 0;
+	system->sighandler_machine = -1;
+	system->system_channel = NULL;
+	system->global = NULL;
 }
 
-int od_system_start(od_system_t *system)
+int od_system_start(od_system_t *system, od_global_t *global)
 {
-	od_instance_t *instance = system->global.instance;
+	system->global = global;
+	od_instance_t *instance = global->instance;
 	system->machine = machine_create("system", od_system, system);
 	if (system->machine == -1) {
-		od_error(&instance->logger, "system", NULL, NULL,
-		         "failed to create system thread");
+		od_error(&instance->logger, NULL, NULL,
+			 "failed to create system thread");
 		return -1;
 	}
 	return 0;
+}
+
+od_system_t *od_system_create(void)
+{
+	od_system_t *s = od_malloc(sizeof(od_system_t));
+	if (s == NULL) {
+		return NULL;
+	}
+
+	od_system_init(s);
+
+	return s;
+}
+
+void od_system_free(od_system_t *system)
+{
+	od_free(system);
 }

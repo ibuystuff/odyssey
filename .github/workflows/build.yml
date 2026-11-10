@@ -1,0 +1,109 @@
+name: build
+on:
+  push:
+    branches: [ master, 'REL_*' ]
+  pull_request:
+    branches: [ master ]
+    paths:
+      - ".github/actions/test-logs/**"
+      - "sources/**"
+      - "CMakeLists.txt"
+      - "test/**"
+      - "docker/**"
+      - "modules/**"
+      - "cmake/**"
+      - ".github/workflows/build.yml"
+      - "!docker/prom-exporter/**"
+      - "!test/prom-exporter/**"
+      - "!sources/machinarium/gdb/**"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ubuntu-build:
+    name: ubuntu-build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os-version: ['jammy', 'noble', 'plucky', 'questing', 'resolute', 'stonking']
+        build-type: ['build_release']
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Ubuntu build check
+      shell: bash
+      run: make ci-build-check-ubuntu ODYSSEY_BUILD_TYPE=${{ matrix.build-type }} ODYSSEY_TEST_CODENAME=${{ matrix.os-version }} 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs
+  fedora-build:
+    name: fedora-build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Fedora build check
+      shell: bash
+      run: make ci-build-check-fedora 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs
+  oraclelinux-build:
+    name: oraclelinux-build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os-version: ['8', '9']
+        build-type: ['build_release']
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Oraclelinux build check
+      shell: bash
+      run: make ci-build-check-oracle-linux ODYSSEY_BUILD_TYPE=${{ matrix.build-type }} ODYSSEY_ORACLELINUX_VERSION=${{ matrix.os-version }} 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs
+  debian-build:
+    name: debian-build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os-version: ['bookworm', 'trixie', 'forky', 'sid']
+        build-type: ['build_release']
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Debian build check
+      shell: bash
+      run: make ci-build-check-debian ODYSSEY_BUILD_TYPE=${{ matrix.build-type }} ODYSSEY_TEST_DEBIAN_DISTRO=${{ matrix.os-version }} 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs
+  macos-build:
+    name: macos-build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26   # Apple Silicon (arm64)
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Install dependencies
+      run: |
+        brew update
+        brew install openssl@3 openldap bison flex
+    - name: Build and run unit tests
+      shell: bash
+      run: make ci-build-check-macos 2>&1 | tee test-run.log
+    - name: Save logs on failure
+      if: failure()
+      uses: ./.github/actions/test-logs

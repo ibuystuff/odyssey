@@ -1,0 +1,217 @@
+#pragma once
+
+/*
+ * Odyssey.
+ *
+ * Scalable PostgreSQL connection pooler.
+ */
+
+#include <status.h>
+#include <types.h>
+#include <pstmt.h>
+
+#include <machinarium/machinarium.h>
+#include <machinarium/ds/vector.h>
+
+typedef enum {
+	/*
+	 * nothing changed on entry execution
+	 */
+	OD_XPLAN_DELTA_NONE,
+
+	/*
+	 * add pstmt to both client and server hashmaps
+	 * in case Parse for stmt which is not exists on server
+	 */
+	OD_XPLAN_DELTA_ADD_BOTH,
+
+	/*
+	 * add pstmt only to client's hashmap
+	 * in case pstmt already existed on server
+	 */
+	OD_XPLAN_DELTA_ADD_CLIENT_ONLY,
+
+	/*
+	 * add pstmt only to server's hashmap
+	 * for cases of shadow parsing of stmt, that is not
+	 * exists on server
+	 */
+	OD_XPLAN_DELTA_ADD_SERVER_ONLY,
+
+	/*
+	 * remove pstmt from client map, on Close
+	 */
+	OD_XPLAN_DELTA_REMOVE_CLIENT_ONLY,
+
+	/*
+	 * remove all pstmts from both client and server hashmaps
+	 * in case of Execute(DISCARD ALL)
+	 */
+	OD_XPLAN_DELTA_REMOVE_ALL,
+
+	/*
+	 * remove all pstmts from client hashmap only
+	 * in case of Execute(DEALLOCATE ALL) - virtualized, not sent to server
+	 */
+	OD_XPLAN_DELTA_REMOVE_CLIENT_ALL,
+
+	/*
+	 * add portal -> pstmt mapping on client
+	 * on Bind (destination portal name)
+	 */
+	OD_XPLAN_DELTA_ADD_PORTAL,
+
+	/*
+	 * remove portal -> pstmt mapping on client
+	 * on Close Portal or after Execute of DISCARD/DEALLOCATE
+	 */
+	OD_XPLAN_DELTA_REMOVE_PORTAL,
+
+	/*
+	 * remove a single pstmt by name from client map
+	 * on Execute(DEALLOCATE name)
+	 */
+	OD_XPLAN_DELTA_REMOVE_CLIENT_ONLY_BY_NAME
+} od_xplan_delta_type_t;
+
+typedef struct {
+	od_xplan_delta_type_t type;
+	/*
+	 * client_pstmt name. normally points into the original client msg
+	 * (owned by xbuf), EXCEPT for OD_XPLAN_DELTA_REMOVE_CLIENT_ONLY_BY_NAME
+	 * where it is an owned NUL-terminated copy (freed in plan_entry_destroy).
+	 */
+	const char *client_pstmt;
+	/*
+	 * cached od_hm_name_hash of client_pstmt / portal_name
+	 * (filled at entry creation), so the plan loops and the apply
+	 * step never re-hash or strcmp on hash mismatch
+	 */
+	mm_hash_t client_pstmt_hash;
+	mm_hash_t portal_name_hash;
+	od_pstmt_t *pstmt;
+	/*
+	 * portal name for ADD_PORTAL / REMOVE_PORTAL deltas
+	 * points to the original client msg (owned by xbuf)
+	 */
+	const char *portal_name;
+} od_xplan_delta_t;
+
+typedef enum {
+	/*
+	 * send to backend and proxy the answer to client
+	 * this is:
+	 * - simple proxy without rewriting the msg: Execute, Flush, Sync, Describe(P)
+	 * - rewritten: Describe(S), Bind
+	 */
+	OD_XPLAN_FORWARD,
+
+	/*
+	 * Parse with rewritten stmt name,
+	 * which must be added to client and server hashmaps
+	 * on success PC
+	 */
+	OD_XPLAN_PARSE,
+
+	/*
+	 * inserted Parse, which PC must not be sent to client
+	 */
+	OD_XPLAN_PARSE_SHADOW,
+
+	/*
+	 * CloseComplete for stmt on client
+	 */
+	OD_XPLAN_VIRTUAL_CLOSE_COMPLETE,
+
+	/*
+	 * ParseComplete for stmt, that already exists on backend
+	 */
+	OD_XPLAN_VIRTUAL_PARSE_COMPLETE,
+
+	/*
+	 * virtual ErrorResponse for unknown or already exists statements
+	 */
+	OD_XPLAN_VIRTUAL_ERROR_RESPONSE,
+
+	/*
+	 * virtual CommandComplete for Execute of DEALLOCATE
+	 * that is virtualized (not sent to server)
+	 */
+	OD_XPLAN_VIRTUAL_COMMAND_COMPLETE,
+
+	/*
+	 * deferred simple query begin
+	 */
+	OD_XPLAN_DEFERRED_BEGIN,
+} od_xplan_entry_type_t;
+
+typedef struct {
+	od_xplan_entry_type_t type;
+
+	/*
+	 * applied after receiving corresponding success response
+	 * from backend
+	 * 
+	 * ex: applied with adding new pstmts after receiving
+	 * corresponding ParseComplete
+	 */
+	od_xplan_delta_t delta;
+
+	/*
+	 * original msg from client
+	 * can be sent to server, if it wan't rewritten to server_msg
+	 *
+	 * cannot be NULL, but is owned by xbuf
+	 */
+	machine_msg_t *clmsg;
+
+	/*
+	 * rewritten client msg to send to server
+	 *
+	 * can be NULL, owned by xplan
+	 */
+	machine_msg_t *srvmsg;
+
+	/*
+	 * virtual response to client
+	 * note:
+	 * no ParseComplete msg here - it is always const seq of bytes
+	 * no CloseComplete msg here - it is always const seq of bytes
+	 * no CommandComplete msg here - it is always const seq of bytes
+	 *                                (handled by vcc_data, vcc_len)
+	 *
+	 * can be NULL, owned by xplan
+	 */
+	machine_msg_t *vresp;
+
+	/*
+	 * pre-built CommandComplete wire bytes for
+	 * OD_XPLAN_VIRTUAL_COMMAND_COMPLETE. points to a static array,
+	 * not owned. NULL for all other entry types.
+	 */
+	const uint8_t *vcc_data;
+	size_t vcc_len;
+} od_xplan_entry_t;
+
+struct od_xplan {
+	/* od_xplan_entry_t[] */
+	mm_vector_t entries;
+
+	/*
+	 * set when a planned forward is known to fail on the backend
+	 * (e.g. Bind/Describe of a pstmt unknown to the client). the rest
+	 * of the batch must not be planned: the backend discards all
+	 * messages until Sync after an error, so executing or
+	 * virtualizing them would be wrong
+	 */
+	int errored;
+};
+
+void od_xplan_init(od_xplan_t *xp);
+void od_xplan_destroy(od_xplan_t *xp);
+void od_xplan_clear(od_xplan_t *xp);
+
+od_frontend_status_t od_xplan_make_from_xbuf(od_xplan_t *xp, od_relay_t *relay);
+
+od_frontend_status_t od_xplan_run(od_xplan_t *xp, od_relay_t *relay,
+				  uint32_t timeout_ms);
